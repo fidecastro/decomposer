@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "decomposer"
+version = "0.1.0"
+description = "Composer-inspired looks for the Opal C1 on Linux (and later Windows)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.24",
+  "opencv-python>=4.8",
+]
+
+[project.optional-dependencies]
+virtual = ["pyvirtualcam>=0.11"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+decomposer = "opal_c1.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

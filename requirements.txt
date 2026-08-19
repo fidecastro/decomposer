@@ -1,0 +1,4 @@
+numpy>=1.24
+opencv-python>=4.8
+# Optional: virtual webcam on Linux/Windows
+# pyvirtualcam>=0.11
