@@ -15,6 +15,10 @@ use v4l::prelude::*;
 use v4l::video::{Capture, Output};
 use v4l::{Format, FourCC};
 
+/// linux/videodev2.h: this frame is progressive, not one field of an
+/// interlaced pair.
+const V4L2_FIELD_NONE: u32 = 1;
+
 /// NV12 is 8 bits of luma per pixel plus a half-resolution interleaved
 /// chroma plane, so one frame is width * height * 3 / 2 bytes.
 pub fn nv12_len(width: u32, height: u32) -> usize {
@@ -145,7 +149,10 @@ impl V4l2Sink {
         let (buf, meta) = OutputStream::next(&mut self.stream)?;
         let n = frame.len().min(buf.len());
         buf[..n].copy_from_slice(&frame[..n]);
-        meta.field = 0;
+        // V4L2_FIELD_NONE. Not ANY (0), which tells the driver it may choose,
+        // and leaves a consumer free to treat the buffer as a single field
+        // rather than a whole progressive frame.
+        meta.field = V4L2_FIELD_NONE;
         meta.bytesused = n as u32;
         Ok(())
     }
