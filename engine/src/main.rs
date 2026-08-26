@@ -54,6 +54,10 @@ struct Args {
     #[arg(long)]
     control: Option<String>,
 
+    /// Mirror: bit 0 horizontal, bit 1 vertical, 3 = 180 degrees
+    #[arg(long, default_value_t = 0)]
+    flip: u32,
+
     /// Unix socket serving a downscaled RGB preview to the control panel
     #[arg(long)]
     preview: Option<String>,
@@ -106,7 +110,7 @@ fn main() -> Result<()> {
         let idx = gpu::look_index(&args.look).ok_or_else(|| {
             anyhow::anyhow!("unknown look {:?}. Known: {}", args.look, gpu::LOOKS.join(", "))
         })?;
-        let g = gpu::Gpu::new(w, h, idx, args.strength)?;
+        let g = gpu::Gpu::new(w, h, idx, args.strength, args.flip & 3)?;
         eprintln!("look   {} @ {:.2} on {}", args.look, args.strength, g.adapter_name);
         Some(g)
     };
@@ -114,6 +118,7 @@ fn main() -> Result<()> {
     let look_state = control::shared(
         gpu::look_index(&args.look).unwrap_or(0),
         args.strength,
+        args.flip & 3,
     );
     if let Some(path) = args.control.clone() {
         control::serve(path, look_state.clone())?;
@@ -139,11 +144,12 @@ fn main() -> Result<()> {
                 let mut s = look_state.lock().unwrap();
                 s.dirty.then(|| {
                     s.dirty = false;
-                    (s.look, s.strength)
+                    (s.look, s.strength, s.flip)
                 })
             };
-            if let Some((look, strength)) = pending {
+            if let Some((look, strength, flip)) = pending {
                 g.set_look(look, strength);
+                g.set_flip(flip);
             }
         }
         let out = match engine.as_mut() {

@@ -123,6 +123,12 @@ class OpalDevice:
         self._device = dai.Device(info)
         self._pipeline = dai.Pipeline(self._device)
         cam = self._pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+        # The C1's sensor is mounted upside down. Opal's own firmware corrects
+        # for that, stock DepthAI firmware does not, so Studio mode would
+        # otherwise deliver an image rotated 180 degrees from Call mode.
+        # Measured, not assumed: correlating the two modes against each other
+        # scores +0.80 for rotate-180 and -0.66 for identical.
+        cam.setImageOrientation(dai.CameraImageOrientation.ROTATE_180_DEG)
         out = cam.requestOutput(
             (self.width, self.height), dai.ImgFrame.Type.NV12, fps=self.fps
         )

@@ -254,6 +254,29 @@ automatic the button lights and the value reads `auto` — the daemon stores aut
 as `-1`, and clamping that onto the slider would display `0`, a real and very
 different setting.
 
+### Orientation
+
+The C1's sensor is mounted upside down. Opal's own firmware corrects for it;
+stock DepthAI firmware does not, so Studio mode used to deliver an image rotated
+180° from Call mode. Measured rather than assumed — correlating the two modes
+scored **+0.80 for rotate-180** and **−0.66 for identical** — and fixed on the
+device with `setImageOrientation(ROTATE_180_DEG)`, so both modes now share one
+reference.
+
+On top of that, mirroring is a user preference applied in the shader, where it
+costs nothing (it only changes where the shader reads):
+
+```bash
+decomposer mirror --horizontal on     # selfie view
+decomposer mirror --vertical on       # both axes together is a 180° turn
+```
+
+Because both modes share an orientation, one mirror setting is meaningful across
+them. 90° rotation is *not* supported: it swaps the output dimensions, which
+means recreating `/dev/video10` at 1080x1920 and forcing every connected
+application to renegotiate — a different and much more disruptive operation than
+a free shader flip.
+
 ### The mark
 
 Opal Composer's logo is a circle and a triangle in black and white, where the

@@ -575,6 +575,23 @@ def _cmd_look(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_mirror(args: argparse.Namespace) -> int:
+    values = {}
+    if args.horizontal is not None:
+        values["horizontal"] = args.horizontal == "on"
+    if args.vertical is not None:
+        values["vertical"] = args.vertical == "on"
+    if not values:
+        resp = _client_call(cmd="status")
+    else:
+        resp = _client_call(cmd="set_mirror", **values)
+    if not resp.get("ok"):
+        return 1
+    print(f"  mirror horizontal {'on' if resp.get('mirror_h') else 'off'}, "
+          f"vertical {'on' if resp.get('mirror_v') else 'off'}")
+    return 0
+
+
 def _cmd_switch(args: argparse.Namespace) -> int:
     if args.to == "studio":
         print("Switching to Studio mode - this takes ~5s and costs the C1 microphone.")
@@ -777,6 +794,19 @@ def build_parser() -> argparse.ArgumentParser:
     lk.add_argument("name", nargs="?", default=None, help="Look name")
     lk.add_argument("--strength", type=float, default=None, help="0.0 to 1.0")
     lk.set_defaults(func=_cmd_look)
+
+    mi = sub.add_parser(
+        "mirror",
+        help="Mirror the published image",
+        description=(
+            "Applied on the GPU at no cost. Both modes share one setting, since "
+            "Studio mode is corrected to Call mode's orientation on the device. "
+            "Both axes together is a 180 degree rotation."
+        ),
+    )
+    mi.add_argument("--horizontal", choices=("on", "off"), default=None)
+    mi.add_argument("--vertical", choices=("on", "off"), default=None)
+    mi.set_defaults(func=_cmd_mirror)
 
     sw = sub.add_parser("switch", help="Switch the daemon between call and studio")
     sw.add_argument("to", choices=("call", "studio"))

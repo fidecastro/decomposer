@@ -10,6 +10,13 @@ struct Params {
     height: u32,
     look: u32,
     strength: f32,
+    // bit 0: mirror horizontally, bit 1: mirror vertically.
+    // Both together is a 180 degree rotation, which needs no size change and
+    // so can be toggled live without tearing down the virtual camera.
+    flip: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -116,14 +123,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w = params.width;
     let uv_base = w * params.height;
 
-    // One aligned u32 per luma row, one for the shared chroma pair.
-    let y0_word = (y * w + x) >> 2u;
-    let y1_word = ((y + 1u) * w + x) >> 2u;
-    let uv_word = (uv_base + (y >> 1u) * w + x) >> 2u;
+    let flip_h = (params.flip & 1u) != 0u;
+    let flip_v = (params.flip & 2u) != 0u;
 
-    let y0 = unpack4(src[y0_word]);
-    let y1 = unpack4(src[y1_word]);
-    let uv = unpack4(src[uv_word]);  // U0 V0 U1 V1
+    // Read from the mirrored block. Both axes stay block-aligned: widths are a
+    // multiple of four and the block is two rows tall, so every read is still
+    // one aligned u32 and the write side is untouched.
+    var sx = x;
+    var sy = y;
+    if (flip_h) { sx = w - 4u - x; }
+    if (flip_v) { sy = params.height - 2u - y; }
+
+    let s0_word = (sy * w + sx) >> 2u;
+    let s1_word = ((sy + 1u) * w + sx) >> 2u;
+    let suv_word = (uv_base + (sy >> 1u) * w + sx) >> 2u;
+
+    var y0 = unpack4(src[s0_word]);
+    var y1 = unpack4(src[s1_word]);
+    var uv = unpack4(src[suv_word]);  // U0 V0 U1 V1
+
+    if (flip_v) {
+        // The block's two rows swap; chroma is shared between them.
+        let t = y0;
+        y0 = y1;
+        y1 = t;
+    }
+    if (flip_h) {
+        y0 = vec4<f32>(y0.w, y0.z, y0.y, y0.x);
+        y1 = vec4<f32>(y1.w, y1.z, y1.y, y1.x);
+        // Columns 0,1 now come from the source's right-hand pair.
+        uv = vec4<f32>(uv.z, uv.w, uv.x, uv.y);
+    }
 
     var out0: vec4<f32>;
     var out1: vec4<f32>;
@@ -131,7 +161,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var cr_sum = vec2<f32>(0.0);
 
     for (var i = 0u; i < 4u; i = i + 1u) {
-        // Columns 0,1 share the first chroma pair; columns 2,3 the second.
         let pair = i >> 1u;
         let cb = select(uv.x, uv.z, pair == 1u);
         let cr = select(uv.y, uv.w, pair == 1u);
@@ -142,16 +171,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         out0[i] = rgb_to_y(top);
         out1[i] = rgb_to_y(bot);
 
-        // Average the block's four graded pixels back down to one chroma pair.
         let ct = rgb_to_cbcr(top);
         let cbm = rgb_to_cbcr(bot);
         cb_sum[pair] = cb_sum[pair] + ct.x + cbm.x;
         cr_sum[pair] = cr_sum[pair] + ct.y + cbm.y;
     }
 
-    dst[y0_word] = pack4(out0);
-    dst[y1_word] = pack4(out1);
-    dst[uv_word] = pack4(vec4<f32>(
+    // Writes stay at the invocation's own block, so no two threads collide.
+    let d0_word = (y * w + x) >> 2u;
+    let d1_word = ((y + 1u) * w + x) >> 2u;
+    let duv_word = (uv_base + (y >> 1u) * w + x) >> 2u;
+
+    dst[d0_word] = pack4(out0);
+    dst[d1_word] = pack4(out1);
+    dst[duv_word] = pack4(vec4<f32>(
         cb_sum.x * 0.25, cr_sum.x * 0.25,
         cb_sum.y * 0.25, cr_sum.y * 0.25,
     ));

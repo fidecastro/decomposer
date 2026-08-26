@@ -263,6 +263,22 @@ class Panel(Gtk.Box):
             row.append(b)
 
         row.append(Gtk.Box(hexpand=True))
+
+        # Mirroring is a view preference, not a camera setting: it lives next
+        # to the mode because it applies to whatever the mode is publishing.
+        self.mirror_buttons = {}
+        for key, glyph, tip in (
+            ("horizontal", "\u21c4", "Mirror left/right"),
+            ("vertical", "\u21c5", "Mirror top/bottom"),
+        ):
+            b = Gtk.Button(label=glyph)
+            b.add_css_class("dc-tiny")
+            b.set_valign(Gtk.Align.CENTER)
+            b.set_tooltip_text(f"{tip} (both together is a 180\u00b0 turn)")
+            b.connect("clicked", self._on_mirror, key)
+            self.mirror_buttons[key] = b
+            row.append(b)
+
         self.mode_hint = Gtk.Label(xalign=1)
         self.mode_hint.add_css_class("dc-hint")
         self.mode_hint.set_valign(Gtk.Align.CENTER)
@@ -372,6 +388,15 @@ class Panel(Gtk.Box):
         self._set_busy(True, f"switching to {mode}, the camera reboots…")
         _worker(lambda: self.client.request(cmd="set_mode", mode=mode), self._on_result)
 
+    def _on_mirror(self, _btn, axis: str) -> None:
+        if self.busy:
+            return
+        current = self.status.get("mirror_h" if axis == "horizontal" else "mirror_v")
+        _worker(
+            lambda: self.client.request(cmd="set_mirror", **{axis: not current}),
+            self._on_result,
+        )
+
     def _on_look(self, _btn, name: str) -> None:
         if self.busy:
             return
@@ -467,6 +492,11 @@ class Panel(Gtk.Box):
             self.mode_pill.remove_css_class(cls)
         self.mode_pill.add_css_class(mode if mode in ("call", "studio") else "off")
         self.mode_hint.set_text("mic off" if studio else "mic on")
+
+        for axis, key in (("horizontal", "mirror_h"), ("vertical", "mirror_v")):
+            b = self.mirror_buttons[axis]
+            b.set_sensitive(True)
+            (b.add_css_class if st.get(key) else b.remove_css_class)("selected")
 
         for name, b in self.mode_buttons.items():
             b.set_sensitive(True)

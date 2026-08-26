@@ -85,6 +85,8 @@ class State:
     width: int = 1920
     height: int = 1080
     output: str = "/dev/video10"
+    mirror_h: bool = False
+    mirror_v: bool = False
     running: bool = False
     frames: int = 0
     error: Optional[str] = None
@@ -127,6 +129,7 @@ class Daemon:
             "--height", str(self.state.height),
             "--look", self.state.look,
             "--strength", str(self.state.strength),
+            "--flip", str(self._flip_bits()),
             "--control", str(self.engine_ctl),
             "--preview", str(self.preview_sock),
         ]
@@ -209,6 +212,25 @@ class Daemon:
         self.engine = None
         with suppress(OSError):
             self.engine_ctl.unlink()
+
+    def _flip_bits(self) -> int:
+        """bit 0 mirrors horizontally, bit 1 vertically; both is a 180 turn."""
+        return (1 if self.state.mirror_h else 0) | (2 if self.state.mirror_v else 0)
+
+    def set_mirror(self, horizontal=None, vertical=None) -> dict:
+        """Mirror the published image.
+
+        Applied in the shader, so it costs nothing and both modes share one
+        setting - Studio mode is corrected to Call mode's orientation on the
+        device, so a single preference is meaningful across both.
+        """
+        with self.lock:
+            if horizontal is not None:
+                self.state.mirror_h = bool(horizontal)
+            if vertical is not None:
+                self.state.mirror_v = bool(vertical)
+            self._tell_engine(f"flip {self._flip_bits()}")
+        return self.status()
 
     def _tell_engine(self, line: str) -> None:
         """Send one control line. Ignored if the engine is not up yet."""
@@ -515,6 +537,10 @@ class Daemon:
                 return {"ok": True, **self.set_look(req.get("look"), req.get("strength"))}
             if cmd == "set_mode":
                 return {"ok": True, **self.set_mode(req.get("mode", "call"))}
+            if cmd == "set_mirror":
+                return {"ok": True, **self.set_mirror(
+                    req.get("horizontal"), req.get("vertical")
+                )}
             if cmd == "set_camera":
                 return {"ok": True, **self.set_camera(**req.get("values", {}))}
             if cmd == "stop":

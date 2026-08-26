@@ -20,13 +20,15 @@ use std::sync::{Arc, Mutex};
 pub struct LookState {
     pub look: u32,
     pub strength: f32,
+    /// bit 0: mirror horizontally, bit 1: mirror vertically.
+    pub flip: u32,
     pub dirty: bool,
 }
 
 pub type Shared = Arc<Mutex<LookState>>;
 
-pub fn shared(look: u32, strength: f32) -> Shared {
-    Arc::new(Mutex::new(LookState { look, strength, dirty: false }))
+pub fn shared(look: u32, strength: f32, flip: u32) -> Shared {
+    Arc::new(Mutex::new(LookState { look, strength, flip, dirty: false }))
 }
 
 /// Listen on `path`, applying commands to `state`. Runs until the process ends.
@@ -72,6 +74,12 @@ fn apply(line: &str, state: &Shared) {
         "strength" => {
             if let Ok(v) = arg.parse::<f32>() {
                 s.strength = v.clamp(0.0, 1.0);
+                s.dirty = true;
+            }
+        }
+        "flip" => {
+            if let Ok(v) = arg.parse::<u32>() {
+                s.flip = v & 3;
                 s.dirty = true;
             }
         }

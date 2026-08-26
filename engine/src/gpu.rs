@@ -23,6 +23,11 @@ struct Params {
     height: u32,
     look: u32,
     strength: f32,
+    /// bit 0: mirror horizontally, bit 1: mirror vertically.
+    flip: u32,
+    // WGSL rounds uniform structs up to 16 bytes; pad explicitly so the Rust
+    // and shader layouts cannot silently disagree.
+    _pad: [u32; 3],
 }
 
 pub struct Gpu {
@@ -41,7 +46,7 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    pub fn new(width: u32, height: u32, look: u32, strength: f32) -> Result<Self> {
+    pub fn new(width: u32, height: u32, look: u32, strength: f32, flip: u32) -> Result<Self> {
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(
             instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -60,7 +65,7 @@ impl Gpu {
             .map_err(|e| anyhow!("could not create GPU device: {e}"))?;
 
         let size = super::source::nv12_len(width, height) as u64;
-        let params = Params { width, height, look, strength };
+        let params = Params { width, height, look, strength, flip, _pad: [0; 3] };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("params"),
@@ -152,6 +157,16 @@ impl Gpu {
     pub fn set_look(&mut self, look: u32, strength: f32) {
         self.params.look = look;
         self.params.strength = strength;
+        self.upload_params();
+    }
+
+    /// Mirror the image. Costs nothing: it only changes where the shader reads.
+    pub fn set_flip(&mut self, flip: u32) {
+        self.params.flip = flip;
+        self.upload_params();
+    }
+
+    fn upload_params(&mut self) {
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
     }
