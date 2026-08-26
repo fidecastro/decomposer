@@ -115,6 +115,9 @@ class State:
     mode: str = Mode.CALL.value
     look: str = "none"
     strength: float = 1.0
+    # Intensity is remembered per look. Composer's filters carry their own
+    # intensity, so a strength dialled in for noir should not follow you to G1.
+    look_strength: dict = field(default_factory=dict)
     width: int = 1920
     height: int = 1080
     output: str = "/dev/video10"
@@ -136,9 +139,12 @@ class Daemon:
     def __init__(
         self, output="/dev/video10", width=1920, height=1080, fps=30.0,
         tray_enabled: bool = False,
+        default_strength: float = 1.0,
     ):
         self.state = State(output=output, width=width, height=height)
         self.tray_enabled = tray_enabled
+        self.default_strength = max(0.0, min(1.0, float(default_strength)))
+        self.state.strength = self.default_strength
         self.fps = fps
         self.lock = threading.RLock()
         self.engine: Optional[subprocess.Popen] = None
@@ -401,6 +407,12 @@ class Daemon:
     # -- controls -------------------------------------------------------
 
     def set_look(self, look: Optional[str], strength: Optional[float]) -> dict:
+        """Select a look and/or its intensity.
+
+        Selecting a look restores the intensity last used for it, so each look
+        keeps its own setting rather than inheriting whatever the previous one
+        was left at.
+        """
         with self.lock:
             if look is not None:
                 known = available_looks()
@@ -408,9 +420,15 @@ class Daemon:
                     raise ValueError(f"unknown look {look!r}. Known: {', '.join(known)}")
                 self.state.look = look
                 self._tell_engine(f"look {look}")
+                if strength is None:
+                    remembered = self.state.look_strength.get(look, self.default_strength)
+                    self.state.strength = remembered
+                    self._tell_engine(f"strength {remembered}")
             if strength is not None:
-                self.state.strength = max(0.0, min(1.0, float(strength)))
-                self._tell_engine(f"strength {self.state.strength}")
+                value = max(0.0, min(1.0, float(strength)))
+                self.state.strength = value
+                self.state.look_strength[self.state.look] = value
+                self._tell_engine(f"strength {value}")
         return self.status()
 
     def set_camera(self, **kw) -> dict:

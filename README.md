@@ -291,6 +291,25 @@ The engine prefers `luts/<name>.cube` when it exists and falls back to the
 built-in curves when it does not, so any `.cube` file works — the look engine is
 open-ended rather than a fixed list.
 
+#### Intensity
+
+The LUTs are each filter measured **at full strength**, because that is what the
+shaders do when handed an image. `--strength` blends linearly between the input
+and the filtered result, which is the same operation MetalPetal's `intensity`
+performs — verified against the references: at `0.0` the output reproduces the
+source, at `0.5` it lands on the exact midpoint, at `1.0` on the full look, all
+within the pipeline's own ~1.1/255 round-trip floor.
+
+That matters because Composer's preset schema defaults `filters.intensity` to
+**0.5**. If that is what the app ships, then `--strength 0.5` reproduces what a
+Composer user actually saw, and `1.0` is twice as strong. The LUTs are right
+either way; only the default is in question, and it is left at `1.0` — the
+measured value — rather than guessing. `decomposer daemon --default-strength 0.5`
+changes it.
+
+Intensity is remembered **per look**, since Composer's filters carry their own:
+a strength dialled in for `noir` does not follow you to `G1`.
+
 ### Overlays
 
 Composer called these stickers. A PNG is composited over the frame — a logo, a
