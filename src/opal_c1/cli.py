@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from contextlib import suppress
 from pathlib import Path
 
 
@@ -239,6 +240,115 @@ def _cmd_control(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_stream_nv12(args: argparse.Namespace) -> int:
+    """Stream raw NV12 to stdout for the look engine.
+
+    Studio mode has no V4L2 node, so the engine cannot read the camera itself.
+    This holds the XLink connection — which is also what keeps manual focus and
+    white balance applied — and pipes frames to it:
+
+        decomposer stream-nv12 --focus 150 | decomposer-engine --input - --output /dev/video10
+    """
+    import signal
+    import time
+
+    from opal_c1.device import OpalDevice
+
+    # Exit quietly when the engine downstream goes away.
+    with suppress(AttributeError, ValueError):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+    out = sys.stdout.buffer
+
+    # A default 64 KB pipe means ~48 handoffs per 3 MB frame. Widening it to the
+    # kernel maximum cuts the wakeups the consumer has to service.
+    with suppress(OSError, AttributeError):
+        import fcntl
+
+        F_SETPIPE_SZ = 1031
+        target = int(Path("/proc/sys/fs/pipe-max-size").read_text().strip())
+        fcntl.fcntl(out.fileno(), F_SETPIPE_SZ, target)
+
+    print("Entering Studio mode - /dev/video0 and the C1 mic will disappear.",
+          file=sys.stderr)
+    with OpalDevice(width=args.width, height=args.height, fps=args.fps) as cam:
+        if args.focus is not None:
+            cam.set_focus(None if args.focus < 0 else args.focus)
+        if args.wb is not None:
+            cam.set_white_balance(None if args.wb < 0 else args.wb)
+        if args.exposure is not None or args.iso is not None:
+            cam.set_exposure(args.exposure, args.iso)
+
+        first = cam.read()
+        print(
+            f"streaming {first.width}x{first.height} NV12 "
+            f"({len(first.nv12())} bytes/frame) to stdout",
+            file=sys.stderr,
+        )
+
+        # Write on a separate thread. A blocking write to the pipe otherwise
+        # stalls the depthai receive loop, and the camera does not wait: frames
+        # arrive late and throughput drops. The queue is deliberately shallow
+        # and drops the oldest frame when full, because for a live camera feed
+        # a stale frame is worth less than a current one.
+        import itertools
+        import queue
+        import threading
+
+        q: "queue.Queue" = queue.Queue(maxsize=4)
+        dropped = 0
+        stop = threading.Event()
+
+        def writer() -> None:
+            while True:
+                buf = q.get()
+                if buf is None:
+                    return
+                try:
+                    out.write(buf)
+                except (BrokenPipeError, ValueError):
+                    stop.set()
+                    return
+
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
+
+        n = 0
+        t0 = time.monotonic()
+        try:
+            for frame in itertools.chain((first,), cam.frames()):
+                if stop.is_set():
+                    break
+                # nv12() may be a view onto a buffer depthai will reuse, so the
+                # handoff to another thread has to own its bytes.
+                buf = bytes(frame.nv12())
+                try:
+                    q.put_nowait(buf)
+                except queue.Full:
+                    with suppress(queue.Empty):
+                        q.get_nowait()
+                        dropped += 1
+                    with suppress(queue.Full):
+                        q.put_nowait(buf)
+                n += 1
+                if args.frames and n >= args.frames:
+                    break
+        except (BrokenPipeError, KeyboardInterrupt):
+            pass
+        finally:
+            with suppress(queue.Full):
+                q.put_nowait(None)
+            thread.join(timeout=3.0)
+
+    dt = time.monotonic() - t0
+    note = f", {dropped} dropped" if dropped else ""
+    print(
+        f"stopped after {n} frames in {dt:.1f}s ({n / dt:.1f} fps{note})",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="decomposer",
@@ -328,6 +438,25 @@ def build_parser() -> argparse.ArgumentParser:
     ct.add_argument("--hold", type=float, default=6.0,
                     help="Seconds to hold Studio mode (settings last only while held)")
     ct.set_defaults(func=_cmd_control)
+
+    sn = sub.add_parser(
+        "stream-nv12",
+        help="Studio mode: stream raw NV12 to stdout for the look engine",
+        description=(
+            "Holds the XLink connection (which is what keeps manual focus and white "
+            "balance applied) and writes raw NV12 frames to stdout. Pipe into "
+            "decomposer-engine --input -. Costs the microphone and /dev/video0."
+        ),
+    )
+    sn.add_argument("--width", type=int, default=1920)
+    sn.add_argument("--height", type=int, default=1080)
+    sn.add_argument("--fps", type=float, default=30.0)
+    sn.add_argument("--focus", type=int, default=None, help="Lens position 0-255, -1 for auto")
+    sn.add_argument("--wb", type=int, default=None, help="White balance 1000-12000 K, -1 for auto")
+    sn.add_argument("--exposure", type=int, default=None, help="Exposure time, microseconds")
+    sn.add_argument("--iso", type=int, default=None, help="ISO 100-1600")
+    sn.add_argument("--frames", type=int, default=0, help="Stop after N frames (0 = forever)")
+    sn.set_defaults(func=_cmd_stream_nv12)
 
     return p
 

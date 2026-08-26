@@ -48,6 +48,26 @@ class Frame:
     iso: Optional[int]
     exposure_us: Optional[int]
     color_temp: Optional[int]
+    stride: int = 0
+
+    def nv12(self):
+        """Tightly packed NV12, as something writable to a binary stream.
+
+        The device is free to pad each row out to a stride wider than the
+        frame. At 1080p it does not, but the consumer expects width-packed
+        NV12, so never assume it.
+
+        In the common unpadded case this returns a memoryview over the frame
+        rather than a copy: at 3 MB and 30 fps, a `.tobytes()` here costs about
+        90 MB/s of pointless memcpy.
+        """
+        if self.stride in (0, self.width):
+            return memoryview(self.data)
+        rows = self.data[: self.stride * self.height]
+        y = rows.reshape(self.height, self.stride)[:, : self.width]
+        uv = self.data[self.stride * self.height :]
+        uv = uv.reshape(self.height // 2, self.stride)[:, : self.width]
+        return np.concatenate([y.ravel(), uv.ravel()]).tobytes()
 
     @property
     def y_plane(self) -> np.ndarray:
@@ -155,6 +175,7 @@ class OpalDevice:
                 else None
             ),
             color_temp=img.getColorTemperature(),
+            stride=img.getStride(),
         )
 
     def frames(self) -> Iterator[Frame]:

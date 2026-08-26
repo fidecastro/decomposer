@@ -81,7 +81,10 @@ fn main() -> Result<()> {
         Some(s)
     };
 
-    let start = std::time::Instant::now();
+    // Timed from the first frame: in Studio mode the producer spends several
+    // seconds switching the camera's firmware before anything arrives, and
+    // charging that to the frame rate makes the engine look half as fast.
+    let mut start = std::time::Instant::now();
     let mut engine = if args.passthrough {
         eprintln!("look   passthrough");
         None
@@ -100,6 +103,9 @@ fn main() -> Result<()> {
             Some(f) => f,
             None => break,
         };
+        if n == 0 {
+            start = std::time::Instant::now();
+        }
         let out = match engine.as_mut() {
             Some(g) => g.process(frame)?,
             None => frame,

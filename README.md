@@ -140,8 +140,10 @@ cd engine && cargo build --release
 # Call mode: read the camera's own node directly
 ./target/release/decomposer-engine --look noir --input /dev/video0 --output /dev/video10
 
-# Studio mode has no V4L2 node, so frames arrive as raw NV12 on stdin
-decomposer stream-nv12 | ./target/release/decomposer-engine --input - --output /dev/video10
+# Studio mode has no V4L2 node, so frames arrive as raw NV12 on stdin.
+# Holding this pipe is also what keeps manual focus and white balance applied.
+decomposer stream-nv12 --focus 150 --wb 3200 \
+  | decomposer-engine --input - --output /dev/video10 --look noir
 
 # Benchmark without an output, or pipe raw frames out for inspection
 ./target/release/decomposer-engine --output null --look chrome --frames 120
@@ -174,7 +176,26 @@ On an RTX 4090, grading is free — the pipeline is camera-bound:
 The GPU stage costs nothing measurable, so the ceiling is the C1's USB bandwidth
 (4K NV12 at 30 fps is ~373 MB/s against a ~400 MB/s practical limit), not the looks.
 
-End to end into `/dev/video10` at 1080p the engine holds **29.6 fps**, and the node
+End to end into `/dev/video10` at 1080p Call mode holds **~28 fps**, and the node
 advertises itself to consumers as `NV12 1920x1080 @ 30fps`. Verified by reading the
 loopback back: `mono` arrives with chroma at exactly 128, `instant` warm-shifted to
 U 116.7 / V 138.5 — the grade reaches the application, not just the engine.
+
+### Studio-mode throughput
+
+The Studio pipeline runs at **~25 fps** against Call mode's ~28, with the camera
+itself delivering ~30. The shortfall is *not* the engine or the pipe: fed from a
+file, the engine's stdin path sustains **950 fps** with a look applied, and
+removing the loopback write changes nothing (25.5 vs 25.4). It is producer-side
+cost in the Python bridge.
+
+Two things were tried and did not move it: reading fd 0 directly instead of
+through Rust's `BufReader`, and widening the pipe to the kernel maximum. Making
+`Frame.nv12()` return a memoryview instead of a `.tobytes()` copy gained about
+0.5 fps. A threaded writer gained nothing measurable but is kept, because it
+bounds latency — it drops the oldest frame rather than letting a stalled
+consumer build an unbounded backlog of stale video.
+
+The remaining ~15% is not yet explained. It is worth revisiting when the daemon
+replaces this pipe, since the daemon can hand frames over shared memory and
+avoid the copy entirely.

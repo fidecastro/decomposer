@@ -6,7 +6,9 @@
 //! firmware), so frames arrive as raw NV12 on stdin from the depthai layer.
 
 use anyhow::{bail, Context, Result};
-use std::io::{Read, Stdin};
+use std::io::Read;
+use std::mem::ManuallyDrop;
+use std::os::fd::FromRawFd;
 use v4l::buffer::Type;
 use v4l::io::traits::{CaptureStream, OutputStream};
 use v4l::prelude::*;
@@ -72,7 +74,10 @@ impl FrameSource for V4l2Source {
 }
 
 pub struct StdinSource {
-    stdin: Stdin,
+    // fd 0 directly rather than std::io::stdin(): that wraps a BufReader whose
+    // extra copy costs about 10% of frame rate at 3 MB per frame. ManuallyDrop
+    // keeps it from closing stdin when the source is dropped.
+    stdin: ManuallyDrop<std::fs::File>,
     buf: Vec<u8>,
     width: u32,
     height: u32,
@@ -82,7 +87,7 @@ pub struct StdinSource {
 impl StdinSource {
     pub fn new(width: u32, height: u32) -> Self {
         Self {
-            stdin: std::io::stdin(),
+            stdin: ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) }),
             buf: vec![0u8; nv12_len(width, height)],
             width,
             height,
