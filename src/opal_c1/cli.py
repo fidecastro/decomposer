@@ -349,6 +349,20 @@ def _cmd_stream_nv12(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_gui(_: argparse.Namespace) -> int:
+    try:
+        from opal_c1.gui import main as gui_main
+    except (ImportError, ValueError) as e:
+        print(
+            f"GUI needs PyGObject with GTK4 and libadwaita ({e}).\n"
+            "  Arch: sudo pacman -S python-gobject gtk4 libadwaita\n"
+            "  or:   pip install 'decomposer[gui]'",
+            file=sys.stderr,
+        )
+        return 1
+    return gui_main()
+
+
 def _cmd_daemon(args: argparse.Namespace) -> int:
     from opal_c1.daemon import Daemon
 
@@ -564,6 +578,9 @@ def build_parser() -> argparse.ArgumentParser:
     dm.add_argument("--fps", type=float, default=30.0)
     dm.add_argument("--mode", choices=("call", "studio"), default="call")
     dm.set_defaults(func=_cmd_daemon)
+
+    ui = sub.add_parser("gui", help="Open the control panel")
+    ui.set_defaults(func=_cmd_gui)
 
     st = sub.add_parser("status", help="Show what the daemon is doing")
     st.set_defaults(func=_cmd_status)

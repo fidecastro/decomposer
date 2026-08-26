@@ -19,12 +19,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gui = ["pygobject>=3.46"]
 preview = ["opencv-python>=4.8"]
 virtual = ["pyvirtualcam>=0.11"]
 dev = ["pytest>=7.0"]
 
 [project.scripts]
 decomposer = "opal_c1.cli:main"
+
+[project.gui-scripts]
+decomposer-panel = "opal_c1.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

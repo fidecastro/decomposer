@@ -101,6 +101,7 @@ class Daemon:
         self._cam = None  # OpalDevice, Studio mode only
         self._shutdown = threading.Event()
         self.engine_log: list[str] = []
+        self.restarts = 0
 
     # -- engine ---------------------------------------------------------
 
@@ -353,6 +354,7 @@ class Daemon:
         s["mode_actual"] = (current_mode().value if current_mode() else None)
         s["engine_alive"] = self.engine is not None and self.engine.poll() is None
         s["looks"] = LOOKS
+        s["restarts"] = self.restarts
         with self.lock:
             s["engine_log"] = list(self.engine_log)
         if self.engine is not None and self.engine.poll() is not None:
@@ -361,6 +363,46 @@ class Daemon:
                 + (" | ".join(s["engine_log"]) or "no output")
             )
         return s
+
+    # -- supervision ----------------------------------------------------
+
+    def _supervise(self) -> None:
+        """Restart the engine if it dies.
+
+        Observed in practice: the camera re-enumerated under a running engine
+        and it exited with ENODEV. Without this the daemon keeps reporting a
+        mode it is no longer serving, and /dev/video10 stays dark until someone
+        notices.
+        """
+        backoff = 2.0
+        while not self._shutdown.wait(2.0):
+            with self.lock:
+                if not self.state.running or self.engine is None:
+                    continue
+                if self.engine.poll() is None:
+                    backoff = 2.0
+                    continue
+                reason = " | ".join(self.engine_log) or "no output"
+                mode = self.state.mode
+
+            print(f"engine died ({reason}); restarting in {backoff:.0f}s")
+            if self._shutdown.wait(backoff):
+                return
+            try:
+                if Mode(mode) is Mode.CALL:
+                    self.enter_call()
+                else:
+                    self.enter_studio()
+                with self.lock:
+                    self.restarts += 1
+                    self.state.error = f"engine restarted after: {reason}"
+                print(f"engine restarted (total restarts: {self.restarts})")
+                backoff = 2.0
+            except Exception as e:
+                with self.lock:
+                    self.state.error = f"engine restart failed: {type(e).__name__}: {e}"
+                print(f"restart failed: {e}")
+                backoff = min(backoff * 2, 30.0)
 
     # -- server ---------------------------------------------------------
 
@@ -411,6 +453,8 @@ class Daemon:
         server.listen(8)
         server.settimeout(0.5)
         print(f"daemon listening on {path}")
+
+        threading.Thread(target=self._supervise, daemon=True).start()
 
         try:
             self.set_mode(initial_mode)

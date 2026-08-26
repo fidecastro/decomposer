@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=decomposer
+GenericName=Opal C1 Control
+Comment=Camera controls and Composer-inspired looks for the Opal C1
+Exec=decomposer gui
+Icon=camera-video
+Terminal=false
+Categories=AudioVideo;Video;Settings;
+Keywords=camera;webcam;opal;c1;video;looks;
+StartupNotify=true

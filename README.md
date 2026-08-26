@@ -199,3 +199,51 @@ consumer build an unbounded backlog of stale video.
 The remaining ~15% is not yet explained. It is worth revisiting when the daemon
 replaces this pipe, since the daemon can hand frames over shared memory and
 avoid the copy entirely.
+
+## Daemon
+
+The daemon owns the camera and the look engine, and everything else is a client
+of it. That is not architecture for its own sake: Studio-mode settings exist only
+while the XLink connection is held, so whoever holds the device *is* the
+settings, and restarting the engine casually would pull `/dev/video10` out from
+under whatever application is using the camera.
+
+```bash
+decomposer daemon              # holds the camera, publishes to /dev/video10
+decomposer status              # what it is doing, plus the engine's own output
+decomposer look noir           # applies on the next frame - no restart, no flicker
+decomposer switch studio       # ~5s; ~15s coming back
+decomposer set --brightness 150 --iso 400
+decomposer set --focus 150     # Studio mode only, live
+decomposer stop
+```
+
+Look changes go over a control socket to the running engine, so the virtual
+camera never drops. Mode switches do restart the engine, since the input source
+changes — but a consumer attached to `/dev/video10` survives it.
+
+If the engine dies, the daemon restarts it. This is not hypothetical: the camera
+re-enumerated under a running engine during testing and it exited with `ENODEV`.
+The engine's stderr is drained into a ring buffer and shown in `status`, so a
+failure explains itself instead of vanishing.
+
+## Control panel
+
+```bash
+decomposer gui
+```
+
+GTK4 and libadwaita, themed from the active Omarchy palette at
+`~/.local/state/omarchy/current/theme/colors.toml` — it follows whatever theme is
+set rather than shipping its own colours. Mode switch, look picker, strength, and
+camera sliders, with focus and white balance greyed out in Call mode and a line
+explaining why rather than silently doing nothing.
+
+Every daemon call runs on a worker thread: a mode switch takes up to fifteen
+seconds and would otherwise freeze the window.
+
+Install the launcher entry with:
+
+```bash
+install -Dm644 packaging/decomposer.desktop ~/.local/share/applications/decomposer.desktop
+```
