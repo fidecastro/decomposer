@@ -1,0 +1,29 @@
+# Opal C1 — grant the active local user access to the XLink/DepthAI interface.
+#
+# The C1 is a Luxonis OAK-1 MAX underneath (Movidius Myriad X, VID 0x03e7). Its
+# UVC interfaces are handled by the kernel and need no rule, but interface 0 —
+# the vendor bulk endpoint that carries XLink — is reached through libusb, and
+# /dev/bus/usb/* is root-only by default.
+#
+# TAG+="uaccess" hands access to whoever owns the current local seat via
+# systemd-logind ACLs. That is tighter than the MODE="0666" in Luxonis' own
+# docs, which makes the device world-writable for every user on the machine.
+#
+# THE FILENAME NUMBER MATTERS. Setting TAG+="uaccess" only marks the device;
+# the ACL is applied by /usr/lib/udev/rules.d/73-seat-late.rules, which runs
+# the uaccess builtin for anything already tagged. Rules execute in lexical
+# order, so a file numbered above 73 sets the tag *after* the only rule that
+# acts on it — the device ends up with CURRENT_TAGS=:uaccess: and no ACL at
+# all. Hence 60-, not 99-. (This is why Luxonis' docs just use MODE="0666":
+# it sidesteps the ordering problem by not needing a second rule to fire.)
+#
+# Install:
+#   sudo install -m 0644 packaging/60-opal-c1.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --action=add --subsystem-match=usb
+# A replug also works and is the surest option.
+
+SUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", TAG+="uaccess"
+
+# Movidius Myriad X unbooted ROM, in case the C1 ever drops back to it.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", ATTRS{idProduct}=="2485", TAG+="uaccess"

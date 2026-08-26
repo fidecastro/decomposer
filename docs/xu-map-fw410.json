@@ -1,0 +1,763 @@
+{
+  "device": {
+    "idVendor": "03e7",
+    "idProduct": "f63d",
+    "product": "Opal C1",
+    "manufacturer": "Opal",
+    "serial": "1844301061E55F1700",
+    "bcdDevice": "0410",
+    "speed": "5000",
+    "bMaxPower": "896mA"
+  },
+  "unit": {
+    "id": 4,
+    "guid": "{ffffffff-ffff-ffff-ffff-ffffffffffff}",
+    "num_controls": 80
+  },
+  "probes": [
+    {
+      "selector": 1,
+      "length": 1,
+      "info": 3,
+      "caps": [
+        "get",
+        "set"
+      ],
+      "values": {
+        "cur": "5c",
+        "min": "00",
+        "max": "ff",
+        "res": "01",
+        "def": "01"
+      },
+      "errors": {}
+    },
+    {
+      "selector": 2,
+      "length": 1,
+      "info": 3,
+      "caps": [
+        "get",
+        "set"
+      ],
+      "values": {
+        "cur": "01",
+        "min": "00",
+        "max": "ff",
+        "res": "01",
+        "def": "01"
+      },
+      "errors": {}
+    },
+    {
+      "selector": 3,
+      "length": 1,
+      "info": 3,
+      "caps": [
+        "get",
+        "set"
+      ],
+      "values": {
+        "cur": "01",
+        "min": "00",
+        "max": "ff",
+        "res": "01",
+        "def": "01"
+      },
+      "errors": {}
+    },
+    {
+      "selector": 4,
+      "length": 1,
+      "info": 3,
+      "caps": [
+        "get",
+        "set"
+      ],
+      "values": {
+        "cur": "01",
+        "min": "00",
+        "max": "ff",
+        "res": "01",
+        "def": "01"
+      },
+      "errors": {}
+    },
+    {
+      "selector": 5,
+      "length": 1,
+      "info": 3,
+      "caps": [
+        "get",
+        "set"
+      ],
+      "values": {
+        "cur": "01",
+        "min": "00",
+        "max": "ff",
+        "res": "01",
+        "def": "01"
+      },
+      "errors": {}
+    },
+    {
+      "selector": 6,
+      "length": 1,
+      "info": 3,
+      "caps": [
+        "get",
+        "set"
+      ],
+      "values": {
+        "cur": "01",
+        "min": "00",
+        "max": "ff",
+        "res": "01",
+        "def": "01"
+      },
+      "errors": {}
+    },
+    {
+      "selector": 7,
+      "length": 1,
+      "info": 3,
+      "caps": [
+        "get",
+        "set"
+      ],
+      "values": {
+        "cur": "01",
+        "min": "00",
+        "max": "ff",
+        "res": "01",
+        "def": "01"
+      },
+      "errors": {}
+    },
+    {
+      "selector": 8,
+      "length": 1,
+      "info": 3,
+      "caps": [
+        "get",
+        "set"
+      ],
+      "values": {
+        "cur": "01",
+        "min": "00",
+        "max": "ff",
+        "res": "01",
+        "def": "01"
+      },
+      "errors": {}
+    },
+    {
+      "selector": 9,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 10,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 11,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 12,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 13,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 14,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 15,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 16,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 17,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 18,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 19,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 20,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 21,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 22,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 23,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 24,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 25,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 26,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 27,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 28,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 29,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 30,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 31,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 32,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 33,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 34,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 35,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 36,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 37,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 38,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 39,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 40,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 41,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 42,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 43,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 44,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 45,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 46,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 47,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 48,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 49,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 50,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 51,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 52,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 53,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 54,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 55,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 56,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 57,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 58,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 59,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 60,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 61,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 62,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 63,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 64,
+      "length": 0,
+      "info": 0,
+      "caps": [],
+      "values": {},
+      "errors": {}
+    },
+    {
+      "selector": 65,
+      "length": null,
+      "info": null,
+      "caps": [],
+      "values": {},
+      "errors": {
+        "len": 2
+      }
+    },
+    {
+      "selector": 66,
+      "length": null,
+      "info": null,
+      "caps": [],
+      "values": {},
+      "errors": {
+        "len": 2
+      }
+    },
+    {
+      "selector": 67,
+      "length": null,
+      "info": null,
+      "caps": [],
+      "values": {},
+      "errors": {
+        "len": 2
+      }
+    },
+    {
+      "selector": 68,
+      "length": null,
+      "info": null,
+      "caps": [],
+      "values": {},
+      "errors": {
+        "len": 2
+      }
+    },
+    {
+      "selector": 69,
+      "length": null,
+      "info": null,
+      "caps": [],
+      "values": {},
+      "errors": {
+        "len": 2
+      }
+    },
+    {
+      "selector": 70,
+      "length": null,
+      "info": null,
+      "caps": [],
+      "values": {},
+      "errors": {
+        "len": 2
+      }
+    },
+    {
+      "selector": 71,
+      "length": null,
+      "info": null,
+      "caps": [],
+      "values": {},
+      "errors": {
+        "len": 2
+      }
+    },
+    {
+      "selector": 72,
+      "length": null,
+      "info": null,
+      "caps": [],
+      "values": {},
+      "errors": {
+        "len": 2
+      }
+    },
+    {
+      "selector": 73,
+      "length": null,
+      "info": null,
+      "caps": [],
+      "values": {},
+      "errors": {
+        "len": 2
+      }
+    },
+    {
+      "selector": 74,
+      "length": null,
+      "info": null,
+      "caps": [],
+      "values": {},
+      "errors": {
+        "len": 2
+      }
+    },
+    {
+      "selector": 75,
+      "length": null,
+      "info": null,
+      "caps": [],
+      "values": {},
+      "errors": {
+        "len": 2
+      }
+    },
+    {
+      "selector": 76,
+      "length": null,
+      "info": null,
+      "caps": [],
+      "values": {},
+      "errors": {
+        "len": 2
+      }
+    },
+    {
+      "selector": 77,
+      "length": null,
+      "info": null,
+      "caps": [],
+      "values": {},
+      "errors": {
+        "len": 2
+      }
+    },
+    {
+      "selector": 78,
+      "length": null,
+      "info": null,
+      "caps": [],
+      "values": {},
+      "errors": {
+        "len": 2
+      }
+    },
+    {
+      "selector": 79,
+      "length": null,
+      "info": null,
+      "caps": [],
+      "values": {},
+      "errors": {
+        "len": 2
+      }
+    },
+    {
+      "selector": 80,
+      "length": null,
+      "info": null,
+      "caps": [],
+      "values": {},
+      "errors": {
+        "len": 2
+      }
+    }
+  ]
+}

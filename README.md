@@ -17,8 +17,11 @@ This is **not** Opal Composer. It does not redistribute Opal binaries, firmware,
 ## Status
 
 - [x] Project scaffold
+- [x] Linux capture confirmed — stock `uvcvideo`, NV12 4K30 / 1080p30, no vendor software
+- [x] Extension Unit mapped (`decomposer probe-xu`) — see `docs/camera-notes.md`
+- [x] XLink/DepthAI control verified — manual focus, white balance, exposure/ISO all exact
+- [ ] XLink capture -> look engine -> `v4l2loopback`
 - [ ] Mac reference stills (`references/`)
-- [ ] Linux raw UVC preview
 - [ ] Host look engine (Process / Noir / Chrome first)
 - [ ] `v4l2loopback` virtual cam
 
@@ -29,15 +32,44 @@ cd decomposer
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
+```
 
-# List cameras
-decomposer devices
+### One-time setup
 
-# Preview with a look
+The camera's manual controls live on XLink, which is reached through libusb, so
+the USB node needs an ACL:
+
+```bash
+sudo install -m 0644 packaging/60-opal-c1.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --action=add --subsystem-match=usb
+```
+
+Without it `depthai` reports zero devices and logs "Insufficient permissions".
+
+### Camera control
+
+```bash
+# What the device actually is
+decomposer camera-info
+
+# Manual focus, white balance, exposure. -1 returns a control to auto.
+decomposer control --focus 150 --wb 3200 --iso 400 --exposure 12000
+decomposer control --auto
+
+# Map the vendor UVC Extension Unit (read-only diagnostic)
+decomposer probe-xu
+```
+
+**While any of these run, `/dev/video0` disappears.** Attaching XLink tears down
+the camera's UVC interfaces; they return about 14 seconds after the command
+exits. This is a property of the hardware, not a bug — see `docs/camera-notes.md`.
+
+### Looks (work in progress)
+
+```bash
 decomposer preview --look noir
-
-# Publish to v4l2loopback (after: sudo modprobe v4l2loopback)
-decomposer virtual --look process --out /dev/video10
+decomposer virtual --look process --out /dev/video10   # needs v4l2loopback
 ```
 
 ## Mac reference capture
