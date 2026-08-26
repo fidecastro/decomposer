@@ -20,8 +20,9 @@ struct Params {
     ov_w: u32,
     ov_h: u32,
     ov_opacity: f32,
+    /// Edge length of the loaded 3D LUT; 0 means use the built-in look.
+    lut_size: u32,
     _pad0: u32,
-    _pad1: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -29,6 +30,8 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> dst: array<u32>;
 // Pre-scaled RGBA8, one pixel per u32, already at ov_w x ov_h.
 @group(0) @binding(3) var<storage, read> overlay: array<u32>;
+// Red varies fastest: index = r + g*size + b*size*size.
+@group(0) @binding(4) var<storage, read> lut: array<vec4<f32>>;
 
 fn unpack4(word: u32) -> vec4<f32> {
     return vec4<f32>(
@@ -75,9 +78,42 @@ fn contrast_about(c: vec3<f32>, amount: f32, pivot: f32) -> vec3<f32> {
     return (c - pivot) * amount + pivot;
 }
 
-// Approximations of Composer's named photo effects. These are deliberate
-// reinterpretations, not ports: Apple's CIPhotoEffect curves are not public.
+fn lut_at(r: u32, g: u32, b: u32) -> vec3<f32> {
+    let n = params.lut_size;
+    return lut[r + g * n + b * n * n].rgb;
+}
+
+// Trilinear between the eight surrounding grid points. The tables are measured
+// at every one of their own grid points, so interpolation only ever happens
+// between real measurements.
+fn sample_lut(c: vec3<f32>) -> vec3<f32> {
+    let n = f32(params.lut_size);
+    let p = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)) * (n - 1.0);
+    let lo = floor(p);
+    let f = p - lo;
+    let hi = min(lo + 1.0, vec3<f32>(n - 1.0));
+
+    let r0 = u32(lo.r); let r1 = u32(hi.r);
+    let g0 = u32(lo.g); let g1 = u32(hi.g);
+    let b0 = u32(lo.b); let b1 = u32(hi.b);
+
+    let c00 = mix(lut_at(r0, g0, b0), lut_at(r1, g0, b0), f.r);
+    let c10 = mix(lut_at(r0, g1, b0), lut_at(r1, g1, b0), f.r);
+    let c01 = mix(lut_at(r0, g0, b1), lut_at(r1, g0, b1), f.r);
+    let c11 = mix(lut_at(r0, g1, b1), lut_at(r1, g1, b1), f.r);
+    return mix(mix(c00, c10, f.g), mix(c01, c11, f.g), f.b);
+}
+
+// A LUT, when one is loaded, is Composer's actual transform rather than an
+// approximation of it. The built-in curves below remain as a fallback for when
+// the LUT files are not installed.
 fn apply_look(c_in: vec3<f32>) -> vec3<f32> {
+    if (params.lut_size > 0u) {
+        return clamp(
+            mix(c_in, sample_lut(c_in), params.strength),
+            vec3<f32>(0.0), vec3<f32>(1.0),
+        );
+    }
     var c = c_in;
     switch params.look {
         case 1u: { // process — cool shadows, lifted greens

@@ -19,6 +19,9 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone)]
 pub struct LookState {
     pub look: u32,
+    /// The name as requested. Resolved to a LUT file if one exists, and only
+    /// then falling back to a built-in curve.
+    pub look_name: String,
     pub strength: f32,
     /// bit 0: mirror horizontally, bit 1: mirror vertically.
     pub flip: u32,
@@ -36,9 +39,9 @@ pub struct LookState {
 
 pub type Shared = Arc<Mutex<LookState>>;
 
-pub fn shared(look: u32, strength: f32, flip: u32) -> Shared {
+pub fn shared(look: u32, name: String, strength: f32, flip: u32) -> Shared {
     Arc::new(Mutex::new(LookState {
-        look, strength, flip, dirty: false,
+        look, look_name: name, strength, flip, dirty: false,
         overlay_path: None,
         overlay_x: 0, overlay_y: 0,
         overlay_max_w: 0, overlay_max_h: 0,
@@ -84,12 +87,12 @@ fn apply(line: &str, state: &Shared) {
     let Ok(mut s) = state.lock() else { return };
     match cmd {
         "look" => {
-            if let Some(idx) = crate::gpu::look_index(rest) {
-                s.look = idx;
-                s.dirty = true;
-            } else {
-                eprintln!("unknown look {rest:?}");
-            }
+            // Any name is accepted here: resolution to a LUT file or a
+            // built-in curve happens in the render loop, which is the only
+            // place that knows where the LUTs live.
+            s.look_name = rest.to_string();
+            s.look = crate::gpu::look_index(rest).unwrap_or(0);
+            s.dirty = true;
         }
         "strength" => {
             if let Ok(v) = rest.parse::<f32>() {

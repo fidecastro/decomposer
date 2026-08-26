@@ -36,10 +36,43 @@ from typing import Optional
 from opal_c1.modes import Mode, current_mode, wait_until_capturable
 from opal_c1.v4l2 import UvcControls
 
-LOOKS = [
+# The eight Core Image effects Composer exposed, then its five own looks.
+# Order is deliberate: it is the order they appear in the panel.
+BUILTIN_LOOKS = [
     "none", "process", "chrome", "fade", "instant",
     "mono", "noir", "tonal", "transfer",
 ]
+CUSTOM_LOOKS = ["G1", "D1", "Q1", "S1", "X1"]
+
+
+def lut_dir() -> Optional[Path]:
+    """Where the extracted .cube LUTs live, if they are installed."""
+    here = Path(__file__).resolve().parents[2]
+    candidate = here / "luts"
+    return candidate if candidate.is_dir() else None
+
+
+def available_looks() -> list[str]:
+    """Built-ins, plus any look with a LUT beside it.
+
+    A LUT is the measured transform rather than an approximation, so when one
+    exists for a built-in name the engine prefers it; the name stays the same
+    either way.
+    """
+    looks = list(BUILTIN_LOOKS)
+    d = lut_dir()
+    if d is None:
+        return looks
+    have = {p.stem for p in d.glob("*.cube")}
+    looks += [n for n in CUSTOM_LOOKS if n in have]
+    looks += sorted(
+        n for n in have
+        if n not in looks and n not in CUSTOM_LOOKS
+    )
+    return looks
+
+
+LOOKS = available_looks()
 
 # Controls the daemon accepts in Call mode, mapped to V4L2 names.
 CALL_CONTROLS = {
@@ -143,6 +176,8 @@ class Daemon:
             "--control", str(self.engine_ctl),
             "--preview", str(self.preview_sock),
         ] + (
+            ["--lut-dir", str(lut_dir())] if lut_dir() else []
+        ) + (
             # Passed at startup too, so an engine restart keeps the overlay.
             ["--overlay", self.state.overlay] if self.state.overlay else []
         )
@@ -368,8 +403,9 @@ class Daemon:
     def set_look(self, look: Optional[str], strength: Optional[float]) -> dict:
         with self.lock:
             if look is not None:
-                if look not in LOOKS:
-                    raise ValueError(f"unknown look {look!r}. Known: {', '.join(LOOKS)}")
+                known = available_looks()
+                if look not in known:
+                    raise ValueError(f"unknown look {look!r}. Known: {', '.join(known)}")
                 self.state.look = look
                 self._tell_engine(f"look {look}")
             if strength is not None:
@@ -470,7 +506,7 @@ class Daemon:
         s["controls"] = self._live_controls()
         s["mode_actual"] = (current_mode().value if current_mode() else None)
         s["engine_alive"] = self.engine is not None and self.engine.poll() is None
-        s["looks"] = LOOKS
+        s["looks"] = available_looks()
         s["restarts"] = self.restarts
         s["preview"] = str(self.preview_sock) if self.preview_sock.exists() else None
         with self.lock:

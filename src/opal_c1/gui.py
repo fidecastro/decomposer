@@ -48,10 +48,15 @@ from opal_c1.daemon import Client, runtime_dir  # noqa: E402
 WIDTH = 384
 PREVIEW_H = 216
 
-LOOKS = [
-    "none", "process", "chrome", "fade", "instant",
+# Composer's eight Core Image effects, then its own five. Both groups are
+# loaded from LUTs measured off Composer itself, so the descriptions below are
+# from measuring what each one does, not from marketing copy.
+CI_LOOKS = [
+    "process", "chrome", "fade", "instant",
     "mono", "noir", "tonal", "transfer",
 ]
+CUSTOM_LOOKS = ["G1", "D1", "Q1", "S1", "X1"]
+LOOKS = ["none"] + CI_LOOKS + CUSTOM_LOOKS
 LOOK_BLURB = {
     "none": "Untouched",
     "process": "Cool shadows, lifted greens",
@@ -62,6 +67,11 @@ LOOK_BLURB = {
     "noir": "Dramatic black and white",
     "tonal": "Soft black and white",
     "transfer": "Warm midtones",
+    "G1": "Composer's own \u2014 cool lift, subtle",
+    "D1": "Composer's own \u2014 black and white, punchy",
+    "Q1": "Composer's own \u2014 black and white, soft",
+    "S1": "Composer's own \u2014 cool lift, medium",
+    "X1": "Composer's own \u2014 cool lift, strong",
 }
 
 AUTO_CAPABLE = ("focus", "wb")
@@ -312,8 +322,13 @@ class Panel(Gtk.Box):
         none_button.set_vexpand(True)
         grid.attach(none_button, 0, 0, 1, 2)
 
-        for i, name in enumerate(n for n in LOOKS if n != "none"):
+        # The eight Core Image looks fill the block beside "none"; Composer's
+        # own five get their own row so the two families stay legible.
+        for i, name in enumerate(CI_LOOKS):
             grid.attach(chip(name), 1 + i % 4, i // 4, 1, 1)
+        for i, name in enumerate(CUSTOM_LOOKS):
+            grid.attach(chip(name), i, 2, 1, 1)
+
         box.append(grid)
 
         row, self.strength, self.strength_value = self._slider_row(
@@ -578,8 +593,11 @@ class Panel(Gtk.Box):
             (b.add_css_class if name == mode else b.remove_css_class)("selected")
 
         look = st.get("look", "none")
+        # A look whose LUT is not installed is shown but not offered.
+        offered = set(st.get("looks") or LOOKS)
         for name, b in self.look_buttons.items():
-            b.set_sensitive(True)
+            b.set_sensitive(name in offered)
+            b.set_opacity(1.0 if name in offered else 0.4)
             (b.add_css_class if name == look else b.remove_css_class)("selected")
 
         overlay = st.get("overlay")

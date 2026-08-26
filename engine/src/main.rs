@@ -13,6 +13,7 @@ use clap::Parser;
 
 mod control;
 mod gpu;
+mod lut;
 mod overlay;
 mod preview;
 mod source;
@@ -58,6 +59,11 @@ struct Args {
     /// Mirror: bit 0 horizontal, bit 1 vertical, 3 = 180 degrees
     #[arg(long, default_value_t = 0)]
     flip: u32,
+
+    /// Directory of .cube LUTs; a look is matched against <name>.cube here
+    /// before falling back to the built-in curves
+    #[arg(long)]
+    lut_dir: Option<String>,
 
     /// PNG to composite over the frame
     #[arg(long)]
@@ -116,13 +122,39 @@ fn main() -> Result<()> {
     // seconds switching the camera's firmware before anything arrives, and
     // charging that to the frame rate makes the engine look half as fast.
     let mut start = std::time::Instant::now();
+    // Resolved before the look is validated, since a LUT name is a valid look
+    // even when it is not one of the built-in curves.
+    let lut_dir = args.lut_dir.clone().map(std::path::PathBuf::from).or_else(|| {
+        std::env::current_exe().ok().and_then(|exe| {
+            exe.ancestors().map(|a| a.join("luts")).find(|p| p.is_dir())
+        })
+    });
+    if let Some(d) = &lut_dir {
+        eprintln!("luts   {}", d.display());
+    }
+    let mut applied_look = String::new();
+
     let mut engine = if args.passthrough {
         eprintln!("look   passthrough");
         None
     } else {
-        let idx = gpu::look_index(&args.look).ok_or_else(|| {
-            anyhow::anyhow!("unknown look {:?}. Known: {}", args.look, gpu::LOOKS.join(", "))
-        })?;
+        let has_lut = lut_dir
+            .as_ref()
+            .map(|d| lut::find(d, &args.look).is_some())
+            .unwrap_or(false);
+        let idx = match gpu::look_index(&args.look) {
+            Some(i) => i,
+            None if has_lut => 0,
+            None => anyhow::bail!(
+                "unknown look {:?}. Built in: {}{}",
+                args.look,
+                gpu::LOOKS.join(", "),
+                lut_dir
+                    .as_ref()
+                    .map(|d| format!("; LUTs in {}", d.display()))
+                    .unwrap_or_default()
+            ),
+        };
         let g = gpu::Gpu::new(w, h, idx, args.strength, args.flip & 3)?;
         eprintln!("look   {} @ {:.2} on {}", args.look, args.strength, g.adapter_name);
         Some(g)
@@ -130,9 +162,11 @@ fn main() -> Result<()> {
 
     let look_state = control::shared(
         gpu::look_index(&args.look).unwrap_or(0),
+        args.look.clone(),
         args.strength,
         args.flip & 3,
     );
+
     {
         let rect: Vec<u32> = args
             .overlay_rect
@@ -149,6 +183,9 @@ fn main() -> Result<()> {
             s.overlay_max_h = rect[3];
         }
         s.overlay_dirty = s.overlay_path.is_some();
+        // Force the first pass through the resolver so the initial --look
+        // actually loads its LUT instead of silently using a built-in curve.
+        s.dirty = true;
     }
     if let Some(path) = args.control.clone() {
         control::serve(path, look_state.clone())?;
@@ -174,12 +211,40 @@ fn main() -> Result<()> {
                 let mut s = look_state.lock().unwrap();
                 s.dirty.then(|| {
                     s.dirty = false;
-                    (s.look, s.strength, s.flip)
+                    (s.look, s.look_name.clone(), s.strength, s.flip)
                 })
             };
-            if let Some((look, strength, flip)) = pending {
+            if let Some((look, name, strength, flip)) = pending {
                 g.set_look(look, strength);
                 g.set_flip(flip);
+                // Reloading the same LUT every strength tweak would be wasteful,
+                // so only touch it when the name actually changes.
+                if name != applied_look {
+                    applied_look = name.clone();
+                    let loaded = match (&lut_dir, name.as_str()) {
+                        (_, "none") => None,
+                        (Some(dir), n) => lut::find(dir, n).and_then(|p| match lut::load(&p) {
+                            Ok(l) => {
+                                eprintln!("look  {n} from {}", p.display());
+                                Some(l)
+                            }
+                            Err(e) => {
+                                eprintln!("lut: {e:#}");
+                                None
+                            }
+                        }),
+                        _ => None,
+                    };
+                    match loaded {
+                        Some(l) => g.set_lut(Some(&l)),
+                        None => {
+                            g.set_lut(None);
+                            if name != "none" && gpu::look_index(&name).is_none() {
+                                eprintln!("unknown look {name:?}");
+                            }
+                        }
+                    }
+                }
             }
 
             // Loading an overlay decodes and rescales a file, so it is handled

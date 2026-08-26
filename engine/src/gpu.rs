@@ -31,9 +31,11 @@ struct Params {
     ov_w: u32,
     ov_h: u32,
     ov_opacity: f32,
+    /// Edge length of the loaded LUT; 0 means fall back to the built-in look.
+    lut_size: u32,
     // WGSL rounds uniform structs up to 16 bytes; pad explicitly so the Rust
     // and shader layouts cannot silently disagree.
-    _pad: [u32; 2],
+    _pad: [u32; 1],
 }
 
 pub struct Gpu {
@@ -46,6 +48,7 @@ pub struct Gpu {
     src_buf: wgpu::Buffer,
     dst_buf: wgpu::Buffer,
     overlay_buf: wgpu::Buffer,
+    lut_buf: wgpu::Buffer,
     staging: wgpu::Buffer,
     params: Params,
     size: u64,
@@ -76,7 +79,8 @@ impl Gpu {
         let params = Params {
             width, height, look, strength, flip,
             ov_x: 0, ov_y: 0, ov_w: 0, ov_h: 0, ov_opacity: 1.0,
-            _pad: [0; 2],
+            lut_size: 0,
+            _pad: [0; 1],
         };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -100,6 +104,11 @@ impl Gpu {
         let overlay_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("overlay"),
             contents: bytemuck::cast_slice(&[0u32]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("lut"),
+            contents: bytemuck::cast_slice(&[0f32; 4]),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -144,11 +153,17 @@ impl Gpu {
                     ty: storage(true),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: storage(true),
+                    count: None,
+                },
             ],
         });
 
         let bind_group = make_bind_group(
-            &device, &layout, &params_buf, &src_buf, &dst_buf, &overlay_buf,
+            &device, &layout, &params_buf, &src_buf, &dst_buf, &overlay_buf, &lut_buf,
         );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -167,7 +182,8 @@ impl Gpu {
 
         Ok(Self {
             device, queue, pipeline, bind_group, layout, params_buf, src_buf, dst_buf,
-            overlay_buf, staging, params, size, out: vec![0u8; size as usize], adapter_name,
+            overlay_buf, lut_buf, staging, params, size,
+            out: vec![0u8; size as usize], adapter_name,
         })
     }
 
@@ -176,6 +192,32 @@ impl Gpu {
     pub fn set_look(&mut self, look: u32, strength: f32) {
         self.params.look = look;
         self.params.strength = strength;
+        self.upload_params();
+    }
+
+    /// Install a colour lookup table, or clear it with `None` to fall back to
+    /// the built-in curves.
+    pub fn set_lut(&mut self, lut: Option<&crate::lut::Lut>) {
+        match lut {
+            None => self.params.lut_size = 0,
+            Some(l) => {
+                let needed = (l.data.len() * 16) as u64;
+                if self.lut_buf.size() < needed {
+                    self.lut_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("lut"),
+                        size: needed,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    self.bind_group = make_bind_group(
+                        &self.device, &self.layout, &self.params_buf,
+                        &self.src_buf, &self.dst_buf, &self.overlay_buf, &self.lut_buf,
+                    );
+                }
+                self.queue.write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(&l.data));
+                self.params.lut_size = l.size;
+            }
+        }
         self.upload_params();
     }
 
@@ -210,7 +252,7 @@ impl Gpu {
                     });
                     self.bind_group = make_bind_group(
                         &self.device, &self.layout, &self.params_buf,
-                        &self.src_buf, &self.dst_buf, &self.overlay_buf,
+                        &self.src_buf, &self.dst_buf, &self.overlay_buf, &self.lut_buf,
                     );
                 }
                 self.queue.write_buffer(
@@ -284,6 +326,7 @@ fn make_bind_group(
     src: &wgpu::Buffer,
     dst: &wgpu::Buffer,
     overlay: &wgpu::Buffer,
+    lut: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("look-bind"),
@@ -293,6 +336,7 @@ fn make_bind_group(
             wgpu::BindGroupEntry { binding: 1, resource: src.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: dst.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: overlay.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: lut.as_entire_binding() },
         ],
     })
 }

@@ -150,8 +150,13 @@ decomposer stream-nv12 --focus 150 --wb 3200 \
 ./target/release/decomposer-engine --output - --frames 1 | ffmpeg -f rawvideo ...
 ```
 
-Looks: `none`, `process`, `chrome`, `fade`, `instant`, `mono`, `noir`, `tonal`,
-`transfer`. `--strength` blends between the original and the graded frame.
+Looks: `none`, then Composer's eight Core Image effects — `process`, `chrome`,
+`fade`, `instant`, `mono`, `noir`, `tonal`, `transfer` — and its own five,
+`G1`, `D1`, `Q1`, `S1`, `X1`. `--strength` blends between the original and the
+graded frame.
+
+**These are not approximations.** Each one is a 3D LUT measured from Composer
+itself; see *Looks, measured* below.
 
 ### Virtual camera setup
 
@@ -253,6 +258,38 @@ Focus and white balance each have an **auto** button. When a control is on
 automatic the button lights and the value reads `auto` — the daemon stores auto
 as `-1`, and clamping that onto the slider would display `0`, a real and very
 different setting.
+
+### Looks, measured
+
+The looks began as hand-tuned curves guessing at Apple's `CIPhotoEffect`
+pipelines, and Composer's own five (`G1 D1 Q1 S1 X1`) were Metal shaders we
+could not read at all. They are now measured instead.
+
+`references/color-target.png` walks the whole RGB cube — 4096 patches, plus a
+skin-tone strip. Rendering it through Composer's own shaders gives an exact
+input/output pair for every colour. Each look was then checked for a spatial
+component (does the output depend on *where* a pixel is, as it would with a
+vignette or grain?) by grouping pixels by input colour and measuring the spread
+of their outputs. **All thirteen came back with a spread of exactly zero**, which
+means each is a pure colour transform and a LUT reproduces it precisely rather
+than approximately.
+
+`scripts/fit_luts.py` extracts a 16³ `.cube` per look — measured at every one of
+its own grid points, so nothing is interpolated at extraction time. Replaying
+each LUT onto the baseline reproduces Composer's render with **zero error**.
+
+End to end through the NV12 pipeline, against Composer's own output:
+
+| | median | p95 | max |
+|---|---|---|---|
+| error per channel, 0–255 | 0.3–0.5 | ≤1.7 | ≤6 |
+
+That residual is the 8-bit YCbCr round trip, not the LUT. The previous hand-tuned
+curves scored a median of 18–46 with a maximum near 198.
+
+The engine prefers `luts/<name>.cube` when it exists and falls back to the
+built-in curves when it does not, so any `.cube` file works — the look engine is
+open-ended rather than a fixed list.
 
 ### Overlays
 
