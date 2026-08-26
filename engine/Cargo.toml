@@ -1,0 +1,17 @@
+[package]
+name = "decomposer-engine"
+version = "0.1.0"
+edition = "2021"
+description = "GPU look engine for the Opal C1: capture -> look -> virtual camera"
+
+[dependencies]
+anyhow = "1"
+bytemuck = "1.25.2"
+clap = { version = "4", features = ["derive"] }
+pollster = "1.0.1"
+v4l = "0.14"
+wgpu = "30.0.1"
+
+[profile.release]
+opt-level = 3
+lto = true

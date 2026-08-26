@@ -128,3 +128,48 @@ decomposer/
 - Composer UI / stickers / decorations
 - Firmware flashing
 - Shipping Opal’s DepthAI dylib or CoreML models
+## Look engine
+
+`engine/` is a Rust binary that reads NV12, grades it on the GPU and republishes
+it to a v4l2loopback node. One compute dispatch per frame: NV12 in, NV12 out,
+with no CPU-side format conversion.
+
+```bash
+cd engine && cargo build --release
+
+# Call mode: read the camera's own node directly
+./target/release/decomposer-engine --look noir --input /dev/video0 --output /dev/video10
+
+# Studio mode has no V4L2 node, so frames arrive as raw NV12 on stdin
+decomposer stream-nv12 | ./target/release/decomposer-engine --input - --output /dev/video10
+
+# Benchmark without an output, or pipe raw frames out for inspection
+./target/release/decomposer-engine --output null --look chrome --frames 120
+./target/release/decomposer-engine --output - --frames 1 | ffmpeg -f rawvideo ...
+```
+
+Looks: `none`, `process`, `chrome`, `fade`, `instant`, `mono`, `noir`, `tonal`,
+`transfer`. `--strength` blends between the original and the graded frame.
+
+### Virtual camera setup
+
+```bash
+sudo install -m 0644 packaging/v4l2loopback.conf /etc/modprobe.d/
+sudo install -m 0644 packaging/v4l2loopback-load.conf /etc/modules-load.d/
+sudo modprobe v4l2loopback
+```
+
+`exclusive_caps=1` matters: without it Chrome, Zoom and Discord list the device
+and then fail to open it.
+
+### Measured
+
+On an RTX 4090, grading is free — the pipeline is camera-bound:
+
+| | passthrough | with a look |
+|---|---|---|
+| 1080p | 28.1 fps | 28.1 fps (`noir`) |
+| 4K | 23.1 fps | 23.9 fps (`chrome`) |
+
+The GPU stage costs nothing measurable, so the ceiling is the C1's USB bandwidth
+(4K NV12 at 30 fps is ~373 MB/s against a ~400 MB/s practical limit), not the looks.
