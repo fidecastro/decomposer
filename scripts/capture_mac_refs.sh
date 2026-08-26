@@ -24,13 +24,26 @@ case "$mode" in
     echo "Capturing raw Opal C1 (Composer should be quit)…"
     "$BIN" "Opal C1" "$REF/raw-c1.png"
     ;;
+  look)
+    # Everything, including the baseline, comes through the virtual camera so
+    # the only difference between captures is the look itself. Comparing
+    # against the raw C1 instead would fold the virtual camera's own scaling
+    # and sharpening into the measurement.
+    if [[ -z "${2:-}" ]]; then
+      echo "Usage: $0 look off|G1|D1|Q1|S1|X1|chrome|..." >&2
+      exit 1
+    fi
+    echo "Capturing Opal Composer virtual cam as look-${look}.png"
+    echo "(select '${look}' in the Composer UI first; change nothing else)"
+    "$BIN" "Opal Composer" "$REF/look-${look}.png"
+    ;;
   composer)
     echo "Capturing Opal Composer virtual cam as composer-${look}.png"
-    echo "(Composer must be open; select the look in the UI first)"
     "$BIN" "Opal Composer" "$REF/composer-${look}.png"
     ;;
   *)
-    echo "Usage: $0 raw | composer [look-name]"
+    echo "Usage: $0 look <name> | raw | composer [look-name]"
+    echo "See docs/reference-capture.md - the baseline 'look off' is required."
     exit 1
     ;;
 esac
