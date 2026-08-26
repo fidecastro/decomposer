@@ -23,7 +23,21 @@ reboots it.
 - v4l2loopback pins its negotiated format while any consumer holds the node,
   and OBS keeps running (and holding) in the tray after its window closes.
 
-## Hardening (P0 — do before any feature)
+## Refactor outcome (2026-08-26/27, phases 1–6 complete)
+
+The hexagonal refactor landed all six P0 items and most of P1: transitions
+run on a single worker with a 20s rate limit, depthai attach is state-gated
+(no more bootloader wedges), the stall watchdog catches alive-but-frozen
+pipelines, teardown ordering is deadlock-free (a real deadlock was caught
+during its own live test), startup serves clients immediately, sticky
+controls replay after firmware reboots, displaced panels quit on name-loss,
+the panel shows transitions instead of freezing, refresh is single-flight,
+probe-xlink refuses while Studio holds the device, and every engine command
+is logged with its text. Still open: preset --with-mode partial application
+(P1-11), splitting status.error from history, engine-side LUT-name
+sanitizing and async LUT loading (P2), plus the features below.
+
+## Hardening (P0 — done; kept for the record)
 
 1. **Serialize mode transitions.** `enter_call`/`enter_studio` run on client
    handler threads *and* the supervisor thread with no transition lock; two

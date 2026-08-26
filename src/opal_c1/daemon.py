@@ -183,6 +183,7 @@ class Daemon:
         # fresh and status reads it. See _status_poller.
         self._snapshot = {"controls": {}, "mode_actual": None}
         self._preset_cache: Optional[list] = None
+        self._looks_cache: list = available_looks()
 
     # -- engine ---------------------------------------------------------
 
@@ -720,6 +721,10 @@ class Daemon:
             if self._preset_cache is None or ticks % 10 == 0:
                 with suppress(Exception):
                     self._refresh_presets()
+                with suppress(Exception):
+                    fresh = available_looks()
+                    with self.lock:
+                        self._looks_cache = fresh
 
     def _watchdog(self) -> None:
         """Detects the stall: everything alive, zero frames flowing.
@@ -819,7 +824,8 @@ class Daemon:
         s["mode_actual"] = snapshot.get("mode_actual")
         engine = self._engine
         s["engine_alive"] = engine is not None and engine.alive()
-        s["looks"] = available_looks()
+        with self.lock:
+            s["looks"] = list(self._looks_cache)
         s["restarts"] = self.restarts
         with self.lock:
             s["transitioning"] = self._ledger.in_progress

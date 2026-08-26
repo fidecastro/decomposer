@@ -205,6 +205,31 @@ The remaining ~15% is not yet explained. It is worth revisiting when the daemon
 replaces this pipe, since the daemon can hand frames over shared memory and
 avoid the copy entirely.
 
+## Architecture
+
+Hexagonal, with the walls enforced by tests rather than convention:
+
+```
+src/opal_c1/
+  core/         pure decisions: model, transitions, health policy, presets.
+                No IO of any kind - a clock or a socket here fails the suite.
+  ports.py      what the application may know about a camera or the engine
+  adapters/     where ports meet the machine: UVC, depthai, engine process
+  daemon.py     the application: one transition worker, supervisor, poller,
+                stall watchdog, JSON-RPC over a unix socket
+  gui.py, cli.py  clients of the daemon, never owners of hardware
+engine/         Rust: capture -> GPU look -> v4l2loopback, one Config struct
+                fed by both argv and the control socket
+tests/          the camera's misbehavior catalogue, replayed in milliseconds
+```
+
+Three properties the tests pin: the core imports no IO; dependencies point
+inward only (core ← ports ← adapters ← app ← ui); and the engine protocol is
+composed in exactly one module, so command-line and runtime configuration
+cannot drift apart again. Direct-hardware CLI commands refuse to run while a
+daemon owns the camera - two owners was a real failure mode, not a
+hypothetical.
+
 ## Daemon
 
 The daemon owns the camera and the look engine, and everything else is a client
