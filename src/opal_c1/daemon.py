@@ -158,8 +158,9 @@ class Daemon:
         self.state.strength = self.default_strength
         self.fps = fps
         self.lock = threading.RLock()
-        self.engine: Optional[subprocess.Popen] = None
-        self.engine_ctl = runtime_dir() / "engine.sock"
+        # The engine is reachable only through the EngineHandle chokepoint;
+        # created lazily so a missing binary fails with advice, not at import.
+        self._engine = None
         self.preview_sock = runtime_dir() / "preview.sock"
         self._pump: Optional[threading.Thread] = None
         self._pump_stop = threading.Event()
@@ -171,8 +172,6 @@ class Daemon:
         self._backend = None
         self._sticky: dict = {}
         self._shutdown = threading.Event()
-        self.engine_log: list[str] = []
-        self._engine_started = 0.0
         self.restarts = 0
         # Transitions are mutually exclusive and rate-limited. The ledger's
         # decisions come from the pure core; the lock enforces them across
@@ -182,120 +181,91 @@ class Daemon:
 
     # -- engine ---------------------------------------------------------
 
-    def _engine_cmd(self, from_stdin: bool) -> list[str]:
-        binary = find_engine()
-        if binary is None:
-            raise RuntimeError(
-                "decomposer-engine not found. Build it with: cd engine && cargo build --release"
+    def _handle(self):
+        """The one EngineHandle, created on first use."""
+        from opal_c1.adapters.engine_proc import EngineHandle
+
+        if self._engine is None:
+            binary = find_engine()
+            if binary is None:
+                raise RuntimeError(
+                    "decomposer-engine not found. Build it with: "
+                    "cd engine && cargo build --release"
+                )
+            self._engine = EngineHandle(
+                binary, runtime_dir() / "engine.sock", self.preview_sock
             )
-        # Discovered per attempt: the number can change between retries when
-        # the camera has just re-enumerated.
-        cam_node = "-" if from_stdin else (camera_video_node() or "/dev/video0")
-        return [
-            binary,
-            "--input", cam_node,
-            "--output", self.state.output,
-            "--width", str(self.state.width),
-            "--height", str(self.state.height),
-            "--look", self.state.look,
-            "--strength", str(self.state.strength),
-            "--flip", str(self._flip_bits()),
-            "--overlay-rect",
-            f"{self.state.overlay_x},{self.state.overlay_y},"
-            f"{self.state.overlay_w},{self.state.overlay_h}",
-            "--overlay-opacity", str(self.state.overlay_opacity),
-            "--control", str(self.engine_ctl),
-            "--preview", str(self.preview_sock),
-        ] + (
-            ["--lut-dir", str(lut_dir())] if lut_dir() else []
-        ) + (
-            # Passed at startup too, so an engine restart keeps the overlay.
-            ["--overlay", self.state.overlay] if self.state.overlay else []
+        return self._engine
+
+    def _engine_config(self, from_stdin: bool) -> model.EngineConfig:
+        """Desired engine state, assembled from daemon state in one place.
+
+        The input node is discovered at call time: its number changes across
+        re-enumerations, which is why the config is rebuilt per start attempt.
+        """
+        st = self.state
+        return model.EngineConfig(
+            input="-" if from_stdin else (camera_video_node() or "/dev/video0"),
+            output=st.output,
+            width=st.width,
+            height=st.height,
+            look=st.look,
+            strength=st.strength,
+            flip=self._flip_bits(),
+            overlay=st.overlay,
+            overlay_x=st.overlay_x, overlay_y=st.overlay_y,
+            overlay_w=st.overlay_w, overlay_h=st.overlay_h,
+            overlay_opacity=st.overlay_opacity,
+            lut_dir=str(lut_dir()) if lut_dir() else None,
         )
 
-    def _drain_stderr(self, proc: subprocess.Popen) -> None:
-        """Keep the engine's last few stderr lines.
-
-        Without this the pipe fills and the engine blocks, and worse, a crash
-        leaves no explanation anywhere.
-        """
-        for raw in iter(proc.stderr.readline, b""):
-            line = raw.decode(errors="replace").rstrip()
-            if not line:
-                continue
-            with self.lock:
-                self.engine_log.append(line)
-                del self.engine_log[:-12]
-
-    def _start_engine(self, from_stdin: bool, attempts: int = 3) -> None:
-        """Start the engine, retrying a device that is not quite ready.
+    def _engine_up(self, from_stdin: bool, attempts: int = 3) -> None:
+        """(Re)start the engine to match current state, retrying a device
+        that is not quite ready.
 
         Straight after a mode switch the camera can accept an open and then
         fail to stream. Retrying is more reliable than trying to predict how
         long the hardware needs.
         """
+        handle = self._handle()
         last = None
         for attempt in range(1, attempts + 1):
             try:
-                self._spawn_engine(from_stdin)
+                handle.stop()
+                handle.start(self._engine_config(from_stdin))
                 return
             except RuntimeError as e:
                 last = e
-                self._stop_engine()
+                handle.stop()
                 if attempt < attempts:
                     time.sleep(2.0 * attempt)
         raise RuntimeError(f"engine would not start after {attempts} attempts: {last}")
 
-    def _spawn_engine(self, from_stdin: bool) -> None:
-        # A socket file left by a previous engine would make the readiness
-        # check below pass instantly against a process that is already dead.
-        with suppress(OSError):
-            self.engine_ctl.unlink()
-        with self.lock:
-            self.engine_log = []
-
-        cmd = self._engine_cmd(from_stdin)
-        self.engine = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE if from_stdin else subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-        threading.Thread(
-            target=self._drain_stderr, args=(self.engine,), daemon=True
-        ).start()
-        self._engine_started = time.time()
-
-        deadline = time.time() + 8
-        while time.time() < deadline:
-            if self.engine.poll() is not None:
-                raise RuntimeError(
-                    "engine exited immediately: " + (" | ".join(self.engine_log) or "no output")
-                )
-            if self.engine_ctl.exists():
-                return
-            time.sleep(0.1)
-        raise RuntimeError(
-            "engine did not open its control socket within 8s: "
-            + (" | ".join(self.engine_log) or "no output")
-        )
-
-    def _stop_engine(self) -> None:
-        if self.engine is None:
-            return
-        with suppress(Exception):
-            if self.engine.stdin:
-                self.engine.stdin.close()
-        with suppress(Exception):
-            self.engine.terminate()
-            self.engine.wait(timeout=5)
-        self.engine = None
-        with suppress(OSError):
-            self.engine_ctl.unlink()
-
     def _flip_bits(self) -> int:
         """bit 0 mirrors horizontally, bit 1 vertically; both is a 180 turn."""
         return (1 if self.state.mirror_h else 0) | (2 if self.state.mirror_v else 0)
+
+    def _sync_engine(self) -> None:
+        """Make the running engine match state's live fields.
+
+        The handle diffs against what the engine already has and sends only
+        the protocol lines for what changed — and apply_live can never
+        restart, so a look change cannot take /dev/video10 down with it.
+        """
+        engine = self._engine
+        if engine is None:
+            return
+        with self.lock:
+            st = self.state
+            live = dict(
+                look=st.look, strength=st.strength, flip=self._flip_bits(),
+                overlay=st.overlay,
+                overlay_x=st.overlay_x, overlay_y=st.overlay_y,
+                overlay_w=st.overlay_w, overlay_h=st.overlay_h,
+                overlay_opacity=st.overlay_opacity,
+            )
+        with suppress(Exception):
+            engine.apply_live(**live)
 
     def set_mirror(self, horizontal=None, vertical=None) -> dict:
         """Mirror the published image.
@@ -309,7 +279,7 @@ class Daemon:
                 self.state.mirror_h = bool(horizontal)
             if vertical is not None:
                 self.state.mirror_v = bool(vertical)
-            self._tell_engine(f"flip {self._flip_bits()}")
+        self._sync_engine()
         return self.status()
 
     def set_overlay(
@@ -338,24 +308,8 @@ class Daemon:
             if opacity is not None:
                 self.state.overlay_opacity = max(0.0, min(1.0, float(opacity)))
 
-            st = self.state
-            self._tell_engine(
-                f"overlay-rect {st.overlay_x} {st.overlay_y} {st.overlay_w} {st.overlay_h}"
-            )
-            self._tell_engine(f"overlay-opacity {st.overlay_opacity}")
-            self._tell_engine(f"overlay {st.overlay or 'off'}")
+        self._sync_engine()
         return self.status()
-
-    def _tell_engine(self, line: str) -> None:
-        """Send one control line. Ignored if the engine is not up yet."""
-        if not self.engine_ctl.exists():
-            return
-        with suppress(OSError):
-            s = socket.socket(socket.AF_UNIX)
-            s.settimeout(2.0)
-            s.connect(str(self.engine_ctl))
-            s.sendall((line + "\n").encode())
-            s.close()
 
     # -- studio frame pump ----------------------------------------------
 
@@ -369,7 +323,7 @@ class Daemon:
         """
         source = self._backend
         assert isinstance(source, FrameSource), "pump started without a frame source"
-        stdin = self.engine.stdin if self.engine else None
+        stdin = self._engine.stdin if self._engine else None
         try:
             while not self._pump_stop.is_set() and stdin is not None:
                 frame = source.try_read_frame()
@@ -407,10 +361,12 @@ class Daemon:
                 with self.lock:
                     self.state.error = "frame pump would not stop"
                 self._pump = None
-                self._stop_engine()
+                if self._engine is not None:
+                    self._engine.stop()
                 return
             self._pump = None
-        self._stop_engine()
+        if self._engine is not None:
+            self._engine.stop()
         if self._backend is not None:
             try:
                 self._backend.release()
@@ -456,7 +412,7 @@ class Daemon:
         backend.attach()
         with self.lock:
             self._backend = backend
-            self._start_engine(from_stdin=False)
+            self._engine_up(from_stdin=False)
             self.state.running = True
             self.state.frames = 0
         self._replay_sticky(backend)
@@ -473,7 +429,7 @@ class Daemon:
             )
             backend.attach()
             self._backend = backend
-            self._start_engine(from_stdin=True)
+            self._engine_up(from_stdin=True)
             self._pump_stop.clear()
             self._pump = threading.Thread(target=self._pump_frames, daemon=True)
             self._pump.start()
@@ -543,16 +499,15 @@ class Daemon:
                 if look not in known:
                     raise ValueError(f"unknown look {look!r}. Known: {', '.join(known)}")
                 self.state.look = look
-                self._tell_engine(f"look {look}")
                 if strength is None:
-                    remembered = self.state.look_strength.get(look, self.default_strength)
-                    self.state.strength = remembered
-                    self._tell_engine(f"strength {remembered}")
+                    self.state.strength = self.state.look_strength.get(
+                        look, self.default_strength
+                    )
             if strength is not None:
                 value = max(0.0, min(1.0, float(strength)))
                 self.state.strength = value
                 self.state.look_strength[self.state.look] = value
-                self._tell_engine(f"strength {value}")
+        self._sync_engine()
         return self.status()
 
     def set_camera(self, **kw) -> dict:
@@ -720,19 +675,19 @@ class Daemon:
             s = asdict(self.state)
         s["controls"] = self._live_controls()
         s["mode_actual"] = (current_mode().value if current_mode() else None)
-        s["engine_alive"] = self.engine is not None and self.engine.poll() is None
+        engine = self._engine
+        s["engine_alive"] = engine is not None and engine.alive()
         s["looks"] = available_looks()
         s["restarts"] = self.restarts
         with self.lock:
             s["transitioning"] = self._ledger.in_progress
         s["presets"] = [p["name"] for p in self.list_presets()]
         s["preview"] = str(self.preview_sock) if self.preview_sock.exists() else None
-        with self.lock:
-            s["engine_log"] = list(self.engine_log)
-        if self.engine is not None and self.engine.poll() is not None:
+        s["engine_log"] = engine.log_lines() if engine is not None else []
+        if engine is not None and not engine.alive() and engine.config is not None:
             s["error"] = (
-                f"engine exited with code {self.engine.returncode}: "
-                + (" | ".join(s["engine_log"]) or "no output")
+                f"engine exited with code {engine.returncode()}: "
+                + (engine.log_text() or "no output")
             )
         return s
 
@@ -753,14 +708,18 @@ class Daemon:
             with self.lock:
                 if not self.state.running:
                     continue
-                if self.engine is not None and self.engine.poll() is None:
+                engine = self._engine
+                if engine is not None and engine.alive():
                     policy.note_alive()
                     continue
                 # Covers both an engine that died and one that never started
                 # (a mode switch that failed mid-camera-reboot).
-                reason = " | ".join(self.engine_log) or "engine not started"
+                reason = (
+                    engine.log_text() if engine is not None else ""
+                ) or "engine not started"
                 mode = Mode(self.state.mode)
-                uptime = time.time() - self._engine_started if self._engine_started else 0.0
+                started = engine.started_at if engine is not None else 0.0
+                uptime = time.time() - started if started else 0.0
 
             action = policy.on_death(
                 mode, uptime, camera_on_bus=current_mode() is not None

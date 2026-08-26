@@ -11,6 +11,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 
+mod config;
 mod control;
 mod gpu;
 mod lut;
@@ -160,7 +161,7 @@ fn main() -> Result<()> {
         Some(g)
     };
 
-    let look_state = control::shared(
+    let look_state = config::shared(
         gpu::look_index(&args.look).unwrap_or(0),
         args.look.clone(),
         args.strength,

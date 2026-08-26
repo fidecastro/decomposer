@@ -158,6 +158,57 @@ class EngineConfig:
         )
 
 
+def engine_cli_args(config: EngineConfig) -> list:
+    """The engine's command line, derived from the config and nowhere else.
+
+    Socket paths are the adapter's business; everything the engine needs to
+    *reproduce a session* comes from here, which is why a restarted engine
+    cannot come back missing settings: its argv and the runtime protocol are
+    two projections of the same struct.
+    """
+    args = [
+        "--input", config.input,
+        "--output", config.output,
+        "--width", str(config.width),
+        "--height", str(config.height),
+        "--look", config.look,
+        "--strength", str(config.strength),
+        "--flip", str(config.flip),
+        "--overlay-rect",
+        f"{config.overlay_x},{config.overlay_y},"
+        f"{config.overlay_w},{config.overlay_h}",
+        "--overlay-opacity", str(config.overlay_opacity),
+    ]
+    if config.lut_dir:
+        args += ["--lut-dir", config.lut_dir]
+    if config.overlay:
+        args += ["--overlay", config.overlay]
+    return args
+
+
+def engine_delta_lines(old: EngineConfig, new: EngineConfig) -> list:
+    """Control-socket lines that turn a running engine's `old` into `new`.
+
+    The only place protocol strings are composed. Restart-only differences
+    are not expressible as lines — needs_restart_from decides that first.
+    """
+    lines = []
+    if new.look != old.look:
+        lines.append(f"look {new.look}")
+    if new.strength != old.strength:
+        lines.append(f"strength {new.strength}")
+    if new.flip != old.flip:
+        lines.append(f"flip {new.flip}")
+    rect = (new.overlay_x, new.overlay_y, new.overlay_w, new.overlay_h)
+    if rect != (old.overlay_x, old.overlay_y, old.overlay_w, old.overlay_h):
+        lines.append("overlay-rect {} {} {} {}".format(*rect))
+    if new.overlay_opacity != old.overlay_opacity:
+        lines.append(f"overlay-opacity {new.overlay_opacity}")
+    if new.overlay != old.overlay:
+        lines.append(f"overlay {new.overlay or 'off'}")
+    return lines
+
+
 @dataclass
 class ControlsState:
     """Last known control values, plus which of them were explicit requests.
