@@ -263,21 +263,31 @@ class Panel(Gtk.Box):
 
     def _look_block(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        grid = Gtk.FlowBox()
-        grid.set_selection_mode(Gtk.SelectionMode.NONE)
-        grid.set_max_children_per_line(5)
-        grid.set_min_children_per_line(5)
+
+        # "none" is not a look, it is the absence of one, so it gets its own
+        # column at full height. The other eight then divide evenly 4x2 instead
+        # of leaving a ragged gap on the second row.
+        grid = Gtk.Grid()
         grid.set_row_spacing(4)
         grid.set_column_spacing(4)
-        grid.set_homogeneous(True)
+        grid.set_column_homogeneous(True)
         self.look_buttons = {}
-        for name in LOOKS:
+
+        def chip(name: str) -> Gtk.Button:
             b = Gtk.Button(label=name)
             b.add_css_class("dc-chip")
             b.set_tooltip_text(LOOK_BLURB[name])
+            b.set_hexpand(True)
             b.connect("clicked", self._on_look, name)
             self.look_buttons[name] = b
-            grid.append(b)
+            return b
+
+        none_button = chip("none")
+        none_button.set_vexpand(True)
+        grid.attach(none_button, 0, 0, 1, 2)
+
+        for i, name in enumerate(n for n in LOOKS if n != "none"):
+            grid.attach(chip(name), 1 + i % 4, i // 4, 1, 1)
         box.append(grid)
 
         row, self.strength, self.strength_value = self._slider_row(

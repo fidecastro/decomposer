@@ -92,8 +92,12 @@ class State:
 
 
 class Daemon:
-    def __init__(self, output="/dev/video10", width=1920, height=1080, fps=30.0):
+    def __init__(
+        self, output="/dev/video10", width=1920, height=1080, fps=30.0,
+        tray_enabled: bool = False,
+    ):
         self.state = State(output=output, width=width, height=height)
+        self.tray_enabled = tray_enabled
         self.fps = fps
         self.lock = threading.RLock()
         self.engine: Optional[subprocess.Popen] = None
@@ -536,7 +540,14 @@ class Daemon:
                 f.flush()
 
     def _start_tray(self) -> None:
-        """Register a bar button, if the desktop has somewhere to put one."""
+        """Register a StatusNotifierItem, for desktops without the Omarchy plugin.
+
+        Off by default: on Omarchy the QML bar widget is the better button - it
+        draws with the bar's own colours, where a tray icon is a scaled pixmap
+        that renders poorly - and having both puts two marks in the bar.
+        """
+        if not self.tray_enabled:
+            return
         try:
             from opal_c1 import tray
         except ImportError:

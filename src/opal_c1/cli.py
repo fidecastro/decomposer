@@ -500,7 +500,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     from opal_c1.daemon import Daemon
 
     return Daemon(
-        output=args.output, width=args.width, height=args.height, fps=args.fps
+        output=args.output, width=args.width, height=args.height, fps=args.fps,
+        tray_enabled=args.tray,
     ).run(initial_mode=args.mode)
 
 
@@ -731,6 +732,11 @@ def build_parser() -> argparse.ArgumentParser:
     dm.add_argument("--height", type=int, default=1080)
     dm.add_argument("--fps", type=float, default=30.0)
     dm.add_argument("--mode", choices=("call", "studio"), default="call")
+    dm.add_argument(
+        "--tray", action="store_true",
+        help="Also register a StatusNotifierItem (for desktops without the "
+             "Omarchy bar plugin; on Omarchy this duplicates the widget)",
+    )
     dm.set_defaults(func=_cmd_daemon)
 
     idt = sub.add_parser(
