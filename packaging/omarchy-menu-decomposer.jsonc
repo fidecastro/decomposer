@@ -1,0 +1,34 @@
+// Add decomposer to the Omarchy menu.
+//
+// Merge these entries into ~/.config/omarchy/extensions/omarchy-menu.jsonc.
+// `decomposer toggle` shows the overlay, or hides it if it is already up, so
+// one entry serves as the on/off control.
+//
+// Use the absolute path if decomposer lives in a virtualenv and
+// ~/.local/bin is not on the menu's PATH — `decomposer install-desktop`
+// creates that symlink for you.
+{
+  "decomposer": {
+    "icon": "",
+    "label": "Camera",
+    "description": "Opal C1 looks, focus and white balance"
+  },
+  "decomposer.toggle": {
+    "icon": "",
+    "label": "Overlay",
+    "action": "decomposer toggle",
+    "description": "Show or hide the camera overlay"
+  },
+  "decomposer.call": {
+    "icon": "",
+    "label": "Call mode",
+    "action": "decomposer switch call",
+    "description": "Microphone on, autofocus only"
+  },
+  "decomposer.studio": {
+    "icon": "",
+    "label": "Studio mode",
+    "action": "decomposer switch studio",
+    "description": "Manual focus and white balance, no microphone"
+  }
+}

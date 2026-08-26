@@ -94,8 +94,15 @@ def load() -> Theme:
 
 
 def css(t: Theme) -> str:
-    """GTK CSS built from the theme palette and the desktop's UI font."""
+    """GTK CSS built from the theme palette and the desktop's UI font.
+
+    Sizing is deliberately tight. This is an overlay dropped from the bar, not
+    a settings window: it should read like a camera's on-screen display, so
+    type is small, padding is minimal, and the preview is the largest element.
+    """
     family, size = system_font()
+    small = size - 2.0
+
     bg = t.color("background")
     bg_dark = t.color("dark_background", bg)
     bg_light = t.color("lighter_background")
@@ -110,42 +117,77 @@ def css(t: Theme) -> str:
 
     return f"""
     window.decomposer {{
-        background: {bg}; color: {fg};
-        font-family: "{family}", sans-serif; font-size: {size:.0f}pt;
+        background: transparent;
+        font-family: "{family}", sans-serif;
+        font-size: {small:.1f}pt;
     }}
-    .dc-header {{ background: {bg_dark}; color: {fg_bright};
-                  border-bottom: 1px solid {sel}; }}
-    .dc-title {{ font-weight: 700; letter-spacing: 0.5px; color: {fg_bright}; }}
-    .dc-section {{ color: {fg_dim}; font-size: 0.82rem; font-weight: 700;
-                   letter-spacing: 1.2px; text-transform: uppercase; }}
-    .dc-card {{ background: {bg_dark}; border: 1px solid {sel};
-                border-radius: 10px; padding: 14px; }}
-    .dc-hint {{ color: {muted}; font-size: 0.85rem; }}
-    .dc-value {{ color: {fg_dim}; font-size: 0.85rem; }}
+    .dc-root {{
+        background: {bg_dark};
+        border: 1px solid {sel};
+        border-radius: 12px;
+        color: {fg};
+    }}
+
+    .dc-header {{ padding: 7px 10px 5px 10px; }}
+    .dc-title {{ font-weight: 700; color: {fg_bright}; font-size: {small:.1f}pt; }}
+    .dc-sub {{ color: {muted}; font-size: {small - 1.5:.1f}pt; }}
+    .dc-section {{
+        color: {muted}; font-size: {small - 2.0:.1f}pt; font-weight: 700;
+        letter-spacing: 0.9px; padding: 0 2px;
+    }}
+    .dc-hint {{ color: {muted}; font-size: {small - 1.5:.1f}pt; }}
+    .dc-value {{ color: {fg_dim}; font-size: {small - 1.0:.1f}pt; }}
+    .dc-label {{ color: {fg_dim}; font-size: {small - 0.5:.1f}pt; }}
+
+    .dc-preview {{
+        background: #000; border-radius: 7px; border: 1px solid {sel};
+    }}
+    .dc-sep {{ background: {sel}; min-height: 1px; }}
 
     button.dc-chip {{
-        background: {bg_light}; color: {fg}; border: 1px solid {sel};
-        border-radius: 999px; padding: 6px 14px; font-weight: 600;
+        background: {bg_light}; color: {fg_dim};
+        border: 1px solid transparent; border-radius: 6px;
+        padding: 2px 8px; margin: 0;
+        font-size: {small - 1.0:.1f}pt; font-weight: 600;
+        min-height: 0; min-width: 0;
     }}
     button.dc-chip:hover {{ background: {sel}; color: {fg_bright}; }}
     button.dc-chip.selected {{
         background: {accent}; color: {bg_dark}; border-color: {accent};
     }}
-    button.dc-chip:disabled {{ color: {muted}; background: {bg_dark}; }}
+    button.dc-chip:disabled {{ color: {muted}; background: transparent; }}
 
-    .dc-pill {{ border-radius: 999px; padding: 3px 12px; font-weight: 700;
-                font-size: 0.82rem; }}
+    button.dc-tiny {{
+        background: transparent; color: {muted};
+        border: 1px solid {sel}; border-radius: 5px;
+        padding: 0 6px; margin: 0; min-height: 0; min-width: 0;
+        font-size: {small - 2.0:.1f}pt; font-weight: 600;
+    }}
+    button.dc-tiny:hover {{ color: {fg_bright}; border-color: {accent}; }}
+    button.dc-tiny.selected {{ background: {accent}; color: {bg_dark}; border-color: {accent}; }}
+    button.dc-tiny:disabled {{ color: {muted}; opacity: 0.4; }}
+
+    .dc-pill {{
+        border-radius: 5px; padding: 1px 7px; font-weight: 700;
+        font-size: {small - 2.0:.1f}pt;
+    }}
     .dc-pill.call {{ background: {green}; color: {bg_dark}; }}
     .dc-pill.studio {{ background: {accent}; color: {bg_dark}; }}
     .dc-pill.off {{ background: {muted}; color: {bg_dark}; }}
 
-    .dc-warn {{ color: {red}; font-size: 0.85rem; }}
-    .dc-ok {{ color: {green}; font-size: 0.85rem; }}
+    .dc-warn {{ color: {red}; font-size: {small - 1.5:.1f}pt; }}
 
-    /* No explicit slider min-width/height: GTK derives the handle size from
-       the trough, and forcing both makes it compute a negative and warn. */
-    scale {{ min-height: 26px; }}
-    scale trough {{ background: {bg_light}; border-radius: 999px; min-height: 6px; }}
+    /* Compact sliders: no drawn value, the number lives in its own label. */
+    scale {{ min-height: 16px; padding: 0; margin: 0; }}
+    scale trough {{
+        background: {bg_light}; border-radius: 999px;
+        min-height: 3px; margin: 0;
+    }}
     scale highlight {{ background: {accent}; border-radius: 999px; }}
-    scale slider {{ background: {fg}; border-radius: 999px; }}
+    scale slider {{
+        background: {fg}; border-radius: 999px;
+        min-width: 11px; min-height: 11px; margin: -5px;
+    }}
+    scale:disabled slider {{ background: {muted}; }}
+    scale:disabled highlight {{ background: {muted}; }}
     """

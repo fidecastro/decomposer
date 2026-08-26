@@ -227,22 +227,41 @@ re-enumerated under a running engine during testing and it exited with `ENODEV`.
 The engine's stderr is drained into a ring buffer and shown in `status`, so a
 failure explains itself instead of vanishing.
 
-## Control panel
+## Overlay
 
 ```bash
-decomposer gui
+decomposer toggle      # show, or hide if already up
 ```
 
+Not a settings window. It is a Wayland layer surface anchored to the top right,
+sized like a camera's on-screen display: live preview first, then small controls.
+Running `toggle` again hides it, so one bar entry or keybind serves as on/off.
+Escape closes it.
+
 GTK4 and libadwaita, themed from the active Omarchy palette at
-`~/.local/state/omarchy/current/theme/colors.toml` — it follows whatever theme is
-set rather than shipping its own colours. Mode switch, look picker, strength, and
-camera sliders, with focus and white balance greyed out in Call mode and a line
-explaining why rather than silently doing nothing.
+`~/.local/state/omarchy/current/theme/colors.toml` and using the desktop UI font.
+Switching Omarchy themes recolours it live.
 
-Every daemon call runs on a worker thread: a mode switch takes up to fifteen
-seconds and would otherwise freeze the window.
+The preview comes from the **engine**, not the camera: the panel must never open
+the camera itself, because in Studio mode there is no V4L2 node and in Call mode
+a second reader competes with the engine. The engine downscales a frame it
+already has to 480x270 RGB and serves it on a Unix socket, publishing every
+other frame and dropping frames for a slow panel rather than stalling the
+pipeline.
 
-Install the launcher entry with:
+Focus and white balance each have an **auto** button. When a control is on
+automatic the button lights and the value reads `auto` — the daemon stores auto
+as `-1`, and clamping that onto the slider would display `0`, a real and very
+different setting.
+
+### Bar and menu integration
+
+`packaging/omarchy-menu-decomposer.jsonc` holds entries to merge into
+`~/.config/omarchy/extensions/omarchy-menu.jsonc`, giving the Omarchy menu a
+Camera submenu with overlay toggle and mode switching. For a keybind, bind
+`decomposer toggle`.
+
+Install the app-menu launcher with:
 
 ```bash
 decomposer install-desktop
@@ -254,12 +273,9 @@ name is not on `PATH`, so the launcher starts nothing and gives no error.
 `install-desktop` writes the absolute path of the running console script and
 links `~/.local/bin/decomposer`.
 
-The panel follows the desktop while it runs: switching Omarchy themes recolours
-it without a restart, and it uses the desktop UI font from
-`org.gnome.desktop.interface font-name`. Launching it again while it is open
-raises the existing window instead of stacking another.
+### Note on gtk4-layer-shell
 
-Focus and white balance each have an **Auto** button that hands the control back
-to the camera. When a control is on automatic the button is highlighted and the
-slider is left alone — showing `-1` clamped onto the slider would read as
-"focus 0", which is a real and very different setting.
+The library has to be loaded into the process *before* GTK opens the Wayland
+display. Importing the typelib is not enough — `ctypes.CDLL` must pull in the
+shared object first, or `is_supported()` returns false and every window is
+created as an ordinary toplevel the compositor centres and tiles.

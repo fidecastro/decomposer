@@ -13,6 +13,7 @@ use clap::Parser;
 
 mod control;
 mod gpu;
+mod preview;
 mod source;
 use source::{FrameSource, StdinSource, V4l2Source};
 
@@ -52,6 +53,14 @@ struct Args {
     /// Unix socket for runtime "look <name>" / "strength <f>" commands
     #[arg(long)]
     control: Option<String>,
+
+    /// Unix socket serving a downscaled RGB preview to the control panel
+    #[arg(long)]
+    preview: Option<String>,
+
+    /// Publish only every Nth frame to the preview
+    #[arg(long, default_value_t = 2)]
+    preview_every: u64,
 }
 
 fn main() -> Result<()> {
@@ -110,6 +119,11 @@ fn main() -> Result<()> {
         control::serve(path, look_state.clone())?;
     }
 
+    let mut preview = match args.preview.clone() {
+        Some(path) => Some(preview::Preview::new(path, args.preview_every)?),
+        None => None,
+    };
+
     let mut n: u64 = 0;
     loop {
         let frame = match source.next_frame()? {
@@ -138,6 +152,9 @@ fn main() -> Result<()> {
         };
         if let Some(sink) = sink.as_mut() {
             sink.write(out)?;
+        }
+        if let Some(p) = preview.as_mut() {
+            p.publish(out, w, h);
         }
         if let Some(w) = stdout_sink.as_mut() {
             use std::io::Write;

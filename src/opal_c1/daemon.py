@@ -96,6 +96,7 @@ class Daemon:
         self.lock = threading.RLock()
         self.engine: Optional[subprocess.Popen] = None
         self.engine_ctl = runtime_dir() / "engine.sock"
+        self.preview_sock = runtime_dir() / "preview.sock"
         self._pump: Optional[threading.Thread] = None
         self._pump_stop = threading.Event()
         self._cam = None  # OpalDevice, Studio mode only
@@ -120,6 +121,7 @@ class Daemon:
             "--look", self.state.look,
             "--strength", str(self.state.strength),
             "--control", str(self.engine_ctl),
+            "--preview", str(self.preview_sock),
         ]
 
     def _drain_stderr(self, proc: subprocess.Popen) -> None:
@@ -355,6 +357,7 @@ class Daemon:
         s["engine_alive"] = self.engine is not None and self.engine.poll() is None
         s["looks"] = LOOKS
         s["restarts"] = self.restarts
+        s["preview"] = str(self.preview_sock) if self.preview_sock.exists() else None
         with self.lock:
             s["engine_log"] = list(self.engine_log)
         if self.engine is not None and self.engine.poll() is not None:

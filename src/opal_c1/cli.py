@@ -643,8 +643,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     idt.set_defaults(func=_cmd_install_desktop)
 
-    ui = sub.add_parser("gui", help="Open the control panel")
+    ui = sub.add_parser("gui", help="Open the overlay")
     ui.set_defaults(func=_cmd_gui)
+
+    tg = sub.add_parser(
+        "toggle",
+        help="Show the overlay, or hide it if it is already up",
+        description=(
+            "Same as `gui`. Running it while the overlay is open hides it, so a "
+            "single bar entry or keybind toggles the panel."
+        ),
+    )
+    tg.set_defaults(func=_cmd_gui)
 
     st = sub.add_parser("status", help="Show what the daemon is doing")
     st.set_defaults(func=_cmd_status)

@@ -1,28 +1,56 @@
-"""decomposer control panel.
+"""decomposer overlay.
 
-A client of the daemon, not a second owner of the camera: everything here is a
-request over the daemon's socket. That matters because switching modes reboots
-the camera and takes up to fifteen seconds, so every call runs on a worker
-thread and the window stays responsive while the hardware catches up.
+Not a settings window. This drops out of the bar like a camera's on-screen
+display: preview first, everything else small and one click away. It is a
+client of the daemon, so it never opens the camera itself — in Studio mode
+there is no V4L2 node to open, and in Call mode a second reader would compete
+with the engine. The preview comes from the engine, which already has the frame.
 
-Colours come from the active Omarchy theme, so the panel matches the desktop
-rather than imposing its own palette.
+Every daemon call runs on a worker thread: a mode switch reboots the camera and
+takes up to fifteen seconds.
 """
 
 from __future__ import annotations
 
+import socket
+import struct
 import threading
+import time
 from typing import Callable, Optional
 
 import gi
+
+# gtk4-layer-shell has to be in the process before GTK opens the Wayland
+# display, or it never hooks the surface and every window is created as an
+# ordinary toplevel the compositor places and tiles as it sees fit. Importing
+# the typelib is not enough — the shared object itself must be loaded first,
+# which is what makes is_supported() true.
+try:
+    import ctypes
+
+    ctypes.CDLL("libgtk4-layer-shell.so.0", mode=ctypes.RTLD_GLOBAL)
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as LayerShell
+
+    HAVE_LAYER_SHELL = True
+except (ValueError, ImportError, OSError):
+    LayerShell = None
+    HAVE_LAYER_SHELL = False
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from opal_c1 import theme as omtheme  # noqa: E402
-from opal_c1.daemon import Client  # noqa: E402
+from opal_c1.daemon import Client, runtime_dir  # noqa: E402
 
+WIDTH = 384
+PREVIEW_H = 216
+
+LOOKS = [
+    "none", "process", "chrome", "fade", "instant",
+    "mono", "noir", "tonal", "transfer",
+]
 LOOK_BLURB = {
     "none": "Untouched",
     "process": "Cool shadows, lifted greens",
@@ -35,247 +63,324 @@ LOOK_BLURB = {
     "transfer": "Warm midtones",
 }
 
-# Controls the camera exposes, and which mode can actually write them.
-# Controls with an automatic mode the camera will take back.
 AUTO_CAPABLE = ("focus", "wb")
-
 SLIDERS = [
-    ("brightness", "Brightness", 0, 255, 1, "both"),
-    ("contrast", "Contrast", 0, 100, 1, "both"),
-    ("saturation", "Saturation", 0, 100, 1, "both"),
-    ("sharpness", "Sharpness", 0, 4, 1, "both"),
-    ("exposure", "Exposure (us)", 1000, 33000, 100, "both"),
-    ("iso", "ISO", 100, 1600, 50, "both"),
-    ("focus", "Focus", 0, 255, 1, "studio"),
-    ("wb", "White balance (K)", 1000, 12000, 100, "studio"),
+    ("brightness", "Brightness", 0, 255, 1),
+    ("contrast", "Contrast", 0, 100, 1),
+    ("saturation", "Saturation", 0, 100, 1),
+    ("sharpness", "Sharpness", 0, 4, 1),
+    ("exposure", "Exposure", 1000, 33000, 100),
+    ("iso", "ISO", 100, 1600, 50),
+    ("focus", "Focus", 0, 255, 1),
+    ("wb", "White bal.", 1000, 12000, 100),
 ]
 
 
 def _worker(fn: Callable[[], dict], done: Callable[[dict], None]) -> None:
-    """Run a daemon call off the UI thread and hand the result back on it."""
-
     def run() -> None:
         try:
             result = fn()
-        except Exception as e:  # a dead daemon must not take the GUI with it
+        except Exception as e:  # a dead daemon must not take the panel with it
             result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         GLib.idle_add(done, result)
 
     threading.Thread(target=run, daemon=True).start()
 
 
+class Preview(Gtk.Picture):
+    """Live frames from the engine's preview socket.
+
+    Connects only while the overlay is on screen; there is no reason to move
+    pixels for a hidden window.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.set_content_fit(Gtk.ContentFit.COVER)
+        self.set_size_request(WIDTH - 20, PREVIEW_H)
+        self.add_css_class("dc-preview")
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._path = runtime_dir() / "preview.sock"
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                sock = socket.socket(socket.AF_UNIX)
+                sock.settimeout(3.0)
+                sock.connect(str(self._path))
+                header = self._recv_exact(sock, 8)
+                if header is None:
+                    raise OSError("no header")
+                w, h = struct.unpack("<II", header)
+                size = w * h * 3
+                sock.settimeout(5.0)
+                while not self._stop.is_set():
+                    data = self._recv_exact(sock, size)
+                    if data is None:
+                        break
+                    GLib.idle_add(self._show, data, w, h)
+            except OSError:
+                pass
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            # The engine restarts on mode switches; just keep trying.
+            if self._stop.wait(1.0):
+                return
+
+    @staticmethod
+    def _recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
+        buf = bytearray()
+        while len(buf) < n:
+            try:
+                chunk = sock.recv(n - len(buf))
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def _show(self, data: bytes, w: int, h: int) -> bool:
+        try:
+            texture = Gdk.MemoryTexture.new(
+                w, h, Gdk.MemoryFormat.R8G8B8, GLib.Bytes.new(data), w * 3
+            )
+            self.set_paintable(texture)
+        except Exception:
+            pass
+        return False
+
+
 class Panel(Gtk.Box):
-    def __init__(self, theme: omtheme.Theme):
+    def __init__(self, theme: omtheme.Theme, on_close: Callable[[], None]):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add_css_class("dc-root")
         self.theme = theme
+        self.on_close = on_close
         self.client = Client()
         self.status: dict = {}
         self.busy = False
         self._pending: dict = {}
         self._debounce: Optional[int] = None
         self._suppress = False
-        # Building a Gtk.Scale emits value-changed. Until the first status has
-        # been applied those signals carry widget defaults, not camera state,
-        # and acting on them would push every control to its minimum.
+        # Building a Gtk.Scale emits value-changed; until the first status
+        # arrives those signals carry widget defaults, not camera state.
         self._ready = False
 
+        self.set_size_request(WIDTH, -1)
         self.append(self._header())
 
-        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
-        body.set_margin_top(18)
-        body.set_margin_bottom(18)
-        body.set_margin_start(18)
-        body.set_margin_end(18)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
+        body.set_margin_start(10)
+        body.set_margin_end(10)
+        body.set_margin_bottom(9)
 
-        body.append(self._mode_card())
-        body.append(self._look_card())
-        body.append(self._camera_card())
-
-        scroll = Gtk.ScrolledWindow(vexpand=True)
-        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroll.set_child(body)
-        self.append(scroll)
+        self.preview = Preview()
+        body.append(self.preview)
+        body.append(self._mode_row())
+        body.append(self._sep())
+        body.append(self._look_block())
+        body.append(self._sep())
+        body.append(self._camera_block())
+        self.append(body)
         self.append(self._footer())
 
         self.refresh()
         GLib.timeout_add_seconds(2, self._tick)
 
     def set_theme(self, theme: omtheme.Theme) -> None:
-        """Called when the desktop theme changes under us."""
         self.theme = theme
-        self.subtitle.set_text(f"Opal C1  ·  {theme.name}")
+        self.subtitle.set_text(theme.name)
 
-    # -- chrome ---------------------------------------------------------
+    def _sep(self) -> Gtk.Widget:
+        s = Gtk.Box()
+        s.add_css_class("dc-sep")
+        return s
 
     def _header(self) -> Gtk.Widget:
-        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         bar.add_css_class("dc-header")
-        bar.set_margin_top(0)
+
         title = Gtk.Label(label="decomposer", xalign=0)
         title.add_css_class("dc-title")
-        title.set_margin_start(16)
-        title.set_margin_top(12)
-        title.set_margin_bottom(12)
         bar.append(title)
 
-        self.subtitle = Gtk.Label(label=f"Opal C1  ·  {self.theme.name}", xalign=0)
-        self.subtitle.add_css_class("dc-hint")
+        self.subtitle = Gtk.Label(label=self.theme.name, xalign=0)
+        self.subtitle.add_css_class("dc-sub")
         self.subtitle.set_valign(Gtk.Align.CENTER)
         bar.append(self.subtitle)
 
-        spacer = Gtk.Box(hexpand=True)
-        bar.append(spacer)
+        bar.append(Gtk.Box(hexpand=True))
 
         self.mode_pill = Gtk.Label(label="—")
         self.mode_pill.add_css_class("dc-pill")
         self.mode_pill.add_css_class("off")
         self.mode_pill.set_valign(Gtk.Align.CENTER)
-        self.mode_pill.set_margin_end(16)
         bar.append(self.mode_pill)
+
+        close = Gtk.Button(label="✕")
+        close.add_css_class("dc-tiny")
+        close.set_valign(Gtk.Align.CENTER)
+        close.connect("clicked", lambda *_: self.on_close())
+        bar.append(close)
         return bar
 
-    def _card(self, title: str) -> tuple[Gtk.Box, Gtk.Box]:
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        label = Gtk.Label(label=title, xalign=0)
-        label.add_css_class("dc-section")
-        outer.append(label)
-        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        inner.add_css_class("dc-card")
-        outer.append(inner)
-        return outer, inner
+    def _mode_row(self) -> Gtk.Widget:
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        lbl = Gtk.Label(label="MODE", xalign=0)
+        lbl.add_css_class("dc-section")
+        lbl.set_valign(Gtk.Align.CENTER)
+        row.append(lbl)
 
-    # -- mode -----------------------------------------------------------
-
-    def _mode_card(self) -> Gtk.Widget:
-        outer, inner = self._card("Mode")
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         self.mode_buttons = {}
-        for mode, label in (("call", "Call"), ("studio", "Studio")):
-            b = Gtk.Button(label=label)
+        for mode, text in (("call", "Call"), ("studio", "Studio")):
+            b = Gtk.Button(label=text)
             b.add_css_class("dc-chip")
             b.connect("clicked", self._on_mode, mode)
             self.mode_buttons[mode] = b
             row.append(b)
-        inner.append(row)
 
-        self.mode_hint = Gtk.Label(xalign=0, wrap=True)
+        row.append(Gtk.Box(hexpand=True))
+        self.mode_hint = Gtk.Label(xalign=1)
         self.mode_hint.add_css_class("dc-hint")
-        self.mode_hint.set_text(
-            "Call keeps the microphone and /dev/video0. Studio adds manual focus "
-            "and white balance, but the camera reboots into firmware with no "
-            "audio — the C1 mic disappears until you switch back."
-        )
-        inner.append(self.mode_hint)
-        return outer
+        self.mode_hint.set_valign(Gtk.Align.CENTER)
+        row.append(self.mode_hint)
+        return row
 
-    def _on_mode(self, _btn, mode: str) -> None:
-        if self.busy or self.status.get("mode") == mode:
-            return
-        self._set_busy(True, f"Switching to {mode}… the camera reboots, this takes a few seconds")
-        _worker(lambda: self.client.request(cmd="set_mode", mode=mode), self._on_result)
-
-    # -- looks ----------------------------------------------------------
-
-    def _look_card(self) -> Gtk.Widget:
-        outer, inner = self._card("Look")
+    def _look_block(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         grid = Gtk.FlowBox()
         grid.set_selection_mode(Gtk.SelectionMode.NONE)
         grid.set_max_children_per_line(5)
-        grid.set_row_spacing(8)
-        grid.set_column_spacing(8)
+        grid.set_min_children_per_line(5)
+        grid.set_row_spacing(4)
+        grid.set_column_spacing(4)
+        grid.set_homogeneous(True)
         self.look_buttons = {}
-        for name in LOOK_BLURB:
+        for name in LOOKS:
             b = Gtk.Button(label=name)
             b.add_css_class("dc-chip")
             b.set_tooltip_text(LOOK_BLURB[name])
             b.connect("clicked", self._on_look, name)
             self.look_buttons[name] = b
             grid.append(b)
-        inner.append(grid)
+        box.append(grid)
 
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        lbl = Gtk.Label(label="Strength", xalign=0)
-        lbl.add_css_class("dc-value")
-        lbl.set_size_request(110, -1)
-        row.append(lbl)
-        self.strength = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.0, 0.05)
-        self.strength.set_hexpand(True)
-        self.strength.set_draw_value(True)
-        self.strength.set_value(1.0)
+        row, self.strength, self.strength_value = self._slider_row(
+            "Strength", 0.0, 1.0, 0.05, digits=2
+        )
         self.strength.connect("value-changed", self._on_strength)
-        row.append(self.strength)
-        inner.append(row)
-        return outer
+        box.append(row)
+        return box
+
+    def _slider_row(self, label: str, lo, hi, step, digits: int = 0):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        lbl = Gtk.Label(label=label, xalign=0)
+        lbl.add_css_class("dc-label")
+        lbl.set_size_request(64, -1)
+        row.append(lbl)
+
+        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, step)
+        scale.set_hexpand(True)
+        scale.set_draw_value(False)  # the number lives in its own label
+        scale.set_valign(Gtk.Align.CENTER)
+        if digits == 0:
+            scale.set_round_digits(0)
+        row.append(scale)
+
+        value = Gtk.Label(xalign=1)
+        value.add_css_class("dc-value")
+        value.set_size_request(38, -1)
+        row.append(value)
+        return row, scale, value
+
+    def _camera_block(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.sliders = {}
+        self.slider_labels = {}
+        self.slider_values = {}
+        self.auto_buttons = {}
+
+        for key, label, lo, hi, step in SLIDERS:
+            row, scale, value = self._slider_row(label, lo, hi, step)
+            scale.connect("value-changed", self._on_slider, key)
+            if key in AUTO_CAPABLE:
+                auto = Gtk.Button(label="auto")
+                auto.add_css_class("dc-tiny")
+                auto.set_valign(Gtk.Align.CENTER)
+                auto.set_tooltip_text(f"Hand {label.lower()} back to the camera")
+                auto.connect("clicked", self._on_auto, key)
+                row.append(auto)
+                self.auto_buttons[key] = auto
+            self.sliders[key] = scale
+            self.slider_values[key] = value
+            self.slider_labels[key] = row.get_first_child()
+            box.append(row)
+
+        self.camera_hint = Gtk.Label(xalign=0, wrap=True)
+        self.camera_hint.add_css_class("dc-hint")
+        box.append(self.camera_hint)
+        return box
+
+    def _footer(self) -> Gtk.Widget:
+        box = Gtk.Box()
+        self.footer = Gtk.Label(xalign=0, wrap=True)
+        self.footer.add_css_class("dc-hint")
+        self.footer.set_margin_start(10)
+        self.footer.set_margin_end(10)
+        self.footer.set_margin_bottom(8)
+        box.append(self.footer)
+        return box
+
+    # -- actions --------------------------------------------------------
+
+    def _on_mode(self, _btn, mode: str) -> None:
+        if self.busy or self.status.get("mode") == mode:
+            return
+        self._set_busy(True, f"switching to {mode}, the camera reboots…")
+        _worker(lambda: self.client.request(cmd="set_mode", mode=mode), self._on_result)
 
     def _on_look(self, _btn, name: str) -> None:
         if self.busy:
             return
         _worker(lambda: self.client.request(cmd="set_look", look=name), self._on_result)
 
-    def _on_strength(self, scale: Gtk.Scale) -> None:
-        if self._suppress or not self._ready:
-            return
-        self._queue({"strength": round(scale.get_value(), 2)})
-
-    # -- camera ---------------------------------------------------------
-
-    def _camera_card(self) -> Gtk.Widget:
-        outer, inner = self._card("Camera")
-        self.sliders = {}
-        self.slider_labels = {}
-        self.auto_buttons = {}
-        for key, label, lo, hi, step, avail in SLIDERS:
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-            lbl = Gtk.Label(label=label, xalign=0)
-            lbl.add_css_class("dc-value")
-            lbl.set_size_request(110, -1)
-            row.append(lbl)
-
-            scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, step)
-            scale.set_hexpand(True)
-            scale.set_draw_value(True)
-            scale.set_round_digits(0)
-            scale.connect("value-changed", self._on_slider, key)
-            row.append(scale)
-
-            # Focus and white balance are the two controls with a real automatic
-            # mode on this camera; -1 hands them back to it.
-            if key in AUTO_CAPABLE:
-                auto = Gtk.Button(label="Auto")
-                auto.add_css_class("dc-chip")
-                auto.set_tooltip_text(f"Hand {label.lower()} back to the camera")
-                auto.set_valign(Gtk.Align.CENTER)
-                auto.connect("clicked", self._on_auto, key)
-                row.append(auto)
-                self.auto_buttons[key] = auto
-
-            self.sliders[key] = scale
-            self.slider_labels[key] = lbl
-            inner.append(row)
-
-        self.camera_hint = Gtk.Label(xalign=0, wrap=True)
-        self.camera_hint.add_css_class("dc-hint")
-        inner.append(self.camera_hint)
-        return outer
-
     def _on_auto(self, _btn, key: str) -> None:
         if self.busy or not self._ready:
             return
-        # Drop any queued drag for this control so it cannot re-apply a manual
-        # value immediately after we ask for automatic.
         self._pending.pop(key, None)
         _worker(
             lambda: self.client.request(cmd="set_camera", values={key: -1}),
             self._on_result,
         )
 
+    def _on_strength(self, scale: Gtk.Scale) -> None:
+        self.strength_value.set_text(f"{scale.get_value():.2f}")
+        if self._suppress or not self._ready:
+            return
+        self._queue({"strength": round(scale.get_value(), 2)})
+
     def _on_slider(self, scale: Gtk.Scale, key: str) -> None:
+        self.slider_values[key].set_text(f"{int(scale.get_value())}")
         if self._suppress or not self._ready:
             return
         self._queue({key: int(scale.get_value())})
 
     def _queue(self, values: dict) -> None:
-        """Coalesce slider traffic: dragging emits continuously."""
         self._pending.update(values)
         if self._debounce is not None:
             GLib.source_remove(self._debounce)
@@ -299,25 +404,11 @@ class Panel(Gtk.Box):
             )
         return False
 
-    # -- footer / state -------------------------------------------------
-
-    def _footer(self) -> Gtk.Widget:
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        box.add_css_class("dc-header")
-        self.footer = Gtk.Label(xalign=0, wrap=True)
-        self.footer.add_css_class("dc-hint")
-        self.footer.set_margin_start(16)
-        self.footer.set_margin_end(16)
-        self.footer.set_margin_top(9)
-        self.footer.set_margin_bottom(9)
-        box.append(self.footer)
-        return box
+    # -- state ----------------------------------------------------------
 
     def _set_busy(self, busy: bool, message: str = "") -> None:
         self.busy = busy
-        for b in self.mode_buttons.values():
-            b.set_sensitive(not busy)
-        for b in self.look_buttons.values():
+        for b in list(self.mode_buttons.values()) + list(self.look_buttons.values()):
             b.set_sensitive(not busy)
         if message:
             self.footer.set_text(message)
@@ -333,12 +424,11 @@ class Panel(Gtk.Box):
     def _on_result(self, resp: dict) -> bool:
         self._set_busy(False)
         if not resp.get("ok"):
-            err = resp.get("error", "unknown error")
             self.mode_pill.set_text("no daemon")
             for cls in ("call", "studio"):
                 self.mode_pill.remove_css_class(cls)
             self.mode_pill.add_css_class("off")
-            self.footer.set_markup(f"<b>{GLib.markup_escape_text(err)}</b>")
+            self.footer.set_text(resp.get("error", "unknown error"))
             self.footer.add_css_class("dc-warn")
             for b in list(self.mode_buttons.values()) + list(self.look_buttons.values()):
                 b.set_sensitive(False)
@@ -347,10 +437,10 @@ class Panel(Gtk.Box):
             return False
         self.footer.remove_css_class("dc-warn")
         self.status = resp
-        self._apply_status(resp)
+        self._apply(resp)
         return False
 
-    def _apply_status(self, st: dict) -> None:
+    def _apply(self, st: dict) -> None:
         mode = st.get("mode", "call")
         studio = mode == "studio"
 
@@ -358,87 +448,76 @@ class Panel(Gtk.Box):
         for cls in ("call", "studio", "off"):
             self.mode_pill.remove_css_class(cls)
         self.mode_pill.add_css_class(mode if mode in ("call", "studio") else "off")
+        self.mode_hint.set_text("mic off" if studio else "mic on")
 
         for name, b in self.mode_buttons.items():
             b.set_sensitive(True)
-            if name == mode:
-                b.add_css_class("selected")
-            else:
-                b.remove_css_class("selected")
+            (b.add_css_class if name == mode else b.remove_css_class)("selected")
 
         look = st.get("look", "none")
         for name, b in self.look_buttons.items():
             b.set_sensitive(True)
-            if name == look:
-                b.add_css_class("selected")
-            else:
-                b.remove_css_class("selected")
+            (b.add_css_class if name == look else b.remove_css_class)("selected")
 
         self._suppress = True
         try:
             self.strength.set_value(float(st.get("strength", 1.0)))
             controls = st.get("controls") or {}
             for key, scale in self.sliders.items():
-                available = key not in ("focus", "wb") or studio
+                available = key not in AUTO_CAPABLE or studio
                 scale.set_sensitive(available)
-                if key in self.auto_buttons:
-                    self.auto_buttons[key].set_sensitive(available)
-                self.slider_labels[key].set_opacity(1.0 if available else 0.45)
                 value = controls.get(key)
                 on_auto = value == -1
                 if key in self.auto_buttons:
-                    # -1 means the camera is driving it. Showing that on the
-                    # button is honest; clamping it onto the slider would read
-                    # as "focus 0", which is a real and very different setting.
-                    if on_auto:
-                        self.auto_buttons[key].add_css_class("selected")
-                    else:
-                        self.auto_buttons[key].remove_css_class("selected")
+                    self.auto_buttons[key].set_sensitive(available)
+                    # -1 means the camera is driving it. Clamping that onto the
+                    # slider would read as "focus 0", a very different setting.
+                    (self.auto_buttons[key].add_css_class if on_auto
+                     else self.auto_buttons[key].remove_css_class)("selected")
                 if value is not None and not on_auto:
                     scale.set_value(float(value))
-                if on_auto:
-                    self.slider_labels[key].set_opacity(0.55)
+                self.slider_values[key].set_text(
+                    "auto" if on_auto else f"{int(scale.get_value())}"
+                )
         finally:
             self._suppress = False
-        # Only now do slider signals represent user intent.
         self._ready = True
 
         self.camera_hint.set_text(
-            "Focus and white balance are live in Studio mode."
-            if studio
-            else "Focus and white balance are greyed out: Call-mode firmware locks "
-                 "them to automatic. Switch to Studio to control them."
+            "" if studio else "focus and white balance need Studio mode"
         )
 
-        alive = st.get("engine_alive")
-        out = st.get("output", "?")
-        if alive:
+        if st.get("engine_alive"):
             self.footer.set_text(
-                f"Publishing {st.get('width')}x{st.get('height')} to {out}  ·  "
-                f"select it as “decomposer” in your camera app"
+                f"{st.get('width')}×{st.get('height')} → {st.get('output')}"
             )
         else:
-            self.footer.set_text(st.get("error") or "Engine is not running")
+            self.footer.set_text(st.get("error") or "engine not running")
 
 
 class App(Adw.Application):
     def __init__(self):
         super().__init__(application_id="dev.decomposer.Panel")
+        self.window: Optional[Gtk.Window] = None
+        self.panel: Optional[Panel] = None
         self.connect("activate", self.on_activate)
 
     def on_activate(self, _app) -> None:
-        # Launching again while the panel is open should bring it forward
-        # rather than stacking a second identical window.
-        existing = self.get_windows()
-        if existing:
-            existing[0].present()
+        # Launching again is how the bar entry toggles the overlay.
+        if self.window is not None:
+            if self.window.get_visible():
+                self._hide()
+            else:
+                self._show()
             return
+        self._build()
+        self._show()
 
+    def _build(self) -> None:
         theme = omtheme.load()
         Adw.StyleManager.get_default().set_color_scheme(
             Adw.ColorScheme.FORCE_DARK if theme.is_dark else Adw.ColorScheme.FORCE_LIGHT
         )
-
         self.provider = Gtk.CssProvider()
         self.provider.load_from_data(omtheme.css(theme).encode())
         Gtk.StyleContext.add_provider_for_display(
@@ -449,24 +528,58 @@ class App(Adw.Application):
         win = Gtk.ApplicationWindow(application=self)
         win.set_title("decomposer")
         win.add_css_class("decomposer")
-        win.set_default_size(560, 760)
-        self.panel = Panel(theme)
-        win.set_child(self.panel)
-        win.present()
+        win.set_default_size(WIDTH, -1)
+        win.set_resizable(False)
 
+        if HAVE_LAYER_SHELL and LayerShell.is_supported():
+            # A layer surface drops from the bar instead of being a managed
+            # window the compositor will tile or centre.
+            LayerShell.init_for_window(win)
+            LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+            LayerShell.set_anchor(win, LayerShell.Edge.TOP, True)
+            LayerShell.set_anchor(win, LayerShell.Edge.RIGHT, True)
+            LayerShell.set_margin(win, LayerShell.Edge.TOP, 6)
+            LayerShell.set_margin(win, LayerShell.Edge.RIGHT, 6)
+            LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.ON_DEMAND)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._on_key)
+        win.add_controller(keys)
+
+        self.panel = Panel(theme, on_close=self._hide)
+        win.set_child(self.panel)
+        self.window = win
         self._watch_desktop()
 
-    def _watch_desktop(self) -> None:
-        """Re-read colours and font when the desktop changes them.
+    def _on_key(self, _c, keyval, _code, _state) -> bool:
+        if keyval == Gdk.KEY_Escape:
+            self._hide()
+            return True
+        return False
 
-        Omarchy switches theme by repointing ~/.local/state/omarchy/current, so
-        watching that directory catches a theme change without polling.
-        """
+    def _show(self) -> None:
+        if self.window is None:
+            return
+        self.window.present()
+        if self.panel is not None:
+            self.panel.preview.start()
+            self.panel.refresh()
+
+    def _hide(self) -> None:
+        if self.window is None:
+            return
+        if self.panel is not None:
+            self.panel.preview.stop()
+        self.window.set_visible(False)
+
+    # -- follow the desktop ---------------------------------------------
+
+    def _watch_desktop(self) -> None:
         self._reload_pending = None
         self._monitors = []
         try:
-            watch_dir = Gio.File.new_for_path(str(omtheme.STATE_THEME.parent))
-            monitor = watch_dir.monitor_directory(Gio.FileMonitorFlags.NONE, None)
+            watch = Gio.File.new_for_path(str(omtheme.STATE_THEME.parent))
+            monitor = watch.monitor_directory(Gio.FileMonitorFlags.NONE, None)
             monitor.connect("changed", self._on_desktop_changed)
             self._monitors.append(monitor)
         except Exception:
@@ -474,12 +587,11 @@ class App(Adw.Application):
         try:
             settings = Gio.Settings.new("org.gnome.desktop.interface")
             settings.connect("changed::font-name", self._on_desktop_changed)
-            self._settings = settings  # keep alive, or the signal is dropped
+            self._settings = settings  # keep alive or the signal is dropped
         except Exception:
             pass
 
     def _on_desktop_changed(self, *_args) -> None:
-        # A theme switch rewrites several files; coalesce into one reload.
         if self._reload_pending is not None:
             GLib.source_remove(self._reload_pending)
         self._reload_pending = GLib.timeout_add(400, self._reload_theme)
@@ -494,7 +606,7 @@ class App(Adw.Application):
         Adw.StyleManager.get_default().set_color_scheme(
             Adw.ColorScheme.FORCE_DARK if theme.is_dark else Adw.ColorScheme.FORCE_LIGHT
         )
-        if getattr(self, "panel", None) is not None:
+        if self.panel is not None:
             self.panel.set_theme(theme)
         return False
 
