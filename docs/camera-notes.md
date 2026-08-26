@@ -279,3 +279,141 @@ control over XLink at the same time. Since manual focus and white balance exist
 only on XLink, decomposer must pull **frames over XLink too**, and republish them
 to `v4l2loopback` for the rest of the system — which is exactly what open-opal did.
 The kernel capture path is off the table whenever full control is wanted.
+
+### Why the wait is ~14 s: the C1 has two USB personalities
+
+It is not a driver delay or a settling time. Attaching XLink makes the camera
+**reboot into a different USB configuration**, and releasing it reboots back.
+Watching `/sys/bus/usb/devices/2-3` across a cycle:
+
+| moment | devnum | PID | interfaces |
+|---|---|---|---|
+| idle | 23 | `f63d` | **5** — vendor bulk, UVC control, UVC stream, audio control, mic |
+| XLink attached | **24** | **`f63b`** | **1** — vendor bulk only |
+| after release, ~0.5-7 s | — | — | **device is off the bus entirely** |
+| recovered | **25** | `f63d` | 5 |
+
+The device number increments twice per cycle, so these are genuine USB
+disconnect/reconnect events, not interface rebinding. `f63b` is exactly the
+second PID recorded from Composer on macOS.
+
+- **`f63d` = camera mode.** UVC video + UAC2 mic + an idle vendor bulk interface.
+- **`f63b` = DepthAI mode.** Vendor bulk only. Nothing else exists.
+
+Measured over three runs, near-identical each time:
+
+```
+XLink connect        4.5 - 5.3 s   (/dev/video0 is already gone when it returns)
+device.close()             0.14 s
+/dev/video0 reappears     13.7 s
+...then capturable        +1.7 s
+total round trip          ~15.5 s
+```
+
+The wait is the Myriad X restarting its USB stack and re-enumerating. There is
+no host-side shortcut.
+
+### The mic dies too
+
+`f63b` exposes one interface, so the UAC2 mic array goes with the video:
+
+```
+idle       : C1 audio card: PRESENT
+xlink open : C1 audio card: GONE
+after      : C1 audio card: PRESENT
+```
+
+**Running decomposer currently costs the C1's microphone**, which matters more
+than the video node — a call app can be pointed at a loopback video device, but
+it cannot be pointed at a microphone that does not exist.
+
+### Open lead: interface 0 exists in camera mode too
+
+In `f63d`, interface 0 (`2-3:1.0`, class `ff`, bulk `0x01`/`0x81`) is present and
+**has no driver bound**. The mode switch is something the *DepthAI connect
+sequence* triggers, not an inherent property of talking to that endpoint.
+
+This is also the only way to reconcile Composer's macOS behaviour: it showed the
+raw `Opal C1` UVC device *and* a working Composer feed at the same time, which is
+impossible if it held XLink the way depthai does.
+
+So it is worth testing whether interface 0 can be claimed with libusb while the
+device stays in `f63d` — and what protocol answers there. If it can, the hybrid
+design comes back, and the mic and the 15 s round trip both stop being problems.
+
+### What actually causes the mode switch
+
+`DEPTHAI_LEVEL=trace` settles it. depthai never talks to Opal's firmware:
+
+```
+Searching for booted device: ... X_LINK_BOOTLOADER ...
+Connected bootloader version 0.0.15
+Booting FW with Bootloader. Version 0.0.15, Time taken: 3009ms
+```
+
+It reboots the camera through its bootloader and loads **its own** firmware. The
+device's `BoardConfig`, printed in the same trace, names both personalities
+explicitly:
+
+```json
+"usb": {"flashBootedPid": 63037, "pid": 63035, "vid": 999}
+"nonExclusiveMode": false, "uvc": null
+```
+
+`63037` = `0xF63D` (Opal firmware, 5 interfaces), `63035` = `0xF63B` (stock
+DepthAI firmware, 1 interface). UVC and audio disappear because **stock DepthAI
+firmware does not implement them**, not because XLink is inherently exclusive.
+
+Things that do not work as escape hatches:
+
+- `X_LINK_BOOTED_NON_EXCLUSIVE` is an **alias for `X_LINK_FLASH_BOOTED`**, the
+  same enum value. There is no distinct state to request.
+- Passing `X_LINK_BOOTED` fails with `X_LINK_DEVICE_NOT_FOUND` (it does at least
+  leave the device alone).
+- The library exposes only `DEPTHAI_INSTALL_SIGNAL_HANDLER`,
+  `DEPTHAI_LIBUSB_ANDROID_JAVAVM` and `DEPTHAI_ZOO_MODELS_PATH`. No no-boot flag.
+- `BoardConfig.nonExclusiveMode` configures firmware *we* boot; it cannot attach
+  us to Opal's.
+
+**depthai cannot attach to Opal's running firmware.** That is a limitation of the
+client, not of the hardware.
+
+### Interface 0 can be held without rebooting
+
+Claiming interface 0 with libusb in `f63d` mode does **not** trigger the switch:
+
+```
+before      : pid=f63d devnum=27 nIf=5
+after claim : pid=f63d devnum=27 nIf=5
+UVC capture while IF0 held: OK
+mic: PRESENT
+```
+
+`devnum` never changes, UVC keeps streaming, the mic stays. The endpoint is
+silent until spoken to — a request/response protocol. **The hybrid is physically
+possible; only the protocol is missing.**
+
+### The mic can only exist under Opal's firmware
+
+| | Opal fw (`f63d`) | DepthAI fw (`f63b`) |
+|---|---|---|
+| UVC video | yes | yes, if `BoardConfig.uvc.enable` |
+| UAC2 mic | **yes** | **no — depthai has no audio support at all** |
+| Manual focus / WB | no (auto locked read-only) | yes |
+| Our own pipeline | no | yes |
+
+`dai.node.UVC` and `BoardConfig.UVC` exist, so our firmware can serve video — but
+nothing in depthai touches audio. The mic is an Opal firmware function.
+
+### Why Path A is likely real
+
+Composer on macOS showed the raw `Opal C1` UVC device, the `Opal Composer`
+virtual cam, and FaceTime **simultaneously**, while linking
+`libdepthai-core.dylib` and `libusb`. That is only possible if Composer attached
+to Opal's firmware over XLink *without* rebooting it — which is exactly what the
+state name `X_LINK_BOOTED_NON_EXCLUSIVE` describes.
+
+So Opal's firmware almost certainly runs an XLink server alongside UVC and audio.
+Reaching it needs an XLink client (protocol is public: `luxonis/XLink`) speaking
+over interface 0, plus the stream names Opal's app exposes. That is the one path
+that keeps video, mic and manual control at once.
