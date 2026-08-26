@@ -149,7 +149,6 @@ impl Gpu {
 
     /// Change the look without rebuilding the pipeline. Used by the daemon
     /// when the user switches look at runtime.
-    #[allow(dead_code)]
     pub fn set_look(&mut self, look: u32, strength: f32) {
         self.params.look = look;
         self.params.strength = strength;

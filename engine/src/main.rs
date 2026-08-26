@@ -11,6 +11,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 
+mod control;
 mod gpu;
 mod source;
 use source::{FrameSource, StdinSource, V4l2Source};
@@ -47,6 +48,10 @@ struct Args {
     /// Skip the GPU entirely and forward frames untouched
     #[arg(long)]
     passthrough: bool,
+
+    /// Unix socket for runtime "look <name>" / "strength <f>" commands
+    #[arg(long)]
+    control: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -97,6 +102,14 @@ fn main() -> Result<()> {
         Some(g)
     };
 
+    let look_state = control::shared(
+        gpu::look_index(&args.look).unwrap_or(0),
+        args.strength,
+    );
+    if let Some(path) = args.control.clone() {
+        control::serve(path, look_state.clone())?;
+    }
+
     let mut n: u64 = 0;
     loop {
         let frame = match source.next_frame()? {
@@ -105,6 +118,19 @@ fn main() -> Result<()> {
         };
         if n == 0 {
             start = std::time::Instant::now();
+        }
+        if let Some(g) = engine.as_mut() {
+            // Cheap per-frame check; only touches the GPU when something moved.
+            let pending = {
+                let mut s = look_state.lock().unwrap();
+                s.dirty.then(|| {
+                    s.dirty = false;
+                    (s.look, s.strength)
+                })
+            };
+            if let Some((look, strength)) = pending {
+                g.set_look(look, strength);
+            }
         }
         let out = match engine.as_mut() {
             Some(g) => g.process(frame)?,

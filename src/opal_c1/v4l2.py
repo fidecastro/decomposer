@@ -195,3 +195,32 @@ class UvcControls:
     def set_auto_exposure(self) -> int:
         """Hand exposure and gain back to the camera."""
         return self.set("auto_exposure", self.AUTO_EXPOSURE_AUTO)
+
+
+# struct v4l2_capability: driver[16] card[32] bus_info[32] version caps device_caps reserved[3]
+_QUERYCAP_FMT = "<16s32s32sIII3I"
+VIDIOC_QUERYCAP = (2 << 30) | (struct.calcsize(_QUERYCAP_FMT) << 16) | (ord("V") << 8) | 0
+V4L2_CAP_VIDEO_CAPTURE = 0x00000001
+
+
+def capture_ready(dev_path: str = "/dev/video0") -> bool:
+    """True if the node exists *and* answers as a capture device.
+
+    After a mode switch the node reappears roughly 1.5s before it can actually
+    stream, so testing os.path.exists alone races: the engine opens the device,
+    fails, and exits.
+    """
+    try:
+        fd = os.open(dev_path, os.O_RDWR | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        buf = bytearray(struct.calcsize(_QUERYCAP_FMT))
+        fcntl.ioctl(fd, VIDIOC_QUERYCAP, buf, True)
+        caps = struct.unpack(_QUERYCAP_FMT, bytes(buf))[4]
+        device_caps = struct.unpack(_QUERYCAP_FMT, bytes(buf))[5]
+        return bool((device_caps or caps) & V4L2_CAP_VIDEO_CAPTURE)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)

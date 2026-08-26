@@ -116,14 +116,17 @@ def wait_for_mode(mode: Mode, timeout: float = 40.0) -> Optional[float]:
 
 
 def wait_until_capturable(timeout: float = 40.0) -> Optional[float]:
-    """Call mode only: wait for /dev/video0 to exist again after a switch.
+    """Call mode only: wait until /dev/video0 can actually capture again.
 
-    The node reappears a little after the device re-enumerates, so callers that
-    want to capture immediately should wait on this rather than on the mode.
+    The node reappears a little after the device re-enumerates, and can be
+    opened before it will stream, so this checks it answers VIDIOC_QUERYCAP as
+    a capture device rather than just testing for the path.
     """
+    from opal_c1.v4l2 import capture_ready
+
     t0 = time.time()
     while time.time() - t0 < timeout:
-        if os.path.exists("/dev/video0"):
+        if capture_ready():
             return round(time.time() - t0, 1)
         time.sleep(0.2)
     return None

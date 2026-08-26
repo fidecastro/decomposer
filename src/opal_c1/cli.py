@@ -349,6 +349,98 @@ def _cmd_stream_nv12(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_daemon(args: argparse.Namespace) -> int:
+    from opal_c1.daemon import Daemon
+
+    return Daemon(
+        output=args.output, width=args.width, height=args.height, fps=args.fps
+    ).run(initial_mode=args.mode)
+
+
+def _print_status(st: dict) -> None:
+    mark = "" if st.get("mode") == st.get("mode_actual") else \
+        f"  (camera reports: {st.get('mode_actual')})"
+    print(f"  mode      {st.get('mode')}{mark}")
+    print(f"  look      {st.get('look')} @ {st.get('strength')}")
+    print(f"  output    {st.get('output')}  {st.get('width')}x{st.get('height')}")
+    print(f"  engine    {'running' if st.get('engine_alive') else 'STOPPED'}")
+    if st.get("frames"):
+        print(f"  frames    {st['frames']}")
+    if st.get("controls"):
+        print(f"  controls  {st['controls']}")
+    for line in st.get("engine_log") or []:
+        print(f"  engine    {line}")
+    if st.get("error"):
+        print(f"  error     {st['error']}", file=sys.stderr)
+
+
+def _client_call(**req) -> dict:
+    from opal_c1.daemon import Client
+
+    resp = Client().request(**req)
+    if not resp.get("ok"):
+        print(f"  {resp.get('error')}", file=sys.stderr)
+    return resp
+
+
+def _cmd_status(_: argparse.Namespace) -> int:
+    resp = _client_call(cmd="status")
+    if not resp.get("ok"):
+        return 1
+    _print_status(resp)
+    return 0
+
+
+def _cmd_stop(_: argparse.Namespace) -> int:
+    resp = _client_call(cmd="stop")
+    if resp.get("ok"):
+        print("  daemon stopping")
+    return 0 if resp.get("ok") else 1
+
+
+def _cmd_look(args: argparse.Namespace) -> int:
+    resp = _client_call(cmd="set_look", look=args.name, strength=args.strength)
+    if not resp.get("ok"):
+        return 1
+    print(f"  look -> {resp.get('look')} @ {resp.get('strength')}")
+    return 0
+
+
+def _cmd_switch(args: argparse.Namespace) -> int:
+    if args.to == "studio":
+        print("Switching to Studio mode - this takes ~5s and costs the C1 microphone.")
+    else:
+        print("Switching to Call mode - the camera reboots, so this takes ~15s.")
+    resp = _client_call(cmd="set_mode", mode=args.to)
+    if not resp.get("ok"):
+        return 1
+    _print_status(resp)
+    return 0
+
+
+def _cmd_set(args: argparse.Namespace) -> int:
+    values = {
+        k: v
+        for k, v in (
+            ("brightness", args.brightness), ("contrast", args.contrast),
+            ("saturation", args.saturation), ("hue", args.hue),
+            ("sharpness", args.sharpness), ("exposure", args.exposure),
+            ("iso", args.iso), ("focus", args.focus), ("wb", args.wb),
+        )
+        if v is not None
+    }
+    if not values:
+        return _cmd_status(args)
+    resp = _client_call(cmd="set_camera", values=values)
+    if not resp.get("ok"):
+        return 1
+    for k, v in (resp.get("applied") or {}).items():
+        print(f"  {k} -> {v}")
+    for k, why in (resp.get("refused") or {}).items():
+        print(f"  {k}: {why}", file=sys.stderr)
+    return 1 if resp.get("refused") else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="decomposer",
@@ -457,6 +549,53 @@ def build_parser() -> argparse.ArgumentParser:
     sn.add_argument("--iso", type=int, default=None, help="ISO 100-1600")
     sn.add_argument("--frames", type=int, default=0, help="Stop after N frames (0 = forever)")
     sn.set_defaults(func=_cmd_stream_nv12)
+
+    dm = sub.add_parser(
+        "daemon",
+        help="Run the daemon: owns the camera and publishes the processed feed",
+        description=(
+            "Holds the camera and the look engine so that Studio-mode settings "
+            "persist and /dev/video10 never disappears from under an application."
+        ),
+    )
+    dm.add_argument("--output", default="/dev/video10")
+    dm.add_argument("--width", type=int, default=1920)
+    dm.add_argument("--height", type=int, default=1080)
+    dm.add_argument("--fps", type=float, default=30.0)
+    dm.add_argument("--mode", choices=("call", "studio"), default="call")
+    dm.set_defaults(func=_cmd_daemon)
+
+    st = sub.add_parser("status", help="Show what the daemon is doing")
+    st.set_defaults(func=_cmd_status)
+
+    sp = sub.add_parser("stop", help="Stop a running daemon")
+    sp.set_defaults(func=_cmd_stop)
+
+    lk = sub.add_parser("look", help="Change the look on a running daemon")
+    lk.add_argument("name", nargs="?", default=None, help="Look name")
+    lk.add_argument("--strength", type=float, default=None, help="0.0 to 1.0")
+    lk.set_defaults(func=_cmd_look)
+
+    sw = sub.add_parser("switch", help="Switch the daemon between call and studio")
+    sw.add_argument("to", choices=("call", "studio"))
+    sw.set_defaults(func=_cmd_switch)
+
+    se = sub.add_parser(
+        "set",
+        help="Adjust camera controls via the daemon",
+        description=(
+            "Routed to whichever path the current mode allows. focus and wb need "
+            "Studio mode; everything else works in either."
+        ),
+    )
+    for name, helptext in (
+        ("brightness", "0-255"), ("contrast", "0-100"), ("saturation", "0-100"),
+        ("hue", "-180..180"), ("sharpness", "0-4"),
+        ("exposure", "microseconds"), ("iso", "100-1600"),
+        ("focus", "0-255, -1 for auto (Studio)"), ("wb", "1000-12000 K, -1 for auto (Studio)"),
+    ):
+        se.add_argument(f"--{name}", type=int, default=None, help=helptext)
+    se.set_defaults(func=_cmd_set)
 
     return p
 
