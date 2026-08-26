@@ -92,6 +92,22 @@ being measured badly, so only fiducials and framing gate.
   ready for that, and the frame grabber now settles for 3 s and locks whatever
   the device allows before keeping a frame.
 
+## The sanity set (step 8 of the capture doc)
+
+`references/sanity-off.png` is a real scene captured from the **Opal Composer
+virtual camera** (identified against the raw C1 by muting Composer's video and
+seeing which feed stopped), then rendered through the same shaders:
+
+```bash
+./scripts/render_looks_mac references/sanity-off.png <outdir>
+```
+
+`sanity-G1/D1/noir/process.png` are committed as the doc's "off plus two or
+three looks", and `sanity-grid.png` is all fourteen side by side. Every look
+reads as a plausible, distinct grade on real content — the numbers from the
+chart and the eyeball test agree. The other nine renders are one command away
+from `sanity-off.png`.
+
 ## What happens next
 
 Unchanged from `reference-capture.md`: sample every patch centre of each pair,
