@@ -2,6 +2,37 @@
 
 What we need, and why it has to be done this particular way.
 
+> **Status (2026-08-26): the reference set exists, and no camera was involved.**
+> Composer 1.4.4 on an Intel Mac never applies looks: the Filters UI is absent,
+> and a preset whose `effects.filters` block names a look is read but ignored at
+> render time — the app's own strings say why ("This feature requires an M1 or
+> later system"). The camera protocol below therefore cannot even be started on
+> Intel hardware.
+>
+> Instead, `scripts/render_looks_mac.swift` renders `references/color-target.png`
+> through Composer's *actual* look implementations, which any Metal GPU can run:
+> the five custom looks are unary MetalPetal fragment shaders
+> (`MTG1Fragment` …) in OpalCameraVideoService's `default.metallib` — one input
+> texture, no other parameters — and the eight named looks are Apple's public
+> `CIPhotoEffect*` Core Image filters, exactly as the app's `*_pipeline.json`
+> files record. The resulting pairs are pixel-exact, cover the whole cube, and
+> carry none of the display-gamut / sensor-response / clipping distortions the
+> photographed protocol was designed to merely tolerate. Validate them with
+> `check_reference.py --exact` (clipping in a look's *output* is the look
+> behaving, so only fiducials and framing gate).
+>
+> The metallib is read from the locally installed app at run time and only the
+> rendered PNGs are kept — never commit Opal's own binaries or shaders.
+>
+> One honest caveat: this measures the shaders at full strength. Composer's
+> preset schema defaults `filters.intensity` to 0.5, so the in-app look as users
+> see it may be a 50% blend with the input; that is a plain per-pixel mix the
+> engine can apply after the LUT.
+>
+> The protocol below is kept for what the synthetic path cannot do: verifying on
+> an M1 Mac that the virtual-camera output through a real display and sensor
+> matches what the LUTs predict.
+
 ## What a reference still is *for*
 
 Composer's five custom looks — `G1`, `D1`, `Q1`, `S1`, `X1` — are Metal shaders
@@ -46,13 +77,27 @@ auto-exposure correction between shots and the pairing is broken.
 3. In Composer: set **manual** exposure, **manual** white balance, **manual**
    focus. Turn off anything automatic. No stickers, no background replacement,
    no other adjustments — only the look should change from here on.
-4. Capture the baseline with the look **off**:
+
+   This has to be done in Composer's own UI. The virtual camera reports *no*
+   lockable exposure, white-balance or focus modes to AVFoundation, so the
+   capture tool cannot pin any of them for you — it can only wait for them to
+   settle. Over standard UVC the C1's auto white balance and continuous
+   autofocus are read-only and stay on (`docs/camera-notes.md`), so if Composer
+   does not expose these controls, that is the ceiling on this path.
+
+4. Expose for the *chart*, not for a pleasing picture. Both ends must survive:
+   check that the darkest patches are not sitting at 0 and the brightest are
+   not sitting at 255. If red and blue clip while green does not, saturation is
+   too high — the look is being measured through a curve that has already
+   thrown the corners of the cube away.
+
+5. Capture the baseline with the look **off**:
 
    ```bash
    ./scripts/capture_mac_refs.sh look off
    ```
 
-5. Then, without touching the camera, the screen, or any other setting, select
+6. Then, without touching the camera, the screen, or any other setting, select
    each look in the Composer UI and capture it:
 
    ```bash
@@ -63,7 +108,7 @@ auto-exposure correction between shots and the pairing is broken.
    ./scripts/capture_mac_refs.sh look X1
    ```
 
-6. The eight Core Image looks are worth capturing too — we approximated those by
+7. The eight Core Image looks are worth capturing too — we approximated those by
    hand and have never checked them against the real thing:
 
    ```bash
@@ -72,9 +117,27 @@ auto-exposure correction between shots and the pairing is broken.
    done
    ```
 
-7. Finally, a sanity set: point the camera at a normal scene (you, a room) and
+8. Finally, a sanity set: point the camera at a normal scene (you, a room) and
    capture `off` plus two or three looks. The chart tells us the numbers; a real
    scene tells us whether the result *looks* right, which is not the same thing.
+
+Run the captures from your own Terminal. macOS attributes camera access to the
+app that launched the process, so a capture driven from somewhere else gets a
+session that starts cleanly and then delivers no frames at all — it looks like a
+hang, not a permission error.
+
+Each capture is checked as it is taken:
+
+```bash
+./scripts/check_reference.py references/look-G1.png
+```
+
+It locates the fiducials, samples all 4096 patches, and reports how much of the
+cube was destroyed by clipping — plus, for anything other than the baseline, how
+far the framing drifted. `capture_mac_refs.sh` runs it automatically and stops
+on failure. A capture that clips is not recoverable by differencing: if the
+baseline reads 255 and the look reads 255, that colour is gone rather than
+merely distorted. Aim for **under 5%** destroyed.
 
 ## What good output looks like
 

@@ -35,7 +35,26 @@ case "$mode" in
     fi
     echo "Capturing Opal Composer virtual cam as look-${look}.png"
     echo "(select '${look}' in the Composer UI first; change nothing else)"
-    "$BIN" "Opal Composer" "$REF/look-${look}.png"
+    if ! "$BIN" "Opal Composer" "$REF/look-${look}.png"; then
+      echo
+      echo "No frame arrived. Two usual causes:" >&2
+      echo "  - Camera permission: run this from your own Terminal, not from" >&2
+      echo "    another tool. macOS grants camera access to the app that" >&2
+      echo "    launched the process." >&2
+      echo "  - Composer is not streaming: open it and confirm you see a" >&2
+      echo "    live picture before capturing." >&2
+      exit 1
+    fi
+    # Check on the spot. A clipped or shifted capture cannot be rescued later,
+    # and finding out now costs one reshoot instead of the whole set.
+    PY="$ROOT/.venv/bin/python"
+    [[ -x "$PY" ]] || PY=python3
+    "$PY" "$ROOT/scripts/check_reference.py" "$REF/look-${look}.png" || {
+      echo
+      echo "^^ This capture is not usable. Fix the above before continuing;"
+      echo "   if the baseline changes, every look must be recaptured."
+      exit 1
+    }
     ;;
   composer)
     echo "Capturing Opal Composer virtual cam as composer-${look}.png"
