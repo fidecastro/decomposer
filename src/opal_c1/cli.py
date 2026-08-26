@@ -9,88 +9,32 @@ from pathlib import Path
 
 
 
-def _cmd_devices(_: argparse.Namespace) -> int:
-    from opal_c1.capture import list_cameras
-    cams = list_cameras()
-    if not cams:
-        print("No cameras found.")
-        return 1
-    for c in cams:
-        print(f"[{c.index}] {c.name}  backend={c.backend}")
-    print(
-        "\nTip (macOS): indices usually follow system order — "
-        "Opal Composer virtual cam, Opal C1, FaceTime, …"
-    )
-    return 0
+def _cmd_probe_xlink(args: argparse.Namespace) -> int:
+    """Ask the vendor bulk interface whether anything is listening.
 
+    Opal's camera-mode firmware does not service this endpoint, which is why
+    Studio mode has to reboot the camera. If a firmware update ever changed
+    that, this is the check that would show it.
+    """
+    import usb.core
 
-def _cmd_looks(_: argparse.Namespace) -> int:
-    from opal_c1.looks import list_looks
-    for name in list_looks():
-        print(name)
-    return 0
+    from opal_c1.xlink import PID_CAMERA, PID_DEPTHAI, XLinkUSB
 
-
-def _cmd_preview(args: argparse.Namespace) -> int:
-    import cv2
-
-    from opal_c1.capture import open_camera, read_frame
-    from opal_c1.looks import apply_look
-    cap = open_camera(index=args.device, width=args.width, height=args.height)
-    win = "decomposer"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    print(f"Preview device={args.device} look={args.look}  (q to quit)")
+    pid = PID_DEPTHAI if args.depthai_mode else PID_CAMERA
+    print(f"Probing interface 0 on 03e7:{pid:04x} (read-only)")
     try:
-        while True:
-            frame = read_frame(cap)
-            out = apply_look(frame, args.look)
-            cv2.imshow(win, out)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
-                break
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-    return 0
-
-
-def _cmd_capture_ref(args: argparse.Namespace) -> int:
-    import cv2
-
-    from opal_c1.capture import grab_still
-    from opal_c1.looks import apply_look
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    frame = grab_still(index=args.device, width=args.width, height=args.height)
-    if args.look and args.look != "none":
-        frame = apply_look(frame, args.look)
-    if not cv2.imwrite(str(out), frame):
-        print(f"Failed to write {out}", file=sys.stderr)
+        with XLinkUSB(pid=pid) as link:
+            resp = link.ping(timeout=args.timeout)
+    except usb.core.USBTimeoutError:
+        print("  no reply: nothing is servicing the endpoint")
         return 1
-    print(f"Wrote {out} ({frame.shape[1]}x{frame.shape[0]})")
-    return 0
-
-
-def _cmd_virtual(args: argparse.Namespace) -> int:
-    from opal_c1.capture import open_camera, read_frame
-    from opal_c1.looks import apply_look
-    from opal_c1.virtualcam import frames_to_virtual_cam
-
-    cap = open_camera(index=args.device, width=args.width, height=args.height)
-
-    def gen():
-        try:
-            while True:
-                frame = read_frame(cap)
-                yield apply_look(frame, args.look)
-        finally:
-            cap.release()
-
-    print(f"Streaming device={args.device} look={args.look} → virtual cam  (Ctrl+C to stop)")
-    try:
-        frames_to_virtual_cam(gen(), width=args.width, height=args.height, fps=args.fps)
-    except KeyboardInterrupt:
-        print("\nStopped.")
+    except Exception as e:
+        print(f"  {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+    if resp is None:
+        print("  short read")
+        return 1
+    print(f"  <<< {resp.describe()}")
     return 0
 
 
@@ -660,33 +604,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    d = sub.add_parser("devices", help="List OpenCV camera indices")
-    d.set_defaults(func=_cmd_devices)
-
-    l = sub.add_parser("looks", help="List available looks")
-    l.set_defaults(func=_cmd_looks)
-
-    def add_device_opts(sp: argparse.ArgumentParser) -> None:
-        sp.add_argument("--device", type=int, default=0, help="OpenCV camera index")
-        sp.add_argument("--width", type=int, default=1280)
-        sp.add_argument("--height", type=int, default=720)
-
-    pr = sub.add_parser("preview", help="Local preview window with a look")
-    add_device_opts(pr)
-    pr.add_argument("--look", default="none", help="Look name (see: decomposer looks)")
-    pr.set_defaults(func=_cmd_preview)
-
-    cr = sub.add_parser("capture-ref", help="Save a reference still")
-    add_device_opts(cr)
-    cr.add_argument("--look", default="none")
-    cr.add_argument("--out", required=True, help="Output PNG path")
-    cr.set_defaults(func=_cmd_capture_ref)
-
-    v = sub.add_parser("virtual", help="Stream looked frames to a virtual webcam")
-    add_device_opts(v)
-    v.add_argument("--look", default="process")
-    v.add_argument("--fps", type=float, default=30.0)
-    v.set_defaults(func=_cmd_virtual)
+    px = sub.add_parser(
+        "probe-xlink",
+        help="Check whether the vendor bulk interface answers (read-only)",
+    )
+    px.add_argument("--depthai-mode", action="store_true",
+                    help="Probe pid f63b instead of camera-mode f63d")
+    px.add_argument("--timeout", type=int, default=2500)
+    px.set_defaults(func=_cmd_probe_xlink)
 
     x = sub.add_parser(
         "probe-xu",

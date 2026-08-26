@@ -5,8 +5,6 @@ __pycache__/
 dist/
 build/
 .DS_Store
-scripts/capture_mac_frame
 scripts/render_looks_mac
-references/smoke-*.png
 engine/target/
 *.nv12

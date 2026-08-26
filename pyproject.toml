@@ -9,9 +9,8 @@ description = "Composer-inspired looks for the Opal C1 on Linux (and later Windo
 readme = "README.md"
 requires-python = ">=3.9"
 # depthai drives the camera in Studio mode and brings numpy with it. pyusb is
-# only needed for the read-only XLink/extension-unit diagnostics. OpenCV is not
-# in the frame path at all any more - the Rust engine in engine/ does that work -
-# so it is an extra, needed only by the legacy preview/virtual commands.
+# only needed for the read-only XLink and extension-unit diagnostics. Nothing
+# here touches frames: the Rust engine in engine/ owns the pixel path.
 dependencies = [
   "numpy>=1.24",
   "depthai>=3.0",
@@ -20,8 +19,10 @@ dependencies = [
 
 [project.optional-dependencies]
 gui = ["pygobject>=3.46"]
-preview = ["opencv-python>=4.8"]
-virtual = ["pyvirtualcam>=0.11"]
+# Tooling for the reference-capture workflow, not the runtime. OpenCV is
+# used by check_reference.py to find the target's fiducials and de-warp a
+# photographed chart; nothing in the frame path needs it.
+references = ["opencv-python>=4.8"]
 dev = ["pytest>=7.0"]
 
 [project.scripts]
