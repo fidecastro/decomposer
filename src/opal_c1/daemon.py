@@ -102,6 +102,7 @@ class Daemon:
         self._pump: Optional[threading.Thread] = None
         self._pump_stop = threading.Event()
         self._cam = None  # OpalDevice, Studio mode only
+        self._last_frame = None  # newest ISP metadata, Studio mode only
         self._shutdown = threading.Event()
         self.engine_log: list[str] = []
         self.restarts = 0
@@ -229,6 +230,7 @@ class Daemon:
                 stdin.write(frame.nv12())
                 with self.lock:
                     self.state.frames += 1
+                    self._last_frame = frame
         except (BrokenPipeError, ValueError, OSError):
             pass
         except Exception as e:  # surface, do not die silently
@@ -352,9 +354,47 @@ class Daemon:
 
     # -- status ---------------------------------------------------------
 
+    def _live_controls(self) -> dict:
+        """What the camera is actually set to right now.
+
+        Reporting only what this session happened to write is misleading: a
+        freshly started daemon would show every control at its minimum while
+        the camera sat at its real values, so the panel drew every slider at 0.
+        """
+        out: dict = {}
+        if Mode(self.state.mode) is Mode.STUDIO:
+            frame = self._last_frame
+            if frame is not None:
+                for key, value in (
+                    ("focus", frame.lens), ("iso", frame.iso),
+                    ("exposure", frame.exposure_us), ("wb", frame.color_temp),
+                ):
+                    if value is not None:
+                        out[key] = value
+        else:
+            try:
+                uvc = UvcControls()
+                for key, name in (
+                    ("brightness", "brightness"), ("contrast", "contrast"),
+                    ("saturation", "saturation"), ("sharpness", "sharpness"),
+                    ("iso", "gain"), ("exposure", "exposure_time_absolute"),
+                ):
+                    control = uvc.query(name)
+                    if control is not None and control.value is not None:
+                        out[key] = control.value
+            except OSError:
+                pass
+        # An explicit request for automatic outranks whatever value the ISP
+        # happens to be reporting while it hunts.
+        for key in ("focus", "wb"):
+            if self.state.controls.get(key) == -1:
+                out[key] = -1
+        return out
+
     def status(self) -> dict:
         with self.lock:
             s = asdict(self.state)
+        s["controls"] = self._live_controls()
         s["mode_actual"] = (current_mode().value if current_mode() else None)
         s["engine_alive"] = self.engine is not None and self.engine.poll() is None
         s["looks"] = LOOKS
@@ -446,6 +486,27 @@ class Daemon:
                 f.write((json.dumps(resp) + "\n").encode())
                 f.flush()
 
+    def _start_tray(self) -> None:
+        """Register a bar button, if the desktop has somewhere to put one."""
+        try:
+            from opal_c1 import tray
+        except ImportError:
+            return
+
+        def toggle() -> None:
+            # Spawn rather than call: the overlay is a separate GTK process,
+            # and running it again is what toggles it.
+            with suppress(Exception):
+                subprocess.Popen(
+                    [sys.executable, "-m", "opal_c1.cli", "toggle"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+
+        with suppress(Exception):
+            tray.run_in_thread(toggle)
+
     def _bind(self, server: socket.socket, path: Path, timeout: float = 20.0) -> bool:
         """Take the socket, waiting out a predecessor that is still shutting down.
 
@@ -494,6 +555,7 @@ class Daemon:
         print(f"daemon listening on {path}")
 
         threading.Thread(target=self._supervise, daemon=True).start()
+        self._start_tray()
 
         try:
             self.set_mode(initial_mode)

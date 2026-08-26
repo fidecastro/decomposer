@@ -363,6 +363,15 @@ def _cmd_install_desktop(args: argparse.Namespace) -> int:
     exe = Path(sys.argv[0]).resolve()
     if not exe.is_file():
         exe = Path(sys.executable).resolve()
+    # Ship the mark as a themed icon so the launcher and window manager
+    # show it rather than a generic camera glyph.
+    from opal_c1 import logo
+
+    icons = Path.home() / ".local/share/icons/hicolor/scalable/apps"
+    icons.mkdir(parents=True, exist_ok=True)
+    (icons / "decomposer.svg").write_text(logo.svg(color="#ffffff"))
+    print(f"  wrote {icons / 'decomposer.svg'}")
+
     apps = Path.home() / ".local/share/applications"
     apps.mkdir(parents=True, exist_ok=True)
     target = apps / "decomposer.desktop"
@@ -375,6 +384,7 @@ def _cmd_install_desktop(args: argparse.Namespace) -> int:
         "Categories=AudioVideo;Video;Settings;\n"
     )
     template = template.replace("Exec=decomposer gui", f"Exec={exe} gui")
+    template = template.replace("Icon=camera-video", "Icon=decomposer")
     target.write_text(template)
     print(f"  wrote {target}")
     print(f"  Exec={exe} gui")

@@ -254,7 +254,45 @@ automatic the button lights and the value reads `auto` — the daemon stores aut
 as `-1`, and clamping that onto the slider would display `0`, a real and very
 different setting.
 
+### The mark
+
+Opal Composer's logo is a circle and a triangle in black and white, where the
+overlap flips colour. `src/opal_c1/logo.py` borrows that idea in Omarchy's pixel
+vocabulary: a pixelated semicircle for the D with a triangle driven into it, and
+the intersection punched out rather than filled.
+
+```
+  ######      ##
+  ########    ####
+  ##########  ######
+  ####################
+  ############  ########
+  ############  ##########
+  ############  ############
+  ############  ############
+  ############  ##########
+  ############  ########
+  ####################
+  ##########  ######
+  ########    ####
+  ######      ##
+```
+
+The geometry is generated, not drawn, so the SVG icon and the tray pixmap are
+always the same shape. Getting there took a few passes: driving the triangle
+deep into the bowl hollowed the D out into a bracket or a thin outline. The
+overlap wants to be a *seam between two solid forms*, the way Composer's is, not
+a subtraction that destroys one of them.
+
 ### Bar and menu integration
+
+decomposer registers a **StatusNotifierItem**, so the daemon puts a button in the
+Omarchy bar's tray. Clicking it toggles the overlay. The bar is Quickshell and
+its widget ids are all built in, so there is no custom-widget slot to fill — a
+tray item is the supported way in, and it needs no new dependencies since Gio
+speaks D-Bus. The icon travels as a pixmap rather than an icon name, so it does
+not depend on an icon theme being installed or refreshed.
+
 
 `packaging/omarchy-menu-decomposer.jsonc` holds entries to merge into
 `~/.config/omarchy/extensions/omarchy-menu.jsonc`, giving the Omarchy menu a
