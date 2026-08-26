@@ -108,11 +108,22 @@ class EngineHandle:
         if proc is None:
             return
         with suppress(Exception):
-            if proc.stdin:
-                proc.stdin.close()
-        with suppress(Exception):
             proc.terminate()
             proc.wait(timeout=5)
+        if proc.poll() is None:
+            # A SIGSTOPped or wedged process ignores SIGTERM; the watchdog
+            # depends on stop() actually stopping, so escalate.
+            with suppress(Exception):
+                proc.kill()
+                proc.wait(timeout=2)
+        # stdin is closed only after the process is dead. Closing it first
+        # flushes buffered frames into the pipe, and a stopped reader turns
+        # that flush into a permanent hang - the stall watchdog froze exactly
+        # there, inside a suppress() that never got the chance to help. With
+        # the reader gone the flush fails fast with EPIPE instead.
+        with suppress(Exception):
+            if proc.stdin:
+                proc.stdin.close()
         self._proc = None
         with suppress(OSError):
             self._control.unlink()

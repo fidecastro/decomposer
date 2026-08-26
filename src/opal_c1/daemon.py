@@ -23,6 +23,7 @@ import errno
 import json
 import os
 import shutil
+import queue
 import socket
 import subprocess
 import sys
@@ -173,11 +174,15 @@ class Daemon:
         self._sticky: dict = {}
         self._shutdown = threading.Event()
         self.restarts = 0
-        # Transitions are mutually exclusive and rate-limited. The ledger's
-        # decisions come from the pure core; the lock enforces them across
-        # client handler threads and the supervisor.
+        # Transitions are executed by exactly one worker thread, in order.
+        # Clients and the supervisor submit requests; the ledger (pure core)
+        # decides admission. Exclusivity is structural, not a mutex.
         self._ledger = transitions.Ledger(current=Mode(self.state.mode))
-        self._transition_lock = threading.Lock()
+        self._requests: queue.Queue = queue.Queue()
+        # status() must never touch hardware: a poller keeps this snapshot
+        # fresh and status reads it. See _status_poller.
+        self._snapshot = {"controls": {}, "mode_actual": None}
+        self._preset_cache: Optional[list] = None
 
     # -- engine ---------------------------------------------------------
 
@@ -352,6 +357,13 @@ class Daemon:
         outside: a camera cycling through its bootloader every fifteen seconds.
         """
         self._pump_stop.set()
+        # Stop the engine before joining the pump: a pump blocked in
+        # stdin.write can only exit once the pipe dies, and EngineHandle.stop
+        # guarantees that (it kills the process before touching stdin, so the
+        # close cannot hang on flushing into a wedged reader).
+        engine = self._engine
+        if engine is not None:
+            engine.stop()
         if self._pump is not None:
             self._pump.join(timeout=5)
             if self._pump.is_alive():
@@ -361,12 +373,8 @@ class Daemon:
                 with self.lock:
                     self.state.error = "frame pump would not stop"
                 self._pump = None
-                if self._engine is not None:
-                    self._engine.stop()
                 return
             self._pump = None
-        if self._engine is not None:
-            self._engine.stop()
         if self._backend is not None:
             try:
                 self._backend.release()
@@ -397,10 +405,13 @@ class Daemon:
             print(f"sticky replay failed: {e}")
 
     def enter_call(self) -> None:
+        """Only the transition worker calls this. The state lock is taken for
+        mutations only — a mode entry spends seconds in hardware waits, and
+        holding the lock across them froze every status() call meanwhile."""
         from opal_c1.adapters.uvc_cam import UvcBackend
 
+        self._teardown()
         with self.lock:
-            self._teardown()
             self.state.mode = Mode.CALL.value
             self.state.error = None
         # Leaving Studio mode reboots the camera; /dev/video0 takes ~14s.
@@ -410,78 +421,107 @@ class Daemon:
             wait_until_capturable(timeout=10)
         backend = UvcBackend()
         backend.attach()
+        self._backend = backend
+        self._engine_up(from_stdin=False)
         with self.lock:
-            self._backend = backend
-            self._engine_up(from_stdin=False)
             self.state.running = True
             self.state.frames = 0
         self._replay_sticky(backend)
 
     def enter_studio(self) -> None:
+        """Only the transition worker calls this; see enter_call on locking."""
         from opal_c1.adapters.depthai_cam import XLinkBackend
 
+        self._teardown()
         with self.lock:
-            self._teardown()
             self.state.mode = Mode.STUDIO.value
             self.state.error = None
-            backend = XLinkBackend(
-                width=self.state.width, height=self.state.height, fps=self.fps
-            )
-            backend.attach()
-            self._backend = backend
-            self._engine_up(from_stdin=True)
-            self._pump_stop.clear()
-            self._pump = threading.Thread(target=self._pump_frames, daemon=True)
-            self._pump.start()
+        backend = XLinkBackend(
+            width=self.state.width, height=self.state.height, fps=self.fps
+        )
+        backend.attach()
+        self._backend = backend
+        self._engine_up(from_stdin=True)
+        self._pump_stop.clear()
+        self._pump = threading.Thread(target=self._pump_frames, daemon=True)
+        self._pump.start()
+        with self.lock:
             self.state.running = True
             self.state.frames = 0
         self._replay_sticky(backend)
 
-    def _transition(self, want: Mode, *, enforce_guard: bool) -> None:
-        """The single doorway through which every mode entry passes.
+    class _Request:
+        def __init__(self, want: Mode):
+            self.want = want
+            self.done = threading.Event()
+            self.error: Optional[BaseException] = None
 
-        Client switches are guarded — rate-limited and mutually exclusive —
-        because every switch reboots the camera's firmware and concurrent
-        entries used to interleave teardown with startup. Supervisor
-        re-entries share the exclusivity but bypass the rate limit: recovery
-        must not be blocked by the thing it is recovering from.
+    def request_transition(
+        self, want: Mode, *, enforce_guard: bool, wait: bool = True,
+        timeout: float = 120.0,
+    ) -> None:
+        """Submit a mode entry to the single transition worker.
+
+        Client switches are guarded — rate-limited, and rejected rather than
+        queued while another transition runs, because a queued surprise
+        firmware reboot is worse than a refusal. Supervisor re-entries bypass
+        the rate limit: recovery must not be blocked by the thing it is
+        recovering from.
         """
         now = time.monotonic()
-        if enforce_guard:
-            with self.lock:
+        with self.lock:
+            busy = self._ledger.in_progress or not self._requests.empty()
+            if enforce_guard:
+                if busy:
+                    raise RuntimeError("a mode transition is already in progress")
                 decision = transitions.evaluate_switch(self._ledger, want, now)
-            if not decision.allowed:
-                raise RuntimeError(decision.reason)
-        if not self._transition_lock.acquire(blocking=False):
-            raise RuntimeError("a mode transition is already in progress")
-        try:
+                if not decision.allowed:
+                    raise RuntimeError(decision.reason)
+            if want is not self._ledger.current:
+                self._ledger.last_switch_at = now
+            request = self._Request(want)
+            self._requests.put(request)
+        if not wait:
+            return
+        if not request.done.wait(timeout):
+            raise RuntimeError(
+                f"transition to {want.value} still running after {timeout:.0f}s"
+            )
+        if request.error is not None:
+            raise request.error
+
+    def _transition_worker(self) -> None:
+        """The one thread that ever enters a mode. Interleaved teardown and
+        startup — two switches racing on different threads — is structurally
+        impossible now, not merely locked away."""
+        while not self._shutdown.is_set():
+            try:
+                request = self._requests.get(timeout=0.5)
+            except queue.Empty:
+                continue
             with self.lock:
-                if want is not self._ledger.current:
-                    self._ledger.last_switch_at = now
                 self._ledger.in_progress = True
-            if want is Mode.CALL:
-                self.enter_call()
-            else:
-                self.enter_studio()
-        finally:
-            with self.lock:
-                self._ledger.in_progress = False
-                self._ledger.current = Mode(self.state.mode)
-            self._transition_lock.release()
+            try:
+                if request.want is Mode.CALL:
+                    self.enter_call()
+                else:
+                    self.enter_studio()
+            except BaseException as e:
+                request.error = e
+                # The mode is still what was asked for: leave `running` set so
+                # the supervisor keeps working toward it instead of going
+                # dormant after a switch that failed mid-camera-reboot.
+                with self.lock:
+                    self.state.running = True
+                    self.state.error = f"{type(e).__name__}: {e}"
+            finally:
+                with self.lock:
+                    self._ledger.in_progress = False
+                    self._ledger.current = Mode(self.state.mode)
+                request.done.set()
 
     def set_mode(self, mode: str) -> dict:
-        want = Mode(mode)
-        try:
-            self._transition(want, enforce_guard=True)
-        except Exception as e:
-            # The mode is still what was asked for: leave `running` set so the
-            # supervisor keeps working toward it instead of going dormant. A
-            # switch issued while the camera is mid-reboot fails exactly once
-            # and used to strand the daemon until someone reissued it by hand.
-            with self.lock:
-                self.state.running = True
-                self.state.error = f"{type(e).__name__}: {e}"
-            raise
+        self.request_transition(Mode(mode), enforce_guard=True)
         return self.status()
 
     # -- controls -------------------------------------------------------
@@ -570,10 +610,11 @@ class Daemon:
                     "width": st.overlay_w, "height": st.overlay_h,
                     "opacity": st.overlay_opacity,
                 },
-                "controls": self._live_controls(),
+                "controls": dict(self._snapshot.get("controls") or {}),
             }
         path = _preset_path(name)
         path.write_text(json.dumps(data, indent=2) + "\n")
+        self._refresh_presets()
         out = self.status()
         out["preset_saved"] = str(path)
         return out
@@ -650,9 +691,103 @@ class Daemon:
         if not path.is_file():
             raise FileNotFoundError(f"no preset named {name!r}")
         path.unlink()
+        self._refresh_presets()
         return {"deleted": name}
 
     # -- status ---------------------------------------------------------
+
+    def _refresh_presets(self) -> None:
+        found = self.list_presets()
+        with self.lock:
+            self._preset_cache = found
+
+    def _status_poller(self) -> None:
+        """Keeps the snapshot status() serves. The only periodic hardware
+        reader: one place to throttle, one place to blame."""
+        ticks = 0
+        while not self._shutdown.wait(1.0):
+            with self.lock:
+                transitioning = self._ledger.in_progress
+            if not transitioning:
+                controls = self._live_controls()
+                mode = current_mode()
+                with self.lock:
+                    self._snapshot = {
+                        "controls": controls,
+                        "mode_actual": mode.value if mode else None,
+                    }
+            ticks += 1
+            if self._preset_cache is None or ticks % 10 == 0:
+                with suppress(Exception):
+                    self._refresh_presets()
+
+    def _watchdog(self) -> None:
+        """Detects the stall: everything alive, zero frames flowing.
+
+        Consumes the engine's preview socket as an ordinary client - the one
+        observable that exists in both modes - and feeds the pure
+        StallDetector. On a stall it stops the engine; recovery is the
+        supervisor's job, through the same policy as any other death.
+        """
+        detector = health.StallDetector()
+        frames = 0
+        sock = None
+
+        def drop(connection):
+            if connection is not None:
+                with suppress(Exception):
+                    connection.close()
+            return None
+
+        while not self._shutdown.wait(0.5):
+            engine = self._engine
+            with self.lock:
+                transitioning = self._ledger.in_progress
+            if engine is None or not engine.alive() or transitioning:
+                detector.reset()
+                sock = drop(sock)
+                continue
+            try:
+                if sock is None:
+                    sock = socket.socket(socket.AF_UNIX)
+                    sock.settimeout(1.5)
+                    sock.connect(str(self.preview_sock))
+                    header = self._recv_exact(sock, 8)
+                    if header is None:
+                        raise OSError("preview closed during header")
+                    w = int.from_bytes(header[0:4], "little")
+                    h = int.from_bytes(header[4:8], "little")
+                    self._preview_frame_len = w * h * 3
+                if self._recv_exact(sock, self._preview_frame_len) is not None:
+                    frames += 1
+                else:
+                    sock = drop(sock)
+            except OSError:
+                # Connection trouble is not evidence of a stall by itself;
+                # the detector decides based on frame progress over time.
+                sock = drop(sock)
+            if detector.update(frames, time.monotonic()):
+                message = (
+                    "pipeline stalled: engine alive but no frames for "
+                    f"{detector.window:.0f}s; restarting the engine"
+                )
+                print(message)
+                with self.lock:
+                    self.state.error = message
+                engine.stop()
+                detector.reset()
+                sock = drop(sock)
+        drop(sock)
+
+    @staticmethod
+    def _recv_exact(sock: socket.socket, n: int):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                return None
+            buf.extend(chunk)
+        return bytes(buf)
 
     def _live_controls(self) -> dict:
         """What the camera is actually set to right now.
@@ -671,17 +806,26 @@ class Daemon:
         return model.merge_reported(live, self._sticky)
 
     def status(self) -> dict:
+        """A snapshot, never a probe: hardware truths come from the poller.
+
+        status() is called constantly (the panel every 2s, plus every setter)
+        and used to open the camera node and read sysfs each time - including
+        while a transition held the lock, which froze every client.
+        """
         with self.lock:
             s = asdict(self.state)
-        s["controls"] = self._live_controls()
-        s["mode_actual"] = (current_mode().value if current_mode() else None)
+            snapshot = dict(self._snapshot)
+        s["controls"] = snapshot.get("controls", {})
+        s["mode_actual"] = snapshot.get("mode_actual")
         engine = self._engine
         s["engine_alive"] = engine is not None and engine.alive()
         s["looks"] = available_looks()
         s["restarts"] = self.restarts
         with self.lock:
             s["transitioning"] = self._ledger.in_progress
-        s["presets"] = [p["name"] for p in self.list_presets()]
+        with self.lock:
+            cached = self._preset_cache
+        s["presets"] = [p["name"] for p in (cached or [])]
         s["preview"] = str(self.preview_sock) if self.preview_sock.exists() else None
         s["engine_log"] = engine.log_lines() if engine is not None else []
         if engine is not None and not engine.alive() and engine.config is not None:
@@ -757,12 +901,13 @@ class Daemon:
                 # only add another reset to whatever it is already doing.
                 continue
 
-            try:
-                self._transition(mode, enforce_guard=False)
-            except Exception as e:
-                if "already in progress" in str(e):
+            with self.lock:
+                if self._ledger.in_progress or not self._requests.empty():
                     # A client transition is underway; it owns the camera now.
                     continue
+            try:
+                self.request_transition(mode, enforce_guard=False)
+            except Exception as e:
                 followup = policy.on_reentry_failed(mode, str(e))
                 print(f"restart failed: {e}")
                 if followup.kind is health.Kind.FALLBACK_TO_CALL:
@@ -772,7 +917,7 @@ class Daemon:
                     with self.lock:
                         self.state.error = followup.message
                     with suppress(Exception):
-                        self._transition(Mode.CALL, enforce_guard=False)
+                        self.request_transition(Mode.CALL, enforce_guard=False)
                 else:
                     with self.lock:
                         self.state.error = f"engine restart failed: {type(e).__name__}: {e}"
@@ -933,13 +1078,18 @@ class Daemon:
         server.settimeout(0.5)
         print(f"daemon listening on {path}")
 
+        threading.Thread(target=self._transition_worker, daemon=True).start()
         threading.Thread(target=self._supervise, daemon=True).start()
+        threading.Thread(target=self._status_poller, daemon=True).start()
+        threading.Thread(target=self._watchdog, daemon=True).start()
         self._start_tray()
 
+        # Entering the initial mode takes seconds to minutes when the camera
+        # is settling; clients must be able to ask what is happening from the
+        # very first moment, so serve first and enter asynchronously.
         try:
-            self.set_mode(initial_mode)
-            print(f"mode {self.state.mode}, look {self.state.look}, "
-                  f"publishing to {self.state.output}")
+            self.request_transition(Mode(initial_mode), enforce_guard=True, wait=False)
+            print(f"entering {initial_mode} mode; serving clients meanwhile")
         except Exception as e:
             print(f"startup failed: {type(e).__name__}: {e}")
             self.state.error = str(e)
