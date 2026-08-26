@@ -47,23 +47,49 @@ sudo udevadm trigger --action=add --subsystem-match=usb
 
 Without it `depthai` reports zero devices and logs "Insufficient permissions".
 
-### Camera control
+### Two modes
+
+The C1 runs one of two firmwares and cannot run both, so decomposer makes the
+tradeoff explicit rather than hiding it:
+
+| | **Call mode** (`f63d`) | **Studio mode** (`f63b`) |
+|---|---|---|
+| Microphone | **yes** | no |
+| `/dev/video0` | **yes** | no |
+| Manual focus | no | **yes** |
+| Manual white balance | no | **yes** |
+| Manual exposure + ISO | yes | yes |
+| Brightness / contrast / saturation / hue / sharpness | yes | yes |
+| Host-side looks | yes | yes |
+
+Call mode is the default and covers ordinary use: the mic works, any app can
+open the camera, and everything except focus and white balance is adjustable
+with no interruption. Studio mode buys those two controls by rebooting the
+camera into stock DepthAI firmware, which has no UVC and no audio.
+
+Switching costs about 5 s into Studio and ~15 s back, because the device
+re-enumerates each way. Studio settings live only while the connection is held.
 
 ```bash
-# What the device actually is
+# Which mode am I in, and what does each offer?
+decomposer mode
+
+# Call mode - instant, no interruption, mic stays up
+decomposer control                                  # show current values
+decomposer control --brightness 140 --saturation 62
+decomposer control --exposure 12000 --iso 400       # engages Manual Mode first
+decomposer control --auto                           # hand exposure back to the camera
+
+# Studio mode - explicit, because it costs the mic
+decomposer control --studio --focus 150 --wb 3200 --hold 10
+
+# Device facts, and the read-only extension-unit diagnostic
 decomposer camera-info
-
-# Manual focus, white balance, exposure. -1 returns a control to auto.
-decomposer control --focus 150 --wb 3200 --iso 400 --exposure 12000
-decomposer control --auto
-
-# Map the vendor UVC Extension Unit (read-only diagnostic)
 decomposer probe-xu
 ```
 
-**While any of these run, `/dev/video0` disappears.** Attaching XLink tears down
-the camera's UVC interfaces; they return about 14 seconds after the command
-exits. This is a property of the hardware, not a bug — see `docs/camera-notes.md`.
+Asking for `--focus` or `--wb` without `--studio` is refused with an explanation
+rather than silently taking your microphone away.
 
 ### Looks (work in progress)
 

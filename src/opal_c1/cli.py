@@ -119,37 +119,123 @@ def _cmd_camera_info(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_mode(args: argparse.Namespace) -> int:
+    from opal_c1.modes import Mode, current_mode, describe
+
+    now = current_mode()
+    if now is None:
+        print("Camera is not on the USB bus (it may be mid-switch, which takes ~15s).")
+        return 1
+    print(f"Current mode: {now.value}\n")
+    for m in Mode:
+        print(f" {'->' if m is now else '  '} {describe(m)}")
+    print(
+        "\nSwitching reboots the camera: about 5s into studio, 15s back to call.\n"
+        "Studio mode has no microphone - depthai has no audio support at all."
+    )
+    return 0
+
+
 def _cmd_control(args: argparse.Namespace) -> int:
+    """Apply controls, routing each to the mode that can serve it."""
     import time
+
+    from opal_c1.modes import Mode, current_mode, wait_until_capturable
+    from opal_c1.v4l2 import UvcControls
+
+    wants_studio = args.focus is not None or args.wb is not None
+
+    if wants_studio and not args.studio:
+        print(
+            "Manual focus and white balance need Studio mode.\n"
+            "  - the camera reboots (~5s), and ~15s to come back afterwards\n"
+            "  - /dev/video0 disappears while it is held\n"
+            "  - the C1 microphone disappears too\n"
+            "Re-run with --studio to accept that, or adjust exposure/gain/colour\n"
+            "instead, which work in Call mode with no interruption.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if not args.studio:
+        now = current_mode()
+        if now is not Mode.CALL:
+            print(
+                f"Camera is in {now.value if now else 'no'} mode; "
+                "Call-mode controls need /dev/video0.",
+                file=sys.stderr,
+            )
+            return 1
+        uvc = UvcControls(args.dev)
+        requested = (
+            ("brightness", args.brightness), ("contrast", args.contrast),
+            ("saturation", args.saturation), ("hue", args.hue),
+            ("sharpness", args.sharpness),
+        )
+        nothing_asked = (
+            all(v is None for _, v in requested)
+            and args.exposure is None and args.iso is None and not args.auto
+        )
+        if nothing_asked:
+            for c in uvc.list():
+                print(" ", c.describe())
+            return 0
+        rc = 0
+        if args.auto:
+            try:
+                uvc.set_auto_exposure()
+                print("  auto_exposure -> Auto Mode")
+            except (PermissionError, ValueError, OSError) as e:
+                print(f"  auto_exposure: {e}", file=sys.stderr)
+                rc = 1
+        for name, value in requested:
+            if value is None:
+                continue
+            try:
+                print(f"  {name} -> {uvc.set(name, value)}")
+            except (PermissionError, ValueError, OSError) as e:
+                print(f"  {name}: {e}", file=sys.stderr)
+                rc = 1
+        if args.exposure is not None or args.iso is not None:
+            # These stall unless auto-exposure is switched to Manual Mode first.
+            try:
+                for k, v in uvc.set_manual_exposure(args.exposure, args.iso).items():
+                    print(f"  {k} -> {v}")
+            except (PermissionError, ValueError, OSError) as e:
+                print(f"  exposure/iso: {e}", file=sys.stderr)
+                rc = 1
+        return rc
 
     from opal_c1.device import OpalDevice
 
-    print("Attaching XLink — /dev/video0 will disappear until this exits.")
+    print("Entering Studio mode - /dev/video0 and the C1 mic will disappear.")
     with OpalDevice(width=args.width, height=args.height) as cam:
         if args.auto:
             cam.set_auto()
             print("  all controls -> auto")
-        else:
-            if args.focus is not None:
-                cam.set_focus(None if args.focus < 0 else args.focus)
-                print(f"  focus -> {'auto' if args.focus < 0 else args.focus}")
-            if args.wb is not None:
-                cam.set_white_balance(None if args.wb < 0 else args.wb)
-                print(f"  white balance -> {'auto' if args.wb < 0 else str(args.wb) + 'K'}")
-            if args.exposure is not None or args.iso is not None:
-                cam.set_exposure(args.exposure, args.iso)
-                print(f"  exposure -> {args.exposure}us iso -> {args.iso}")
+        if args.focus is not None:
+            cam.set_focus(None if args.focus < 0 else args.focus)
+            print(f"  focus -> {'auto' if args.focus < 0 else args.focus}")
+        if args.wb is not None:
+            cam.set_white_balance(None if args.wb < 0 else args.wb)
+            print(f"  white balance -> {'auto' if args.wb < 0 else str(args.wb) + 'K'}")
+        if args.exposure is not None or args.iso is not None:
+            cam.set_exposure(args.exposure, args.iso)
+            print(f"  exposure -> {args.exposure}us  iso -> {args.iso}")
 
-        # Controls only persist while XLink is attached, so hold and report.
         deadline = time.time() + args.hold
         while time.time() < deadline:
             f = cam.read()
             if f.sequence % 30 == 0:
-                print(
-                    f"  [{f.sequence:>5}] lens={f.lens} iso={f.iso} "
-                    f"exp={f.exposure_us}us wb={f.color_temp}K"
-                )
-    print("Released. /dev/video0 returns in ~14s.")
+                print(f"  [{f.sequence:>5}] lens={f.lens} iso={f.iso} "
+                      f"exp={f.exposure_us}us wb={f.color_temp}K")
+
+    print("Leaving Studio mode ...")
+    t = wait_until_capturable()
+    print(
+        f"  Call mode restored after {t}s - mic and /dev/video0 are back."
+        if t is not None else "  camera has not come back yet"
+    )
     return 0
 
 
@@ -209,23 +295,38 @@ def build_parser() -> argparse.ArgumentParser:
     ci.add_argument("--height", type=int, default=1080)
     ci.set_defaults(func=_cmd_camera_info)
 
+    md = sub.add_parser("mode", help="Show Call/Studio mode and what each offers")
+    md.set_defaults(func=_cmd_mode)
+
     ct = sub.add_parser(
         "control",
-        help="Apply manual focus / white balance / exposure over XLink",
+        help="Adjust camera controls",
         description=(
-            "Manual controls live on XLink, not UVC. Pass -1 to a value to return "
-            "that control to auto. Settings persist only while attached, so the "
-            "command holds the connection for --hold seconds."
+            "Exposure, gain and colour work in Call mode with no interruption. "
+            "Focus and white balance exist only in Studio mode, which reboots the "
+            "camera and takes away /dev/video0 and the microphone, so they need "
+            "--studio. With no values given, prints the current controls."
         ),
     )
+    ct.add_argument("--dev", default="/dev/video0")
     ct.add_argument("--width", type=int, default=1920)
     ct.add_argument("--height", type=int, default=1080)
-    ct.add_argument("--focus", type=int, default=None, help="Lens position 0-255, or -1 for auto")
-    ct.add_argument("--wb", type=int, default=None, help="White balance 1000-12000 K, or -1 for auto")
-    ct.add_argument("--exposure", type=int, default=None, help="Exposure time in microseconds")
-    ct.add_argument("--iso", type=int, default=None, help="ISO 100-1600")
+    ct.add_argument("--brightness", type=int, default=None, help="0-255")
+    ct.add_argument("--contrast", type=int, default=None, help="0-100")
+    ct.add_argument("--saturation", type=int, default=None, help="0-100")
+    ct.add_argument("--hue", type=int, default=None, help="-180..180")
+    ct.add_argument("--sharpness", type=int, default=None, help="0-4")
+    ct.add_argument("--exposure", type=int, default=None, help="Exposure time, microseconds")
+    ct.add_argument("--iso", type=int, default=None, help="ISO / gain, 100-1600")
+    ct.add_argument("--focus", type=int, default=None,
+                    help="Lens position 0-255, or -1 for auto (Studio mode only)")
+    ct.add_argument("--wb", type=int, default=None,
+                    help="White balance 1000-12000 K, or -1 for auto (Studio mode only)")
+    ct.add_argument("--studio", action="store_true",
+                    help="Accept entering Studio mode (loses /dev/video0 and the mic)")
     ct.add_argument("--auto", action="store_true", help="Return everything to auto")
-    ct.add_argument("--hold", type=float, default=6.0, help="Seconds to hold the connection")
+    ct.add_argument("--hold", type=float, default=6.0,
+                    help="Seconds to hold Studio mode (settings last only while held)")
     ct.set_defaults(func=_cmd_control)
 
     return p
