@@ -349,6 +349,64 @@ def _cmd_stream_nv12(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_install_desktop(args: argparse.Namespace) -> int:
+    """Install the launcher so the panel starts from the app menu.
+
+    The shipped .desktop cannot just say `Exec=decomposer gui`: when decomposer
+    is installed in a virtualenv, that name is not on PATH and the launcher
+    silently does nothing. This writes the absolute path of the running
+    interpreter's console script instead, and drops a shim in ~/.local/bin so
+    the bare command works in a terminal too.
+    """
+    import shutil
+
+    exe = Path(sys.argv[0]).resolve()
+    if not exe.is_file():
+        exe = Path(sys.executable).resolve()
+    apps = Path.home() / ".local/share/applications"
+    apps.mkdir(parents=True, exist_ok=True)
+    target = apps / "decomposer.desktop"
+
+    source = Path(__file__).resolve().parents[2] / "packaging/decomposer.desktop"
+    template = source.read_text() if source.is_file() else (
+        "[Desktop Entry]\nType=Application\nName=decomposer\n"
+        "Comment=Camera controls and looks for the Opal C1\n"
+        "Exec=decomposer gui\nIcon=camera-video\nTerminal=false\n"
+        "Categories=AudioVideo;Video;Settings;\n"
+    )
+    template = template.replace("Exec=decomposer gui", f"Exec={exe} gui")
+    target.write_text(template)
+    print(f"  wrote {target}")
+    print(f"  Exec={exe} gui")
+
+    binhome = Path.home() / ".local/bin"
+    binhome.mkdir(parents=True, exist_ok=True)
+    shim = binhome / "decomposer"
+    if shim.exists() or shim.is_symlink():
+        if shim.resolve() == exe:
+            print(f"  {shim} already points here")
+        else:
+            print(f"  {shim} exists and points elsewhere; left alone", file=sys.stderr)
+    else:
+        shim.symlink_to(exe)
+        print(f"  linked {shim} -> {exe}")
+
+    if shutil.which("decomposer") is None:
+        print(
+            "  note: ~/.local/bin is not on your PATH, so the bare `decomposer` "
+            "command still will not resolve in a terminal. The launcher will "
+            "work regardless, since it uses the absolute path.",
+            file=sys.stderr,
+        )
+    with suppress(Exception):
+        subprocess_update = shutil.which("update-desktop-database")
+        if subprocess_update:
+            import subprocess
+
+            subprocess.run([subprocess_update, str(apps)], check=False)
+    return 0
+
+
 def _cmd_gui(_: argparse.Namespace) -> int:
     try:
         from opal_c1.gui import main as gui_main
@@ -578,6 +636,12 @@ def build_parser() -> argparse.ArgumentParser:
     dm.add_argument("--fps", type=float, default=30.0)
     dm.add_argument("--mode", choices=("call", "studio"), default="call")
     dm.set_defaults(func=_cmd_daemon)
+
+    idt = sub.add_parser(
+        "install-desktop",
+        help="Install the app-menu launcher with a working absolute path",
+    )
+    idt.set_defaults(func=_cmd_install_desktop)
 
     ui = sub.add_parser("gui", help="Open the control panel")
     ui.set_defaults(func=_cmd_gui)

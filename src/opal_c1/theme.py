@@ -34,6 +34,31 @@ FALLBACK = {
 }
 
 
+def system_font() -> tuple[str, float]:
+    """The desktop's UI font, as (family, points).
+
+    GTK already honours this, but stating it in our own CSS keeps the panel
+    consistent when the rest of the stylesheet sets sizes in rem.
+    """
+    desc = ""
+    try:
+        from gi.repository import Gio
+
+        desc = Gio.Settings.new("org.gnome.desktop.interface").get_string("font-name")
+    except Exception:
+        pass
+    if not desc:
+        return ("sans-serif", 11.0)
+    parts = desc.split()
+    # Pango descriptions end with the size: "Adwaita Sans 11".
+    if len(parts) > 1:
+        try:
+            return (" ".join(parts[:-1]), float(parts[-1]))
+        except ValueError:
+            pass
+    return (desc, 11.0)
+
+
 @dataclass
 class Theme:
     name: str
@@ -69,7 +94,8 @@ def load() -> Theme:
 
 
 def css(t: Theme) -> str:
-    """GTK CSS built from the theme palette."""
+    """GTK CSS built from the theme palette and the desktop's UI font."""
+    family, size = system_font()
     bg = t.color("background")
     bg_dark = t.color("dark_background", bg)
     bg_light = t.color("lighter_background")
@@ -83,7 +109,10 @@ def css(t: Theme) -> str:
     green = t.color("green")
 
     return f"""
-    window.decomposer {{ background: {bg}; color: {fg}; }}
+    window.decomposer {{
+        background: {bg}; color: {fg};
+        font-family: "{family}", sans-serif; font-size: {size:.0f}pt;
+    }}
     .dc-header {{ background: {bg_dark}; color: {fg_bright};
                   border-bottom: 1px solid {sel}; }}
     .dc-title {{ font-weight: 700; letter-spacing: 0.5px; color: {fg_bright}; }}

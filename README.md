@@ -245,5 +245,21 @@ seconds and would otherwise freeze the window.
 Install the launcher entry with:
 
 ```bash
-install -Dm644 packaging/decomposer.desktop ~/.local/share/applications/decomposer.desktop
+decomposer install-desktop
 ```
+
+Use that rather than copying `packaging/decomposer.desktop` by hand. The shipped
+file says `Exec=decomposer gui`, and when decomposer lives in a virtualenv that
+name is not on `PATH`, so the launcher starts nothing and gives no error.
+`install-desktop` writes the absolute path of the running console script and
+links `~/.local/bin/decomposer`.
+
+The panel follows the desktop while it runs: switching Omarchy themes recolours
+it without a restart, and it uses the desktop UI font from
+`org.gnome.desktop.interface font-name`. Launching it again while it is open
+raises the existing window instead of stacking another.
+
+Focus and white balance each have an **Auto** button that hands the control back
+to the camera. When a control is on automatic the button is highlighted and the
+slider is left alone — showing `-1` clamped onto the slider would read as
+"focus 0", which is a real and very different setting.

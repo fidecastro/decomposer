@@ -18,7 +18,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from opal_c1 import theme as omtheme  # noqa: E402
 from opal_c1.daemon import Client  # noqa: E402
@@ -36,6 +36,9 @@ LOOK_BLURB = {
 }
 
 # Controls the camera exposes, and which mode can actually write them.
+# Controls with an automatic mode the camera will take back.
+AUTO_CAPABLE = ("focus", "wb")
+
 SLIDERS = [
     ("brightness", "Brightness", 0, 255, 1, "both"),
     ("contrast", "Contrast", 0, 100, 1, "both"),
@@ -71,6 +74,10 @@ class Panel(Gtk.Box):
         self._pending: dict = {}
         self._debounce: Optional[int] = None
         self._suppress = False
+        # Building a Gtk.Scale emits value-changed. Until the first status has
+        # been applied those signals carry widget defaults, not camera state,
+        # and acting on them would push every control to its minimum.
+        self._ready = False
 
         self.append(self._header())
 
@@ -93,6 +100,11 @@ class Panel(Gtk.Box):
         self.refresh()
         GLib.timeout_add_seconds(2, self._tick)
 
+    def set_theme(self, theme: omtheme.Theme) -> None:
+        """Called when the desktop theme changes under us."""
+        self.theme = theme
+        self.subtitle.set_text(f"Opal C1  ·  {theme.name}")
+
     # -- chrome ---------------------------------------------------------
 
     def _header(self) -> Gtk.Widget:
@@ -106,10 +118,10 @@ class Panel(Gtk.Box):
         title.set_margin_bottom(12)
         bar.append(title)
 
-        sub = Gtk.Label(label=f"Opal C1  ·  {self.theme.name}", xalign=0)
-        sub.add_css_class("dc-hint")
-        sub.set_valign(Gtk.Align.CENTER)
-        bar.append(sub)
+        self.subtitle = Gtk.Label(label=f"Opal C1  ·  {self.theme.name}", xalign=0)
+        self.subtitle.add_css_class("dc-hint")
+        self.subtitle.set_valign(Gtk.Align.CENTER)
+        bar.append(self.subtitle)
 
         spacer = Gtk.Box(hexpand=True)
         bar.append(spacer)
@@ -201,7 +213,7 @@ class Panel(Gtk.Box):
         _worker(lambda: self.client.request(cmd="set_look", look=name), self._on_result)
 
     def _on_strength(self, scale: Gtk.Scale) -> None:
-        if self._suppress:
+        if self._suppress or not self._ready:
             return
         self._queue({"strength": round(scale.get_value(), 2)})
 
@@ -211,6 +223,7 @@ class Panel(Gtk.Box):
         outer, inner = self._card("Camera")
         self.sliders = {}
         self.slider_labels = {}
+        self.auto_buttons = {}
         for key, label, lo, hi, step, avail in SLIDERS:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
             lbl = Gtk.Label(label=label, xalign=0)
@@ -225,6 +238,17 @@ class Panel(Gtk.Box):
             scale.connect("value-changed", self._on_slider, key)
             row.append(scale)
 
+            # Focus and white balance are the two controls with a real automatic
+            # mode on this camera; -1 hands them back to it.
+            if key in AUTO_CAPABLE:
+                auto = Gtk.Button(label="Auto")
+                auto.add_css_class("dc-chip")
+                auto.set_tooltip_text(f"Hand {label.lower()} back to the camera")
+                auto.set_valign(Gtk.Align.CENTER)
+                auto.connect("clicked", self._on_auto, key)
+                row.append(auto)
+                self.auto_buttons[key] = auto
+
             self.sliders[key] = scale
             self.slider_labels[key] = lbl
             inner.append(row)
@@ -234,8 +258,19 @@ class Panel(Gtk.Box):
         inner.append(self.camera_hint)
         return outer
 
+    def _on_auto(self, _btn, key: str) -> None:
+        if self.busy or not self._ready:
+            return
+        # Drop any queued drag for this control so it cannot re-apply a manual
+        # value immediately after we ask for automatic.
+        self._pending.pop(key, None)
+        _worker(
+            lambda: self.client.request(cmd="set_camera", values={key: -1}),
+            self._on_result,
+        )
+
     def _on_slider(self, scale: Gtk.Scale, key: str) -> None:
-        if self._suppress:
+        if self._suppress or not self._ready:
             return
         self._queue({key: int(scale.get_value())})
 
@@ -346,12 +381,27 @@ class Panel(Gtk.Box):
             for key, scale in self.sliders.items():
                 available = key not in ("focus", "wb") or studio
                 scale.set_sensitive(available)
+                if key in self.auto_buttons:
+                    self.auto_buttons[key].set_sensitive(available)
                 self.slider_labels[key].set_opacity(1.0 if available else 0.45)
                 value = controls.get(key)
-                if value is not None:
+                on_auto = value == -1
+                if key in self.auto_buttons:
+                    # -1 means the camera is driving it. Showing that on the
+                    # button is honest; clamping it onto the slider would read
+                    # as "focus 0", which is a real and very different setting.
+                    if on_auto:
+                        self.auto_buttons[key].add_css_class("selected")
+                    else:
+                        self.auto_buttons[key].remove_css_class("selected")
+                if value is not None and not on_auto:
                     scale.set_value(float(value))
+                if on_auto:
+                    self.slider_labels[key].set_opacity(0.55)
         finally:
             self._suppress = False
+        # Only now do slider signals represent user intent.
+        self._ready = True
 
         self.camera_hint.set_text(
             "Focus and white balance are live in Studio mode."
@@ -377,15 +427,22 @@ class App(Adw.Application):
         self.connect("activate", self.on_activate)
 
     def on_activate(self, _app) -> None:
+        # Launching again while the panel is open should bring it forward
+        # rather than stacking a second identical window.
+        existing = self.get_windows()
+        if existing:
+            existing[0].present()
+            return
+
         theme = omtheme.load()
         Adw.StyleManager.get_default().set_color_scheme(
             Adw.ColorScheme.FORCE_DARK if theme.is_dark else Adw.ColorScheme.FORCE_LIGHT
         )
 
-        provider = Gtk.CssProvider()
-        provider.load_from_data(omtheme.css(theme).encode())
+        self.provider = Gtk.CssProvider()
+        self.provider.load_from_data(omtheme.css(theme).encode())
         Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(), provider,
+            Gdk.Display.get_default(), self.provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
@@ -393,8 +450,53 @@ class App(Adw.Application):
         win.set_title("decomposer")
         win.add_css_class("decomposer")
         win.set_default_size(560, 760)
-        win.set_child(Panel(theme))
+        self.panel = Panel(theme)
+        win.set_child(self.panel)
         win.present()
+
+        self._watch_desktop()
+
+    def _watch_desktop(self) -> None:
+        """Re-read colours and font when the desktop changes them.
+
+        Omarchy switches theme by repointing ~/.local/state/omarchy/current, so
+        watching that directory catches a theme change without polling.
+        """
+        self._reload_pending = None
+        self._monitors = []
+        try:
+            watch_dir = Gio.File.new_for_path(str(omtheme.STATE_THEME.parent))
+            monitor = watch_dir.monitor_directory(Gio.FileMonitorFlags.NONE, None)
+            monitor.connect("changed", self._on_desktop_changed)
+            self._monitors.append(monitor)
+        except Exception:
+            pass
+        try:
+            settings = Gio.Settings.new("org.gnome.desktop.interface")
+            settings.connect("changed::font-name", self._on_desktop_changed)
+            self._settings = settings  # keep alive, or the signal is dropped
+        except Exception:
+            pass
+
+    def _on_desktop_changed(self, *_args) -> None:
+        # A theme switch rewrites several files; coalesce into one reload.
+        if self._reload_pending is not None:
+            GLib.source_remove(self._reload_pending)
+        self._reload_pending = GLib.timeout_add(400, self._reload_theme)
+
+    def _reload_theme(self) -> bool:
+        self._reload_pending = None
+        theme = omtheme.load()
+        try:
+            self.provider.load_from_data(omtheme.css(theme).encode())
+        except Exception:
+            return False
+        Adw.StyleManager.get_default().set_color_scheme(
+            Adw.ColorScheme.FORCE_DARK if theme.is_dark else Adw.ColorScheme.FORCE_LIGHT
+        )
+        if getattr(self, "panel", None) is not None:
+            self.panel.set_theme(theme)
+        return False
 
 
 def main() -> int:
