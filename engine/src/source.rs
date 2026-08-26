@@ -122,6 +122,8 @@ impl FrameSource for StdinSource {
 
 pub struct V4l2Sink {
     stream: MmapStream<'static>,
+    width: u32,
+    height: u32,
 }
 
 impl V4l2Sink {
@@ -130,11 +132,18 @@ impl V4l2Sink {
             Device::with_path(path).with_context(|| format!("open {path}"))?,
         ));
 
-        let want = Format::new(width, height, FourCC::new(b"NV12"));
+        // The virtual camera speaks I420 (YU12), not NV12, deliberately.
+        // OBS consumes this device through libv4l2's emulated formats, and
+        // libv4lconvert's NV12 conversion path flips the frame vertically -
+        // measured, not surmised: a frame with a red band at rows 150-210 and
+        // a blue band at 415-450 comes out with red at 855-929 and blue at
+        // 630-661, the exact mirror positions. Publishing I420 lets every
+        // consumer take the frames natively and the flipping code never runs.
+        let want = Format::new(width, height, FourCC::new(b"YU12"));
         let got = Output::set_format(dev, &want).context("set output format")?;
-        if got.width != width || got.height != height || &got.fourcc.repr != b"NV12" {
+        if got.width != width || got.height != height || &got.fourcc.repr != b"YU12" {
             bail!(
-                "{path} rejected {width}x{height} NV12 (got {}x{} {}). \
+                "{path} rejected {width}x{height} YU12 (got {}x{} {}). \
                  Is v4l2loopback loaded? See packaging/v4l2loopback.conf",
                 got.width, got.height, got.fourcc
             );
@@ -142,18 +151,33 @@ impl V4l2Sink {
 
         let stream = MmapStream::with_buffers(dev, Type::VideoOutput, 2)
             .context("start output stream")?;
-        Ok(Self { stream })
+        Ok(Self { stream, width, height })
     }
 
+    /// Publish one NV12 frame as I420: Y verbatim, then the interleaved UV
+    /// plane split into planar U and V.
     pub fn write(&mut self, frame: &[u8]) -> Result<()> {
+        let y_len = (self.width * self.height) as usize;
+        let quarter = y_len / 4;
+        let total = y_len + 2 * quarter;
+        if frame.len() < total {
+            bail!("short frame: {} bytes, need {total}", frame.len());
+        }
         let (buf, meta) = OutputStream::next(&mut self.stream)?;
-        let n = frame.len().min(buf.len());
-        buf[..n].copy_from_slice(&frame[..n]);
+        if buf.len() < total {
+            bail!("output buffer too small: {} < {total}", buf.len());
+        }
+        buf[..y_len].copy_from_slice(&frame[..y_len]);
+        let (u_out, v_out) = buf[y_len..y_len + 2 * quarter].split_at_mut(quarter);
+        for (i, pair) in frame[y_len..total].chunks_exact(2).enumerate() {
+            u_out[i] = pair[0];
+            v_out[i] = pair[1];
+        }
         // V4L2_FIELD_NONE. Not ANY (0), which tells the driver it may choose,
         // and leaves a consumer free to treat the buffer as a single field
         // rather than a whole progressive frame.
         meta.field = V4L2_FIELD_NONE;
-        meta.bytesused = n as u32;
+        meta.bytesused = total as u32;
         Ok(())
     }
 }

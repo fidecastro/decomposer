@@ -445,6 +445,24 @@ name is not on `PATH`, so the launcher starts nothing and gives no error.
 `install-desktop` writes the absolute path of the running console script and
 links `~/.local/bin/decomposer`.
 
+### Why the virtual camera speaks I420, not NV12
+
+OBS on this system consumes `/dev/video10` only through libv4l2's "Emulated"
+formats, and **libv4lconvert's NV12 conversion path flips the frame
+vertically**. Measured, not surmised: a frame with a red band at rows 150–210
+and a blue band at 415–450 came out of `v4lconvert_convert(NV12→BGR3)` with red
+at 855–929 and blue at 630–661 — the exact mirror positions. The engine's own
+output and the raw loopback bytes were verified correct first, so the flip was
+isolated to that one conversion layer by running it buffer-to-buffer on a known
+frame.
+
+Publishing I420 (`YU12`) instead sidesteps the buggy code entirely: OBS,
+browsers and GStreamer all consume it natively, and the bandwidth is identical.
+Internally the pipeline stays NV12; only the loopback boundary de-interleaves
+the UV plane. Note that v4l2loopback pins the negotiated format while any
+reader holds the node, so changing the published format requires consumers to
+disconnect once.
+
 ### Note on layer surfaces and dialogs
 
 A layer surface is not an `xdg_toplevel`, so it cannot be a dialog's transient
