@@ -181,6 +181,7 @@ class Daemon:
         self._last_frame = None  # newest ISP metadata, Studio mode only
         self._shutdown = threading.Event()
         self.engine_log: list[str] = []
+        self._engine_started = 0.0
         self.restarts = 0
 
     # -- engine ---------------------------------------------------------
@@ -267,6 +268,7 @@ class Daemon:
         threading.Thread(
             target=self._drain_stderr, args=(self.engine,), daemon=True
         ).start()
+        self._engine_started = time.time()
 
         deadline = time.time() + 8
         while time.time() < deadline:
@@ -749,6 +751,7 @@ class Daemon:
         backoff = 0.0
         failures = 0
         vanished = 0  # consecutive failures where the camera left the bus
+        short_lives = 0  # consecutive runs where the engine died young
 
         while not self._shutdown.wait(2.0):
             with self.lock:
@@ -762,6 +765,33 @@ class Daemon:
                 # (a mode switch that failed mid-camera-reboot).
                 reason = " | ".join(self.engine_log) or "engine not started"
                 mode = Mode(self.state.mode)
+                uptime = time.time() - self._engine_started if self._engine_started else 0.0
+
+            # A camera that streams for a few seconds and then falls off the bus
+            # is in its degraded firmware state. Each retry provokes another
+            # crash-and-reboot, so fast retries just churn the hardware - and
+            # because the camera is back on the bus by the time we look, the
+            # vanish check below never fires. Recognise the pattern by engine
+            # lifetime instead.
+            if 0 < uptime < 30:
+                short_lives += 1
+            elif uptime >= 30:
+                short_lives = 0
+            if short_lives >= 4:
+                message = (
+                    "the camera streams for a few seconds and then drops off the "
+                    "bus, repeatedly. This is the C1 firmware state a short "
+                    "unplug does not always clear: power it off for 2-3 minutes "
+                    "(and try a different USB 3 port). Holding retries for 2 "
+                    "minutes."
+                )
+                with self.lock:
+                    self.state.error = message
+                print(message)
+                if self._shutdown.wait(120.0):
+                    return
+                short_lives = 2  # stay suspicious, but allow a probe
+                continue
 
             # A camera that keeps leaving the bus is not a software failure and
             # retrying does not fix it. The C1 does this once its firmware gets
@@ -778,8 +808,15 @@ class Daemon:
                     with self.lock:
                         self.state.error = message
                     print(message)
-                    if self._shutdown.wait(60.0):
-                        return
+                    # Hold, but come back the moment the camera reappears so a
+                    # replug recovers in seconds rather than a minute.
+                    waited = 0.0
+                    while waited < 60.0:
+                        if self._shutdown.wait(5.0):
+                            return
+                        waited += 5.0
+                        if current_mode() is not None:
+                            break
                     continue
             else:
                 vanished = 0
