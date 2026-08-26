@@ -25,9 +25,15 @@ struct Params {
     strength: f32,
     /// bit 0: mirror horizontally, bit 1: mirror vertically.
     flip: u32,
+    /// Overlay placement in output pixels; ov_w == 0 disables it.
+    ov_x: u32,
+    ov_y: u32,
+    ov_w: u32,
+    ov_h: u32,
+    ov_opacity: f32,
     // WGSL rounds uniform structs up to 16 bytes; pad explicitly so the Rust
     // and shader layouts cannot silently disagree.
-    _pad: [u32; 3],
+    _pad: [u32; 2],
 }
 
 pub struct Gpu {
@@ -35,9 +41,11 @@ pub struct Gpu {
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
+    layout: wgpu::BindGroupLayout,
     params_buf: wgpu::Buffer,
     src_buf: wgpu::Buffer,
     dst_buf: wgpu::Buffer,
+    overlay_buf: wgpu::Buffer,
     staging: wgpu::Buffer,
     params: Params,
     size: u64,
@@ -65,7 +73,11 @@ impl Gpu {
             .map_err(|e| anyhow!("could not create GPU device: {e}"))?;
 
         let size = super::source::nv12_len(width, height) as u64;
-        let params = Params { width, height, look, strength, flip, _pad: [0; 3] };
+        let params = Params {
+            width, height, look, strength, flip,
+            ov_x: 0, ov_y: 0, ov_w: 0, ov_h: 0, ov_opacity: 1.0,
+            _pad: [0; 2],
+        };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("params"),
@@ -83,6 +95,13 @@ impl Gpu {
         let src_buf = mk("src", wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
         let dst_buf = mk("dst", wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
         let staging = mk("staging", wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
+        // A storage binding cannot be empty, so an absent overlay is a single
+        // transparent pixel that the shader never reads (ov_w stays 0).
+        let overlay_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("overlay"),
+            contents: bytemuck::cast_slice(&[0u32]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("look"),
@@ -119,18 +138,18 @@ impl Gpu {
                     ty: storage(false),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: storage(true),
+                    count: None,
+                },
             ],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("look-bind"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: src_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: dst_buf.as_entire_binding() },
-            ],
-        });
+        let bind_group = make_bind_group(
+            &device, &layout, &params_buf, &src_buf, &dst_buf, &overlay_buf,
+        );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("look-pipeline-layout"),
@@ -147,8 +166,8 @@ impl Gpu {
         });
 
         Ok(Self {
-            device, queue, pipeline, bind_group, params_buf, src_buf, dst_buf,
-            staging, params, size, out: vec![0u8; size as usize], adapter_name,
+            device, queue, pipeline, bind_group, layout, params_buf, src_buf, dst_buf,
+            overlay_buf, staging, params, size, out: vec![0u8; size as usize], adapter_name,
         })
     }
 
@@ -157,6 +176,53 @@ impl Gpu {
     pub fn set_look(&mut self, look: u32, strength: f32) {
         self.params.look = look;
         self.params.strength = strength;
+        self.upload_params();
+    }
+
+    /// Place an image over the frame, or clear it with `None`.
+    ///
+    /// The buffer is rebuilt only when the overlay's size changes; moving it or
+    /// fading it just rewrites the uniform.
+    pub fn set_overlay(
+        &mut self,
+        overlay: Option<&crate::overlay::Overlay>,
+        x: u32,
+        y: u32,
+        opacity: f32,
+    ) {
+        match overlay {
+            None => {
+                self.params.ov_w = 0;
+                self.params.ov_h = 0;
+            }
+            Some(ov) if ov.is_empty() => {
+                self.params.ov_w = 0;
+                self.params.ov_h = 0;
+            }
+            Some(ov) => {
+                let needed = (ov.pixels.len() * 4) as u64;
+                if self.overlay_buf.size() < needed {
+                    self.overlay_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("overlay"),
+                        size: needed,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    self.bind_group = make_bind_group(
+                        &self.device, &self.layout, &self.params_buf,
+                        &self.src_buf, &self.dst_buf, &self.overlay_buf,
+                    );
+                }
+                self.queue.write_buffer(
+                    &self.overlay_buf, 0, bytemuck::cast_slice(&ov.pixels),
+                );
+                self.params.ov_w = ov.width;
+                self.params.ov_h = ov.height;
+            }
+        }
+        self.params.ov_x = x;
+        self.params.ov_y = y;
+        self.params.ov_opacity = opacity.clamp(0.0, 1.0);
         self.upload_params();
     }
 
@@ -209,4 +275,24 @@ impl Gpu {
         self.staging.unmap();
         Ok(&self.out)
     }
+}
+
+fn make_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    params: &wgpu::Buffer,
+    src: &wgpu::Buffer,
+    dst: &wgpu::Buffer,
+    overlay: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("look-bind"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: src.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: dst.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: overlay.as_entire_binding() },
+        ],
+    })
 }

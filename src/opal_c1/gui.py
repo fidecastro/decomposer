@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import socket
 import struct
+from pathlib import Path
 import threading
 import time
 from typing import Callable, Optional
@@ -202,6 +203,7 @@ class Panel(Gtk.Box):
         body.append(self._mode_row())
         body.append(self._sep())
         body.append(self._look_block())
+        body.append(self._overlay_row())
         body.append(self._sep())
         body.append(self._camera_block())
         self.append(body)
@@ -321,6 +323,71 @@ class Panel(Gtk.Box):
         box.append(row)
         return box
 
+    def _overlay_row(self) -> Gtk.Widget:
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        lbl = Gtk.Label(label="Overlay", xalign=0)
+        lbl.add_css_class("dc-label")
+        lbl.set_size_request(64, -1)
+        row.append(lbl)
+
+        self.overlay_button = Gtk.Button(label="choose\u2026")
+        self.overlay_button.add_css_class("dc-chip")
+        self.overlay_button.set_hexpand(True)
+        self.overlay_button.connect("clicked", self._on_overlay_choose)
+        row.append(self.overlay_button)
+
+        self.overlay_clear = Gtk.Button(label="\u00d7")
+        self.overlay_clear.add_css_class("dc-tiny")
+        self.overlay_clear.set_valign(Gtk.Align.CENTER)
+        self.overlay_clear.set_tooltip_text("Remove the overlay")
+        self.overlay_clear.connect("clicked", self._on_overlay_clear)
+        row.append(self.overlay_clear)
+
+        self.overlay_opacity = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0.0, 1.0, 0.05
+        )
+        self.overlay_opacity.set_draw_value(False)
+        self.overlay_opacity.set_valign(Gtk.Align.CENTER)
+        self.overlay_opacity.set_size_request(70, -1)
+        self.overlay_opacity.set_tooltip_text("Overlay opacity")
+        self.overlay_opacity.connect("value-changed", self._on_overlay_opacity)
+        row.append(self.overlay_opacity)
+        return row
+
+    def _on_overlay_choose(self, _btn) -> None:
+        dialog = Gtk.FileDialog()
+        dialog.set_title("Choose an overlay image")
+        png = Gtk.FileFilter()
+        png.set_name("PNG images")
+        png.add_mime_type("image/png")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(png)
+        dialog.set_filters(filters)
+        dialog.open(self.get_root(), None, self._on_overlay_chosen)
+
+    def _on_overlay_chosen(self, dialog, result) -> None:
+        try:
+            path = dialog.open_finish(result).get_path()
+        except Exception:
+            return  # cancelled
+        if not path:
+            return
+        _worker(
+            lambda: self.client.request(cmd="set_overlay", values={"path": path}),
+            self._on_result,
+        )
+
+    def _on_overlay_clear(self, _btn) -> None:
+        _worker(
+            lambda: self.client.request(cmd="set_overlay", values={"path": "off"}),
+            self._on_result,
+        )
+
+    def _on_overlay_opacity(self, scale: Gtk.Scale) -> None:
+        if self._suppress or not self._ready:
+            return
+        self._queue({"overlay_opacity": round(scale.get_value(), 2)})
+
     def _slider_row(self, label: str, lo, hi, step, digits: int = 0):
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
         lbl = Gtk.Label(label=label, xalign=0)
@@ -434,6 +501,14 @@ class Panel(Gtk.Box):
         pending, self._pending = self._pending, {}
         if not pending:
             return False
+        opacity = pending.pop("overlay_opacity", None)
+        if opacity is not None:
+            _worker(
+                lambda: self.client.request(
+                    cmd="set_overlay", values={"opacity": opacity}
+                ),
+                self._on_result,
+            )
         strength = pending.pop("strength", None)
         if strength is not None:
             _worker(
@@ -507,8 +582,17 @@ class Panel(Gtk.Box):
             b.set_sensitive(True)
             (b.add_css_class if name == look else b.remove_css_class)("selected")
 
+        overlay = st.get("overlay")
+        self.overlay_button.set_label(
+            Path(overlay).name if overlay else "choose\u2026"
+        )
+        self.overlay_button.set_tooltip_text(overlay or "No overlay")
+        self.overlay_clear.set_sensitive(bool(overlay))
+        self.overlay_opacity.set_sensitive(bool(overlay))
+
         self._suppress = True
         try:
+            self.overlay_opacity.set_value(float(st.get("overlay_opacity", 1.0)))
             self.strength.set_value(float(st.get("strength", 1.0)))
             controls = st.get("controls") or {}
             for key, scale in self.sliders.items():
@@ -551,8 +635,15 @@ class Panel(Gtk.Box):
 
 
 class App(Adw.Application):
-    def __init__(self):
-        super().__init__(application_id="dev.decomposer.Panel")
+    def __init__(self, replace: bool = False):
+        # ALLOW_REPLACEMENT is always on so a later instance can take over
+        # cleanly. Without it the only way to restart the panel is to hunt the
+        # process down, and it cannot be found through the compositor while the
+        # window is hidden.
+        flags = Gio.ApplicationFlags.ALLOW_REPLACEMENT
+        if replace:
+            flags |= Gio.ApplicationFlags.REPLACE
+        super().__init__(application_id="dev.decomposer.Panel", flags=flags)
         self.window: Optional[Gtk.Window] = None
         self.panel: Optional[Panel] = None
         self.connect("activate", self.on_activate)
@@ -666,5 +757,5 @@ class App(Adw.Application):
         return False
 
 
-def main() -> int:
-    return App().run(None)
+def main(replace: bool = False) -> int:
+    return App(replace=replace).run(None)

@@ -13,6 +13,7 @@ use clap::Parser;
 
 mod control;
 mod gpu;
+mod overlay;
 mod preview;
 mod source;
 use source::{FrameSource, StdinSource, V4l2Source};
@@ -57,6 +58,18 @@ struct Args {
     /// Mirror: bit 0 horizontal, bit 1 vertical, 3 = 180 degrees
     #[arg(long, default_value_t = 0)]
     flip: u32,
+
+    /// PNG to composite over the frame
+    #[arg(long)]
+    overlay: Option<String>,
+
+    /// Overlay placement: x,y,max_w,max_h in output pixels (0 = unconstrained)
+    #[arg(long, default_value = "0,0,0,0")]
+    overlay_rect: String,
+
+    /// Overlay opacity, 0.0 to 1.0
+    #[arg(long, default_value_t = 1.0)]
+    overlay_opacity: f32,
 
     /// Unix socket serving a downscaled RGB preview to the control panel
     #[arg(long)]
@@ -120,6 +133,23 @@ fn main() -> Result<()> {
         args.strength,
         args.flip & 3,
     );
+    {
+        let rect: Vec<u32> = args
+            .overlay_rect
+            .split(',')
+            .filter_map(|v| v.trim().parse().ok())
+            .collect();
+        let mut s = look_state.lock().unwrap();
+        s.overlay_path = args.overlay.clone();
+        s.overlay_opacity = args.overlay_opacity.clamp(0.0, 1.0);
+        if rect.len() == 4 {
+            s.overlay_x = rect[0];
+            s.overlay_y = rect[1];
+            s.overlay_max_w = rect[2];
+            s.overlay_max_h = rect[3];
+        }
+        s.overlay_dirty = s.overlay_path.is_some();
+    }
     if let Some(path) = args.control.clone() {
         control::serve(path, look_state.clone())?;
     }
@@ -150,6 +180,33 @@ fn main() -> Result<()> {
             if let Some((look, strength, flip)) = pending {
                 g.set_look(look, strength);
                 g.set_flip(flip);
+            }
+
+            // Loading an overlay decodes and rescales a file, so it is handled
+            // separately from the cheap uniform updates above.
+            let overlay_change = {
+                let mut s = look_state.lock().unwrap();
+                s.overlay_dirty.then(|| {
+                    s.overlay_dirty = false;
+                    (
+                        s.overlay_path.clone(),
+                        s.overlay_x, s.overlay_y,
+                        s.overlay_max_w, s.overlay_max_h,
+                        s.overlay_opacity,
+                    )
+                })
+            };
+            if let Some((path, ox, oy, mw, mh, opacity)) = overlay_change {
+                match path {
+                    None => g.set_overlay(None, 0, 0, 1.0),
+                    Some(p) => match overlay::load(&p, mw, mh) {
+                        Ok(img) => {
+                            eprintln!("overlay {p} {}x{} at {ox},{oy}", img.width, img.height);
+                            g.set_overlay(Some(&img), ox, oy, opacity);
+                        }
+                        Err(e) => eprintln!("overlay: {e:#}"),
+                    },
+                }
             }
         }
         let out = match engine.as_mut() {

@@ -254,6 +254,32 @@ automatic the button lights and the value reads `auto` — the daemon stores aut
 as `-1`, and clamping that onto the slider would display `0`, a real and very
 different setting.
 
+### Overlays
+
+Composer called these stickers. A PNG is composited over the frame — a logo, a
+watermark, a lower third:
+
+```bash
+decomposer overlay ~/logo.png --x 1480 --y 700 --width 380 --height 380 --opacity 0.9
+decomposer overlay off
+```
+
+Position is in output pixels; width and height are maximums the image is fitted
+into, keeping aspect ratio, with 0 meaning unconstrained. The panel has a file
+picker, a clear button and an opacity slider.
+
+The host decodes and rescales once, so the GPU gets a buffer already at final
+size and the shader only does a rectangle test and a blend — no resampling per
+frame. Downscaling uses a box filter with alpha-weighted colour, because nearest
+sampling destroys a shrunken logo (thin strokes vanish) and unweighted averaging
+drags dark fringes out of transparent pixels.
+
+Compositing happens in RGB **before** the conversion back to YCbCr, so the
+overlay is graded-*over* rather than graded — a logo keeps its own colours
+whatever look is applied — and its alpha edge lands in RGB instead of being
+smeared by chroma subsampling. Overlay coordinates are output-space, so
+mirroring the image does not drag the logo along with it.
+
 ### Orientation
 
 The C1's sensor is mounted upside down. Opal's own firmware corrects for it;

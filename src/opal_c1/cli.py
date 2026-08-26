@@ -482,7 +482,7 @@ def _cmd_install_plugin(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_gui(_: argparse.Namespace) -> int:
+def _cmd_gui(args: argparse.Namespace) -> int:
     try:
         from opal_c1.gui import main as gui_main
     except (ImportError, ValueError) as e:
@@ -493,7 +493,7 @@ def _cmd_gui(_: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    return gui_main()
+    return gui_main(replace=getattr(args, 'replace', False))
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:
@@ -572,6 +572,32 @@ def _cmd_look(args: argparse.Namespace) -> int:
     if not resp.get("ok"):
         return 1
     print(f"  look -> {resp.get('look')} @ {resp.get('strength')}")
+    return 0
+
+
+def _cmd_overlay(args: argparse.Namespace) -> int:
+    values = {}
+    if args.path is not None:
+        values["path"] = args.path
+    for name, value in (
+        ("x", args.x), ("y", args.y),
+        ("width", args.width), ("height", args.height),
+        ("opacity", args.opacity),
+    ):
+        if value is not None:
+            values[name] = value
+    resp = _client_call(cmd="status") if not values else _client_call(
+        cmd="set_overlay", values=values
+    )
+    if not resp.get("ok"):
+        return 1
+    if resp.get("overlay"):
+        print(f"  overlay {resp['overlay']}")
+        print(f"    at {resp['overlay_x']},{resp['overlay_y']} "
+              f"fitted into {resp['overlay_w']}x{resp['overlay_h']} "
+              f"(0 = unconstrained), opacity {resp['overlay_opacity']}")
+    else:
+        print("  no overlay")
     return 0
 
 
@@ -772,6 +798,8 @@ def build_parser() -> argparse.ArgumentParser:
     ip.set_defaults(func=_cmd_install_plugin)
 
     ui = sub.add_parser("gui", help="Open the overlay")
+    ui.add_argument("--replace", action="store_true",
+                    help="Take over from a panel that is already running")
     ui.set_defaults(func=_cmd_gui)
 
     tg = sub.add_parser(
@@ -782,6 +810,8 @@ def build_parser() -> argparse.ArgumentParser:
             "single bar entry or keybind toggles the panel."
         ),
     )
+    tg.add_argument("--replace", action="store_true",
+                    help="Take over from a panel that is already running")
     tg.set_defaults(func=_cmd_gui)
 
     st = sub.add_parser("status", help="Show what the daemon is doing")
@@ -794,6 +824,25 @@ def build_parser() -> argparse.ArgumentParser:
     lk.add_argument("name", nargs="?", default=None, help="Look name")
     lk.add_argument("--strength", type=float, default=None, help="0.0 to 1.0")
     lk.set_defaults(func=_cmd_look)
+
+    ov = sub.add_parser(
+        "overlay",
+        help="Composite an image over the video",
+        description=(
+            "Places a PNG over the frame - a logo, a watermark, a lower third. "
+            "Composited on the GPU before the conversion back to YCbCr, so it "
+            "keeps its own colours whatever look is applied. Position is in "
+            "output pixels; width and height are maximums it is fitted into, "
+            "keeping aspect ratio, and 0 means unconstrained. Pass 'off' to clear."
+        ),
+    )
+    ov.add_argument("path", nargs="?", default=None, help="PNG file, or 'off'")
+    ov.add_argument("--x", type=int, default=None)
+    ov.add_argument("--y", type=int, default=None)
+    ov.add_argument("--width", type=int, default=None, help="Max width, 0 = unconstrained")
+    ov.add_argument("--height", type=int, default=None, help="Max height, 0 = unconstrained")
+    ov.add_argument("--opacity", type=float, default=None, help="0.0 to 1.0")
+    ov.set_defaults(func=_cmd_overlay)
 
     mi = sub.add_parser(
         "mirror",

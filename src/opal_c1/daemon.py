@@ -85,6 +85,12 @@ class State:
     width: int = 1920
     height: int = 1080
     output: str = "/dev/video10"
+    overlay: Optional[str] = None
+    overlay_x: int = 0
+    overlay_y: int = 0
+    overlay_w: int = 0
+    overlay_h: int = 0
+    overlay_opacity: float = 1.0
     mirror_h: bool = False
     mirror_v: bool = False
     running: bool = False
@@ -130,9 +136,16 @@ class Daemon:
             "--look", self.state.look,
             "--strength", str(self.state.strength),
             "--flip", str(self._flip_bits()),
+            "--overlay-rect",
+            f"{self.state.overlay_x},{self.state.overlay_y},"
+            f"{self.state.overlay_w},{self.state.overlay_h}",
+            "--overlay-opacity", str(self.state.overlay_opacity),
             "--control", str(self.engine_ctl),
             "--preview", str(self.preview_sock),
-        ]
+        ] + (
+            # Passed at startup too, so an engine restart keeps the overlay.
+            ["--overlay", self.state.overlay] if self.state.overlay else []
+        )
 
     def _drain_stderr(self, proc: subprocess.Popen) -> None:
         """Keep the engine's last few stderr lines.
@@ -230,6 +243,40 @@ class Daemon:
             if vertical is not None:
                 self.state.mirror_v = bool(vertical)
             self._tell_engine(f"flip {self._flip_bits()}")
+        return self.status()
+
+    def set_overlay(
+        self, path=None, x=None, y=None, width=None, height=None, opacity=None
+    ) -> dict:
+        """Composite an image over the frame, or clear it with path="off".
+
+        Placement is in output pixels; width/height are maximums the image is
+        fitted into, keeping its aspect ratio. Zero means unconstrained.
+        """
+        with self.lock:
+            if path is not None:
+                if path in ("off", "", None):
+                    self.state.overlay = None
+                else:
+                    resolved = Path(path).expanduser()
+                    if not resolved.is_file():
+                        raise FileNotFoundError(f"no such overlay image: {resolved}")
+                    self.state.overlay = str(resolved)
+            for name, value in (
+                ("overlay_x", x), ("overlay_y", y),
+                ("overlay_w", width), ("overlay_h", height),
+            ):
+                if value is not None:
+                    setattr(self.state, name, max(0, int(value)))
+            if opacity is not None:
+                self.state.overlay_opacity = max(0.0, min(1.0, float(opacity)))
+
+            st = self.state
+            self._tell_engine(
+                f"overlay-rect {st.overlay_x} {st.overlay_y} {st.overlay_w} {st.overlay_h}"
+            )
+            self._tell_engine(f"overlay-opacity {st.overlay_opacity}")
+            self._tell_engine(f"overlay {st.overlay or 'off'}")
         return self.status()
 
     def _tell_engine(self, line: str) -> None:
@@ -537,6 +584,8 @@ class Daemon:
                 return {"ok": True, **self.set_look(req.get("look"), req.get("strength"))}
             if cmd == "set_mode":
                 return {"ok": True, **self.set_mode(req.get("mode", "call"))}
+            if cmd == "set_overlay":
+                return {"ok": True, **self.set_overlay(**req.get("values", {}))}
             if cmd == "set_mirror":
                 return {"ok": True, **self.set_mirror(
                     req.get("horizontal"), req.get("vertical")

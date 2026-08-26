@@ -14,14 +14,21 @@ struct Params {
     // Both together is a 180 degree rotation, which needs no size change and
     // so can be toggled live without tearing down the virtual camera.
     flip: u32,
+    // Overlay placement, in output pixels. ov_w == 0 means no overlay.
+    ov_x: u32,
+    ov_y: u32,
+    ov_w: u32,
+    ov_h: u32,
+    ov_opacity: f32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> src: array<u32>;
 @group(0) @binding(2) var<storage, read_write> dst: array<u32>;
+// Pre-scaled RGBA8, one pixel per u32, already at ov_w x ov_h.
+@group(0) @binding(3) var<storage, read> overlay: array<u32>;
 
 fn unpack4(word: u32) -> vec4<f32> {
     return vec4<f32>(
@@ -112,6 +119,29 @@ fn apply_look(c_in: vec3<f32>) -> vec3<f32> {
     return clamp(mix(c_in, c, params.strength), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// Composite the overlay in linear-ish RGB, before the trip back to YCbCr.
+// Doing it here means the overlay is graded-over rather than graded, so a logo
+// keeps its own colours whatever look is applied, and the alpha edge lands in
+// RGB where it belongs instead of being smeared by chroma subsampling.
+fn composite(px: u32, py: u32, rgb: vec3<f32>) -> vec3<f32> {
+    if (params.ov_w == 0u || px < params.ov_x || py < params.ov_y) {
+        return rgb;
+    }
+    let lx = px - params.ov_x;
+    let ly = py - params.ov_y;
+    if (lx >= params.ov_w || ly >= params.ov_h) {
+        return rgb;
+    }
+    let word = overlay[ly * params.ov_w + lx];
+    let src = vec3<f32>(
+        f32( word        & 0xffu),
+        f32((word >>  8u) & 0xffu),
+        f32((word >> 16u) & 0xffu),
+    ) / 255.0;
+    let alpha = f32((word >> 24u) & 0xffu) / 255.0 * params.ov_opacity;
+    return mix(rgb, src, clamp(alpha, 0.0, 1.0));
+}
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = gid.x * 4u;
@@ -165,8 +195,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let cb = select(uv.x, uv.z, pair == 1u);
         let cr = select(uv.y, uv.w, pair == 1u);
 
-        let top = apply_look(ycbcr_to_rgb(y0[i], cb, cr));
-        let bot = apply_look(ycbcr_to_rgb(y1[i], cb, cr));
+        // Overlay coordinates are output-space, so a mirrored image does not
+        // drag the logo along with it.
+        let top = composite(x + i, y, apply_look(ycbcr_to_rgb(y0[i], cb, cr)));
+        let bot = composite(x + i, y + 1u, apply_look(ycbcr_to_rgb(y1[i], cb, cr)));
 
         out0[i] = rgb_to_y(top);
         out1[i] = rgb_to_y(bot);
