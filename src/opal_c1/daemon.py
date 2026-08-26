@@ -33,10 +33,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from opal_c1.core import health, presets as preset_codec, transitions
+from opal_c1.core import health, model, presets as preset_codec, transitions
 from opal_c1.core.model import Mode
-from opal_c1.modes import camera_video_node, current_mode, wait_until_capturable
-from opal_c1.v4l2 import UvcControls
+from opal_c1.modes import current_mode, wait_until_capturable
+from opal_c1.modes import camera_video_node  # engine input node discovery
+from opal_c1.ports import FrameSource
 
 # The eight Core Image effects Composer exposed, then its five own looks.
 # Order is deliberate: it is the order they appear in the panel.
@@ -80,16 +81,6 @@ LOOKS = available_looks()
 # stronger than these are usually wanted. Half is a better starting point; each
 # look then remembers whatever you dial in for it.
 DEFAULT_STRENGTH = 0.5
-
-# Controls the daemon accepts in Call mode, mapped to V4L2 names.
-CALL_CONTROLS = {
-    "brightness": "brightness",
-    "contrast": "contrast",
-    "saturation": "saturation",
-    "hue": "hue",
-    "sharpness": "sharpness",
-}
-
 
 def runtime_dir() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/decomposer-{os.getuid()}"
@@ -172,8 +163,13 @@ class Daemon:
         self.preview_sock = runtime_dir() / "preview.sock"
         self._pump: Optional[threading.Thread] = None
         self._pump_stop = threading.Event()
-        self._cam = None  # OpalDevice, Studio mode only
-        self._last_frame = None  # newest ISP metadata, Studio mode only
+        # The camera is reached only through a backend implementing
+        # ports.CameraBackend; which one depends on the mode. `_sticky`
+        # remembers explicit user requests so they can be replayed after the
+        # firmware reboots - which it does on every mode switch and every
+        # Studio engine restart, silently resetting to defaults otherwise.
+        self._backend = None
+        self._sticky: dict = {}
         self._shutdown = threading.Event()
         self.engine_log: list[str] = []
         self._engine_started = 0.0
@@ -371,11 +367,12 @@ class Daemon:
         a mode switch - which would park this thread inside depthai and make a
         clean close impossible.
         """
-        assert self._cam is not None
+        source = self._backend
+        assert isinstance(source, FrameSource), "pump started without a frame source"
         stdin = self.engine.stdin if self.engine else None
         try:
             while not self._pump_stop.is_set() and stdin is not None:
-                frame = self._cam.try_read()
+                frame = source.try_read_frame()
                 if frame is None:
                     # Well under a frame interval, so this costs no latency.
                     self._pump_stop.wait(0.004)
@@ -383,7 +380,6 @@ class Daemon:
                 stdin.write(frame.nv12())
                 with self.lock:
                     self.state.frames += 1
-                    self._last_frame = frame
         except (BrokenPipeError, ValueError, OSError):
             pass
         except Exception as e:  # surface, do not die silently
@@ -415,16 +411,38 @@ class Daemon:
                 return
             self._pump = None
         self._stop_engine()
-        if self._cam is not None:
+        if self._backend is not None:
             try:
-                self._cam.close()
+                self._backend.release()
             except Exception as e:
-                print(f"warning: camera close failed: {e}")
+                print(f"warning: camera release failed: {e}")
                 with self.lock:
-                    self.state.error = f"camera close failed: {e}"
-            self._cam = None
+                    self.state.error = f"camera release failed: {e}"
+            self._backend = None
+
+    def _replay_sticky(self, backend) -> None:
+        """Reapply remembered requests after a firmware reboot.
+
+        Every mode entry boots a fresh firmware with default settings, so
+        without this the camera silently reverts while status keeps claiming
+        the old values. Failures are noted, not fatal: a fresh session with
+        defaults beats no session because one replayed value was refused.
+        """
+        replay = model.sticky_for_mode(self._sticky, backend.mode)
+        if not replay:
+            return
+        try:
+            applied, refused = backend.apply_controls(replay)
+            with self.lock:
+                self.state.controls.update(applied)
+            if refused:
+                print(f"sticky replay refused: {refused}")
+        except Exception as e:
+            print(f"sticky replay failed: {e}")
 
     def enter_call(self) -> None:
+        from opal_c1.adapters.uvc_cam import UvcBackend
+
         with self.lock:
             self._teardown()
             self.state.mode = Mode.CALL.value
@@ -434,27 +452,34 @@ class Daemon:
             wait_until_capturable(timeout=45)
         else:
             wait_until_capturable(timeout=10)
+        backend = UvcBackend()
+        backend.attach()
         with self.lock:
+            self._backend = backend
             self._start_engine(from_stdin=False)
             self.state.running = True
             self.state.frames = 0
+        self._replay_sticky(backend)
 
     def enter_studio(self) -> None:
-        from opal_c1.device import OpalDevice
+        from opal_c1.adapters.depthai_cam import XLinkBackend
 
         with self.lock:
             self._teardown()
             self.state.mode = Mode.STUDIO.value
             self.state.error = None
-            self._cam = OpalDevice(
+            backend = XLinkBackend(
                 width=self.state.width, height=self.state.height, fps=self.fps
-            ).open()
+            )
+            backend.attach()
+            self._backend = backend
             self._start_engine(from_stdin=True)
             self._pump_stop.clear()
             self._pump = threading.Thread(target=self._pump_frames, daemon=True)
             self._pump.start()
             self.state.running = True
             self.state.frames = 0
+        self._replay_sticky(backend)
 
     def _transition(self, want: Mode, *, enforce_guard: bool) -> None:
         """The single doorway through which every mode entry passes.
@@ -531,62 +556,38 @@ class Daemon:
         return self.status()
 
     def set_camera(self, **kw) -> dict:
-        """Apply camera controls, using whichever path the current mode allows."""
+        """Apply camera controls through the current mode's backend.
+
+        Mode-level routing comes from the single table in core.model — the
+        if-studio branches that used to live here are gone. Only values the
+        table allows reach the backend, so a refusal from the backend means
+        the hardware itself said no, not that the mode could not try.
+        """
+        requested = {k: v for k, v in kw.items() if v is not None}
         with self.lock:
             mode = Mode(self.state.mode)
-            applied, refused = {}, {}
-
-            if mode is Mode.STUDIO and self._cam is not None:
-                for region_key, setter in (
-                    ("af_region", self._cam.set_af_region),
-                    ("ae_region", self._cam.set_ae_region),
-                ):
-                    region = kw.get(region_key)
-                    if region:
-                        x, y, w, h = (int(v) for v in region)
-                        setter(x, y, w, h)
-                        applied[region_key] = [x, y, w, h]
-                if kw.get("effect") is not None:
-                    self._cam.set_effect(kw["effect"])
-                    applied["effect"] = kw["effect"]
-                if kw.get("scene") is not None:
-                    self._cam.set_scene(kw["scene"])
-                    applied["scene"] = kw["scene"]
-                if "focus" in kw and kw["focus"] is not None:
-                    v = int(kw["focus"])
-                    self._cam.set_focus(None if v < 0 else v)
-                    applied["focus"] = v
-                if "wb" in kw and kw["wb"] is not None:
-                    v = int(kw["wb"])
-                    self._cam.set_white_balance(None if v < 0 else v)
-                    applied["wb"] = v
-                if kw.get("exposure") is not None or kw.get("iso") is not None:
-                    self._cam.set_exposure(kw.get("exposure"), kw.get("iso"))
-                    applied["exposure"] = kw.get("exposure")
-                    applied["iso"] = kw.get("iso")
+            backend = self._backend
+        applied, refused = {}, {}
+        allowed = {}
+        for key, value in requested.items():
+            why = model.refusal_reason(mode, key)
+            if why:
+                refused[key] = why
             else:
-                uvc = UvcControls(camera_video_node() or "/dev/video0")
-                for key, name in CALL_CONTROLS.items():
-                    if kw.get(key) is not None:
-                        try:
-                            applied[key] = uvc.set(name, int(kw[key]))
-                        except (PermissionError, ValueError, OSError) as e:
-                            refused[key] = str(e)
-                if kw.get("exposure") is not None or kw.get("iso") is not None:
-                    try:
-                        applied.update(
-                            uvc.set_manual_exposure(kw.get("exposure"), kw.get("iso"))
-                        )
-                    except (PermissionError, ValueError, OSError) as e:
-                        refused["exposure"] = str(e)
-                for key in ("focus", "wb", "af_region", "ae_region", "effect", "scene"):
-                    if kw.get(key) is not None:
-                        refused[key] = (
-                            f"{key} needs Studio mode; it is an XLink control the "
-                            "Call-mode firmware does not expose"
-                        )
-
+                allowed[key] = value
+        if allowed:
+            if backend is None:
+                for key in allowed:
+                    refused[key] = "no camera attached (mode transition in progress?)"
+            else:
+                got, denied = backend.apply_controls(allowed)
+                applied.update(got)
+                refused.update(denied)
+        with self.lock:
             self.state.controls.update(applied)
+            for key, value in applied.items():
+                if key in model.STICKY_CONTROLS:
+                    self._sticky[key] = value
         out = self.status()
         out["applied"] = applied
         if refused:
@@ -705,39 +706,14 @@ class Daemon:
         freshly started daemon would show every control at its minimum while
         the camera sat at its real values, so the panel drew every slider at 0.
         """
-        out: dict = {}
-        if Mode(self.state.mode) is Mode.STUDIO:
-            frame = self._last_frame
-            if frame is not None:
-                for key, value in (
-                    ("focus", frame.lens), ("iso", frame.iso),
-                    ("exposure", frame.exposure_us), ("wb", frame.color_temp),
-                ):
-                    if value is not None:
-                        out[key] = value
-        else:
-            try:
-                uvc = UvcControls(camera_video_node() or "/dev/video0")
-                for key, name in (
-                    ("brightness", "brightness"), ("contrast", "contrast"),
-                    ("saturation", "saturation"), ("sharpness", "sharpness"),
-                    ("iso", "gain"), ("exposure", "exposure_time_absolute"),
-                ):
-                    control = uvc.query(name)
-                    if control is not None and control.value is not None:
-                        out[key] = control.value
-            except OSError:
-                pass
-        # An explicit request for automatic outranks whatever value the ISP
-        # happens to be reporting while it hunts.
-        for key in ("focus", "wb"):
-            if self.state.controls.get(key) == -1:
-                out[key] = -1
-        # Effect and scene have no live readback; report what was last set.
-        for key in ("effect", "scene"):
-            if key in self.state.controls:
-                out[key] = self.state.controls[key]
-        return out
+        backend = self._backend
+        live: dict = {}
+        if backend is not None:
+            with suppress(Exception):
+                live = backend.read_controls()
+        # Remembered intent (auto requests, effect/scene) overlays readback;
+        # the precedence rules are pure and tested in core.model.
+        return model.merge_reported(live, self._sticky)
 
     def status(self) -> dict:
         with self.lock:

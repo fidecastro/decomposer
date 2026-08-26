@@ -79,6 +79,21 @@ reboots it.
     whole load; apply the non-mode parts first, then attempt the switch, and
     report precisely what happened.
 
+## Hardening (P1, found during refactor phase 2)
+
+- **Replaced panels linger.** `gui --replace` takes the D-Bus name but the
+  displaced GTK process does not exit — it stays alive, windowless, polling
+  the daemon on its old code. Two were found running side by side. Handle
+  name-loss by quitting.
+- **`status.error` mixes history with the present.** After a successful
+  recovery it still carries "engine restarted after: <old log>", which reads
+  as a live fault. Split into `error` (current) and `last_event` (history).
+- **Unattributed `look mono` on the engine control socket** during the
+  phase-2 smoke, while daemon state stayed `none`. Observed once, with a
+  stale pre-refactor panel alive, so attribution is impossible — but the
+  engine control socket accepts lines from any same-user process with no
+  provenance. Worth logging accepted commands engine-side.
+
 ## Hardening (P2)
 
 12. Cache `_live_controls` for ~1s (currently 6 open/query/close ioctl rounds

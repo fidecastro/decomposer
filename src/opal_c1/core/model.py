@@ -68,6 +68,44 @@ def controls_for(mode: Mode) -> frozenset:
     return STUDIO_ONLY_CONTROLS | SHARED_CONTROLS
 
 
+# Controls whose requested values should be replayed after the firmware
+# reboots. Every mode switch (and every Studio engine restart) boots a fresh
+# firmware with default settings, so without replay the camera silently
+# reverts while status keeps claiming the old values. Regions are excluded
+# deliberately: a tap-to-focus was aimed at a moment, not a policy.
+STICKY_CONTROLS = frozenset({
+    "brightness", "contrast", "saturation", "hue", "sharpness",
+    "exposure", "iso", "focus", "wb", "effect", "scene",
+})
+
+
+def sticky_for_mode(sticky: dict, mode: Mode) -> dict:
+    """The subset of remembered requests that this mode can replay."""
+    reachable = controls_for(mode)
+    return {
+        key: value
+        for key, value in sticky.items()
+        if key in STICKY_CONTROLS and key in reachable
+    }
+
+
+def merge_reported(live: dict, sticky: dict) -> dict:
+    """Combine hardware readback with remembered intent for status.
+
+    An explicit request for automatic (-1) outranks whatever value the ISP
+    reports while it hunts, and effect/scene have no readback at all — the
+    remembered request is the only truth available.
+    """
+    out = dict(live)
+    for key in ("focus", "wb"):
+        if sticky.get(key) == -1:
+            out[key] = -1
+    for key in ("effect", "scene"):
+        if key in sticky:
+            out[key] = sticky[key]
+    return out
+
+
 def refusal_reason(mode: Mode, control: str) -> Optional[str]:
     """Why `control` cannot be applied in `mode`, or None if it can."""
     if control in controls_for(mode):
