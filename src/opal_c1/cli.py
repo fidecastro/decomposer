@@ -417,6 +417,71 @@ def _cmd_install_desktop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_install_plugin(args: argparse.Namespace) -> int:
+    """Install the Omarchy bar widget.
+
+    Omarchy's bar takes QML plugins from ~/.config/omarchy/plugins, which is a
+    far better fit than a tray icon: the widget draws the mark with the bar's
+    own foreground colour, so it matches whatever theme is set.
+    """
+    import json
+    import shutil
+    import subprocess
+
+    from opal_c1 import logo
+
+    module_id = "decomposer.overlay"
+    root = Path.home() / ".config/omarchy/plugins" / module_id
+    root.mkdir(parents=True, exist_ok=True)
+
+    exe = Path(sys.argv[0]).resolve()
+    command = f"{exe} toggle" if exe.is_file() else "decomposer toggle"
+
+    (root / "manifest.json").write_text(logo.qml_manifest(module_id))
+    (root / "BarWidget.qml").write_text(logo.qml_widget(module_id, command))
+    print(f"  wrote {root}/manifest.json")
+    print(f"  wrote {root}/BarWidget.qml  (runs: {command})")
+
+    validate = shutil.which("omarchy")
+    if validate:
+        result = subprocess.run(
+            [validate, "plugin", "validate", str(root)],
+            capture_output=True, text=True,
+        )
+        out = (result.stdout + result.stderr).strip()
+        if out:
+            print("  " + out.splitlines()[-1])
+
+    shell = Path.home() / ".config/omarchy/shell.json"
+    if not args.add_to_bar:
+        print(
+            f"\n  To show it, add {module_id!r} to the bar in {shell}\n"
+            f"  (or re-run with --add-to-bar and I will do it, keeping a backup)."
+        )
+        return 0
+
+    try:
+        config = json.loads(shell.read_text())
+    except (OSError, ValueError) as e:
+        print(f"  could not read {shell}: {e}", file=sys.stderr)
+        return 1
+
+    layout = config.setdefault("bar", {}).setdefault("layout", {})
+    side = layout.setdefault(args.side, [])
+    if any(item.get("id") == module_id for item in side):
+        print(f"  {module_id} is already on the {args.side} of the bar")
+        return 0
+
+    backup = shell.with_suffix(".json.bak")
+    backup.write_text(shell.read_text())
+    side.insert(0, {"id": module_id})
+    shell.write_text(json.dumps(config, indent=2) + "\n")
+    print(f"  backed up {shell} -> {backup}")
+    print(f"  added {module_id} to bar.layout.{args.side}")
+    print("  the bar should pick it up shortly; otherwise restart omarchy-shell")
+    return 0
+
+
 def _cmd_gui(_: argparse.Namespace) -> int:
     try:
         from opal_c1.gui import main as gui_main
@@ -673,6 +738,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Install the app-menu launcher with a working absolute path",
     )
     idt.set_defaults(func=_cmd_install_desktop)
+
+    ip = sub.add_parser(
+        "install-plugin",
+        help="Install the Omarchy bar widget that toggles the overlay",
+    )
+    ip.add_argument("--add-to-bar", action="store_true",
+                    help="Also add it to shell.json (a backup is kept)")
+    ip.add_argument("--side", choices=("left", "center", "right"), default="right")
+    ip.set_defaults(func=_cmd_install_plugin)
 
     ui = sub.add_parser("gui", help="Open the overlay")
     ui.set_defaults(func=_cmd_gui)

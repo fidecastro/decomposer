@@ -412,29 +412,48 @@ class Daemon:
     # -- supervision ----------------------------------------------------
 
     def _supervise(self) -> None:
-        """Restart the engine if it dies.
+        """Restart the engine if it dies, without hammering the camera.
 
-        Observed in practice: the camera re-enumerated under a running engine
-        and it exited with ENODEV. Without this the daemon keeps reporting a
-        mode it is no longer serving, and /dev/video10 stays dark until someone
-        notices.
+        Retrying is not free. Re-entering Studio mode reboots the camera
+        through its bootloader, so a tight retry loop leaves the device
+        cycling f63c -> f63d -> f63c forever and it never settles long enough
+        to serve anything. Backoff therefore starts above the cost of the
+        operation it is retrying, the camera must be present and have stayed
+        present before we try at all, and a mode that keeps failing is
+        abandoned for Call mode rather than retried indefinitely.
         """
-        backoff = 2.0
+        # A Call restart only reopens /dev/video0; a Studio restart reboots
+        # the camera's firmware and costs roughly twenty seconds.
+        FLOOR = {Mode.CALL: 3.0, Mode.STUDIO: 25.0}
+        MAX_BACKOFF = 120.0
+        GIVE_UP_AFTER = 3
+
+        backoff = 0.0
+        failures = 0
+
         while not self._shutdown.wait(2.0):
             with self.lock:
                 if not self.state.running or self.engine is None:
                     continue
                 if self.engine.poll() is None:
-                    backoff = 2.0
+                    backoff = 0.0
+                    failures = 0
                     continue
                 reason = " | ".join(self.engine_log) or "no output"
-                mode = self.state.mode
+                mode = Mode(self.state.mode)
 
-            print(f"engine died ({reason}); restarting in {backoff:.0f}s")
-            if self._shutdown.wait(backoff):
+            wait = backoff or FLOOR[mode]
+            print(f"engine died ({reason}); retrying {mode.value} in {wait:.0f}s")
+            if self._shutdown.wait(wait):
                 return
+
+            if not self._camera_settled():
+                # Mid-reboot. Say nothing and come back; attempting now would
+                # only add another reset to whatever it is already doing.
+                continue
+
             try:
-                if Mode(mode) is Mode.CALL:
+                if mode is Mode.CALL:
                     self.enter_call()
                 else:
                     self.enter_studio()
@@ -442,12 +461,42 @@ class Daemon:
                     self.restarts += 1
                     self.state.error = f"engine restarted after: {reason}"
                 print(f"engine restarted (total restarts: {self.restarts})")
-                backoff = 2.0
+                backoff = 0.0
+                failures = 0
             except Exception as e:
-                with self.lock:
-                    self.state.error = f"engine restart failed: {type(e).__name__}: {e}"
-                print(f"restart failed: {e}")
-                backoff = min(backoff * 2, 30.0)
+                failures += 1
+                backoff = min(max(backoff, FLOOR[mode]) * 2, MAX_BACKOFF)
+                print(f"restart failed ({failures}/{GIVE_UP_AFTER}): {e}")
+                if failures >= GIVE_UP_AFTER and mode is Mode.STUDIO:
+                    # Studio is the mode that reboots the camera. Falling back
+                    # to Call stops the cycling and leaves a usable camera.
+                    print("giving up on studio mode; falling back to call")
+                    with self.lock:
+                        self.state.error = (
+                            f"studio mode failed {failures} times ({e}); "
+                            "fell back to call"
+                        )
+                    with suppress(Exception):
+                        self.enter_call()
+                    failures = 0
+                    backoff = 0.0
+                else:
+                    with self.lock:
+                        self.state.error = f"engine restart failed: {type(e).__name__}: {e}"
+
+    def _camera_settled(self, dwell: float = 3.0) -> bool:
+        """True if the camera is on the bus and has stayed put.
+
+        A device in the middle of re-enumerating will answer once and vanish
+        again; acting on that first sighting is what turns one failure into a
+        loop.
+        """
+        first = current_mode()
+        if first is None:
+            return False
+        if self._shutdown.wait(dwell):
+            return False
+        return current_mode() is first
 
     # -- server ---------------------------------------------------------
 

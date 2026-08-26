@@ -286,12 +286,20 @@ a subtraction that destroys one of them.
 
 ### Bar and menu integration
 
-decomposer registers a **StatusNotifierItem**, so the daemon puts a button in the
-Omarchy bar's tray. Clicking it toggles the overlay. The bar is Quickshell and
-its widget ids are all built in, so there is no custom-widget slot to fill — a
-tray item is the supported way in, and it needs no new dependencies since Gio
-speaks D-Bus. The icon travels as a pixmap rather than an icon name, so it does
-not depend on an icon theme being installed or refreshed.
+```bash
+decomposer install-plugin --add-to-bar
+```
+
+Omarchy's bar loads QML plugins from `~/.config/omarchy/plugins`, so decomposer
+ships one. The widget draws the mark as real rectangles tinted with the bar's own
+`foreground`, so it follows the active theme instead of baking in a colour or
+shipping a font glyph — and the grid is generated from `logo.py`, so the bar
+button, the SVG icon and the tray pixmap cannot drift apart. `--add-to-bar` edits
+`shell.json` and keeps a `.bak`; without it the command just prints what to add.
+
+A **StatusNotifierItem** is also registered by the daemon, for desktops that have
+a tray but no Omarchy plugin host. On Omarchy the plugin is the better path: a
+tray icon is a foreign body in that bar, and it cannot pick up the theme.
 
 
 `packaging/omarchy-menu-decomposer.jsonc` holds entries to merge into

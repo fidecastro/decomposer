@@ -18,6 +18,18 @@ from gi.repository import Gio, GLib
 
 from opal_c1 import logo
 
+def _icon_dir() -> "os.PathLike":
+    from pathlib import Path
+
+    return Path.home() / ".local/share/icons/hicolor/scalable/apps"
+
+
+def _icon_installed() -> bool:
+    from pathlib import Path
+
+    return (Path(_icon_dir()) / "decomposer.svg").is_file()
+
+
 WATCHER_NAME = "org.kde.StatusNotifierWatcher"
 WATCHER_PATH = "/StatusNotifierWatcher"
 ITEM_PATH = "/StatusNotifierItem"
@@ -30,6 +42,7 @@ INTERFACE_XML = """
     <property name="Title" type="s" access="read"/>
     <property name="Status" type="s" access="read"/>
     <property name="IconName" type="s" access="read"/>
+    <property name="IconThemePath" type="s" access="read"/>
     <property name="IconPixmap" type="a(iiay)" access="read"/>
     <property name="AttentionIconName" type="s" access="read"/>
     <property name="OverlayIconName" type="s" access="read"/>
@@ -145,8 +158,15 @@ class Tray:
             return GLib.Variant("s", "decomposer")
         if prop == "Status":
             return GLib.Variant("s", "Active")
-        if prop in ("IconName", "AttentionIconName", "OverlayIconName"):
+        if prop == "IconName":
+            # Some hosts render only named icons and ignore IconPixmap, so
+            # advertise the installed theme icon when it is actually there and
+            # leave the pixmap as the fallback for hosts that prefer it.
+            return GLib.Variant("s", "decomposer" if _icon_installed() else "")
+        if prop in ("AttentionIconName", "OverlayIconName"):
             return GLib.Variant("s", "")
+        if prop == "IconThemePath":
+            return GLib.Variant("s", str(_icon_dir()))
         if prop == "IconPixmap":
             return GLib.Variant("a(iiay)", [(w, h, data)])
         if prop == "ToolTip":
