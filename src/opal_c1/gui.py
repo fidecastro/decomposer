@@ -64,16 +64,24 @@ LOOK_BLURB = {
 }
 
 AUTO_CAPABLE = ("focus", "wb")
+
+# Which modes can actually drive each control. Call mode reaches the camera
+# over V4L2; Studio mode runs different firmware where /dev/video0 does not
+# exist and only the ISP controls are addressable. A control the current mode
+# cannot touch is disabled and shown as "-", because drawing it at its minimum
+# claims the camera is set to zero when it simply is not reported.
+CALL, STUDIO = "call", "studio"
 SLIDERS = [
-    ("brightness", "Brightness", 0, 255, 1),
-    ("contrast", "Contrast", 0, 100, 1),
-    ("saturation", "Saturation", 0, 100, 1),
-    ("sharpness", "Sharpness", 0, 4, 1),
-    ("exposure", "Exposure", 1000, 33000, 100),
-    ("iso", "ISO", 100, 1600, 50),
-    ("focus", "Focus", 0, 255, 1),
-    ("wb", "White bal.", 1000, 12000, 100),
+    ("brightness", "Brightness", 0, 255, 1, (CALL,)),
+    ("contrast", "Contrast", 0, 100, 1, (CALL,)),
+    ("saturation", "Saturation", 0, 100, 1, (CALL,)),
+    ("sharpness", "Sharpness", 0, 4, 1, (CALL,)),
+    ("exposure", "Exposure", 1000, 33000, 100, (CALL, STUDIO)),
+    ("iso", "ISO", 100, 1600, 50, (CALL, STUDIO)),
+    ("focus", "Focus", 0, 255, 1, (STUDIO,)),
+    ("wb", "White bal.", 1000, 12000, 100, (STUDIO,)),
 ]
+SLIDER_MODES = {key: modes for key, _, _, _, _, modes in SLIDERS}
 
 
 def _worker(fn: Callable[[], dict], done: Callable[[dict], None]) -> None:
@@ -325,7 +333,7 @@ class Panel(Gtk.Box):
         self.slider_values = {}
         self.auto_buttons = {}
 
-        for key, label, lo, hi, step in SLIDERS:
+        for key, label, lo, hi, step, _modes in SLIDERS:
             row, scale, value = self._slider_row(label, lo, hi, step)
             scale.connect("value-changed", self._on_slider, key)
             if key in AUTO_CAPABLE:
@@ -474,8 +482,9 @@ class Panel(Gtk.Box):
             self.strength.set_value(float(st.get("strength", 1.0)))
             controls = st.get("controls") or {}
             for key, scale in self.sliders.items():
-                available = key not in AUTO_CAPABLE or studio
+                available = mode in SLIDER_MODES[key]
                 scale.set_sensitive(available)
+                self.slider_labels[key].set_opacity(1.0 if available else 0.4)
                 value = controls.get(key)
                 on_auto = value == -1
                 if key in self.auto_buttons:
@@ -486,15 +495,21 @@ class Panel(Gtk.Box):
                      else self.auto_buttons[key].remove_css_class)("selected")
                 if value is not None and not on_auto:
                     scale.set_value(float(value))
-                self.slider_values[key].set_text(
-                    "auto" if on_auto else f"{int(scale.get_value())}"
-                )
+                if not available:
+                    text = "-"
+                elif on_auto:
+                    text = "auto"
+                else:
+                    text = f"{int(scale.get_value())}"
+                self.slider_values[key].set_text(text)
         finally:
             self._suppress = False
         self._ready = True
 
         self.camera_hint.set_text(
-            "" if studio else "focus and white balance need Studio mode"
+            "brightness, contrast, saturation and sharpness need Call mode"
+            if studio
+            else "focus and white balance need Studio mode"
         )
 
         if st.get("engine_alive"):
