@@ -15,6 +15,7 @@ Only depthai and numpy are needed here — no OpenCV.
 
 from __future__ import annotations
 
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import timedelta
@@ -80,16 +81,37 @@ class Frame:
         )
 
 
-def find_device() -> dai.DeviceInfo:
-    devices = dai.Device.getAllAvailableDevices()
-    if not devices:
-        raise RuntimeError(
-            "No DepthAI device found.\n"
-            "  - Is the C1 plugged into a USB 3 port directly (it draws ~896 mA)?\n"
-            "  - Are the udev rules installed? See packaging/60-opal-c1.rules.\n"
-            "    Without them depthai logs 'Insufficient permissions' and reports 0 devices."
+def find_device(deadline_s: float = 20.0) -> dai.DeviceInfo:
+    """A device that is actually safe to attach to, or a clear error.
+
+    Never `devices[0]`: a switch that lands while the camera is mid-reboot
+    sees only the bootloader, and attaching to that wedges the session with
+    "Couldn't read data from stream: `_bootloader` (X_LINK_ERROR)". The pure
+    policy in core.transitions decides; this loop just feeds it fresh facts
+    until it says attach or the deadline passes.
+    """
+    from opal_c1.core.transitions import AttachAction, choose_device
+
+    t0 = time.monotonic()
+    last_reason = "no DepthAI device on the bus"
+    while True:
+        devices = dai.Device.getAllAvailableDevices()
+        decision = choose_device(
+            [(d.state.name, d.status.name) for d in devices]
         )
-    return devices[0]
+        if decision.action is AttachAction.ATTACH:
+            return devices[decision.index]
+        if decision.reason:
+            last_reason = decision.reason
+        if time.monotonic() - t0 >= deadline_s:
+            break
+        time.sleep(1.0)
+    raise RuntimeError(
+        f"no attachable DepthAI device within {deadline_s:.0f}s ({last_reason}).\n"
+        "  - Is the C1 plugged into a USB 3 port directly (it draws ~896 mA)?\n"
+        "  - Are the udev rules installed? See packaging/60-opal-c1.rules.\n"
+        "    Without them depthai logs 'Insufficient permissions' and reports 0 devices."
+    )
 
 
 class OpalDevice:

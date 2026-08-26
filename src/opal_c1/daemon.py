@@ -33,7 +33,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from opal_c1.modes import Mode, camera_video_node, current_mode, wait_until_capturable
+from opal_c1.core import health, presets as preset_codec, transitions
+from opal_c1.core.model import Mode
+from opal_c1.modes import camera_video_node, current_mode, wait_until_capturable
 from opal_c1.v4l2 import UvcControls
 
 # The eight Core Image effects Composer exposed, then its five own looks.
@@ -124,15 +126,8 @@ def preset_dir() -> Path:
 
 
 def _preset_path(name: str) -> Path:
-    """Resolve a preset name to a file, refusing anything path-like.
-
-    Preset names arrive over a socket, so a name containing a separator or ".."
-    would otherwise be a way to write wherever the daemon can reach.
-    """
-    clean = name.strip()
-    if not clean or clean != Path(clean).name or clean.startswith("."):
-        raise ValueError(f"invalid preset name {name!r}")
-    return preset_dir() / f"{clean}.json"
+    """Resolve a preset name to a file. Validation lives in the pure core."""
+    return preset_dir() / f"{preset_codec.validate_name(name)}.json"
 
 
 @dataclass
@@ -183,6 +178,11 @@ class Daemon:
         self.engine_log: list[str] = []
         self._engine_started = 0.0
         self.restarts = 0
+        # Transitions are mutually exclusive and rate-limited. The ledger's
+        # decisions come from the pure core; the lock enforces them across
+        # client handler threads and the supervisor.
+        self._ledger = transitions.Ledger(current=Mode(self.state.mode))
+        self._transition_lock = threading.Lock()
 
     # -- engine ---------------------------------------------------------
 
@@ -456,13 +456,42 @@ class Daemon:
             self.state.running = True
             self.state.frames = 0
 
-    def set_mode(self, mode: str) -> dict:
-        want = Mode(mode)
+    def _transition(self, want: Mode, *, enforce_guard: bool) -> None:
+        """The single doorway through which every mode entry passes.
+
+        Client switches are guarded — rate-limited and mutually exclusive —
+        because every switch reboots the camera's firmware and concurrent
+        entries used to interleave teardown with startup. Supervisor
+        re-entries share the exclusivity but bypass the rate limit: recovery
+        must not be blocked by the thing it is recovering from.
+        """
+        now = time.monotonic()
+        if enforce_guard:
+            with self.lock:
+                decision = transitions.evaluate_switch(self._ledger, want, now)
+            if not decision.allowed:
+                raise RuntimeError(decision.reason)
+        if not self._transition_lock.acquire(blocking=False):
+            raise RuntimeError("a mode transition is already in progress")
         try:
+            with self.lock:
+                if want is not self._ledger.current:
+                    self._ledger.last_switch_at = now
+                self._ledger.in_progress = True
             if want is Mode.CALL:
                 self.enter_call()
             else:
                 self.enter_studio()
+        finally:
+            with self.lock:
+                self._ledger.in_progress = False
+                self._ledger.current = Mode(self.state.mode)
+            self._transition_lock.release()
+
+    def set_mode(self, mode: str) -> dict:
+        want = Mode(mode)
+        try:
+            self._transition(want, enforce_guard=True)
         except Exception as e:
             # The mode is still what was asked for: leave `running` set so the
             # supervisor keeps working toward it instead of going dormant. A
@@ -604,9 +633,9 @@ class Daemon:
         path = _preset_path(name)
         if not path.is_file():
             raise FileNotFoundError(f"no preset named {name!r} in {preset_dir()}")
-        data = json.loads(path.read_text())
-
-        notes = []
+        # The pure codec normalizes: unknown fields dropped, out-of-range
+        # values clamped, and every such repair reported rather than silent.
+        data, notes = preset_codec.decode(json.loads(path.read_text()))
         if with_mode and data.get("mode") and data["mode"] != self.state.mode:
             self.set_mode(data["mode"])
         elif data.get("mode") and data["mode"] != self.state.mode:
@@ -718,6 +747,8 @@ class Daemon:
         s["engine_alive"] = self.engine is not None and self.engine.poll() is None
         s["looks"] = available_looks()
         s["restarts"] = self.restarts
+        with self.lock:
+            s["transitioning"] = self._ledger.in_progress
         s["presets"] = [p["name"] for p in self.list_presets()]
         s["preview"] = str(self.preview_sock) if self.preview_sock.exists() else None
         with self.lock:
@@ -732,34 +763,22 @@ class Daemon:
     # -- supervision ----------------------------------------------------
 
     def _supervise(self) -> None:
-        """Restart the engine if it dies, without hammering the camera.
+        """Restart the engine when it dies. Decisions come from core.health.
 
-        Retrying is not free. Re-entering Studio mode reboots the camera
-        through its bootloader, so a tight retry loop leaves the device
-        cycling f63c -> f63d -> f63c forever and it never settles long enough
-        to serve anything. Backoff therefore starts above the cost of the
-        operation it is retrying, the camera must be present and have stayed
-        present before we try at all, and a mode that keeps failing is
-        abandoned for Call mode rather than retried indefinitely.
+        This thread gathers facts — did the engine die, how long did it live,
+        is the camera on the bus — and executes whatever the pure policy
+        answers. The policy is unit-tested against every failure pattern the
+        camera has demonstrated (dies-young, vanished, repeated re-entry
+        failure), which is the only reason to trust a loop like this.
         """
-        # A Call restart only reopens /dev/video0; a Studio restart reboots
-        # the camera's firmware and costs roughly twenty seconds.
-        FLOOR = {Mode.CALL: 3.0, Mode.STUDIO: 25.0}
-        MAX_BACKOFF = 120.0
-        GIVE_UP_AFTER = 3
-
-        backoff = 0.0
-        failures = 0
-        vanished = 0  # consecutive failures where the camera left the bus
-        short_lives = 0  # consecutive runs where the engine died young
+        policy = health.EnginePolicy()
 
         while not self._shutdown.wait(2.0):
             with self.lock:
                 if not self.state.running:
                     continue
                 if self.engine is not None and self.engine.poll() is None:
-                    backoff = 0.0
-                    failures = 0
+                    policy.note_alive()
                     continue
                 # Covers both an engine that died and one that never started
                 # (a mode switch that failed mid-camera-reboot).
@@ -767,63 +786,35 @@ class Daemon:
                 mode = Mode(self.state.mode)
                 uptime = time.time() - self._engine_started if self._engine_started else 0.0
 
-            # A camera that streams for a few seconds and then falls off the bus
-            # is in its degraded firmware state. Each retry provokes another
-            # crash-and-reboot, so fast retries just churn the hardware - and
-            # because the camera is back on the bus by the time we look, the
-            # vanish check below never fires. Recognise the pattern by engine
-            # lifetime instead.
-            if 0 < uptime < 30:
-                short_lives += 1
-            elif uptime >= 30:
-                short_lives = 0
-            if short_lives >= 4:
-                message = (
-                    "the camera streams for a few seconds and then drops off the "
-                    "bus, repeatedly. This is the C1 firmware state a short "
-                    "unplug does not always clear: power it off for 2-3 minutes "
-                    "(and try a different USB 3 port). Holding retries for 2 "
-                    "minutes."
-                )
+            action = policy.on_death(
+                mode, uptime, camera_on_bus=current_mode() is not None
+            )
+
+            if action.kind is health.Kind.HOLD_SICK:
                 with self.lock:
-                    self.state.error = message
-                print(message)
-                if self._shutdown.wait(120.0):
+                    self.state.error = action.message
+                print(action.message)
+                if self._shutdown.wait(action.delay):
                     return
-                short_lives = 2  # stay suspicious, but allow a probe
                 continue
 
-            # A camera that keeps leaving the bus is not a software failure and
-            # retrying does not fix it. The C1 does this once its firmware gets
-            # into a bad state - typically after many mode switches - and only a
-            # power cycle clears it. Say so instead of thrashing.
-            if current_mode() is None:
-                vanished += 1
-                if vanished >= 3:
-                    message = (
-                        "the camera keeps dropping off the USB bus. This is the "
-                        "C1's firmware, not decomposer: unplug it for ~30s and "
-                        "plug it back into a direct USB 3 port. Retrying slowly."
-                    )
-                    with self.lock:
-                        self.state.error = message
-                    print(message)
-                    # Hold, but come back the moment the camera reappears so a
-                    # replug recovers in seconds rather than a minute.
-                    waited = 0.0
-                    while waited < 60.0:
-                        if self._shutdown.wait(5.0):
-                            return
-                        waited += 5.0
-                        if current_mode() is not None:
-                            break
-                    continue
-            else:
-                vanished = 0
+            if action.kind is health.Kind.HOLD_VANISHED:
+                with self.lock:
+                    self.state.error = action.message
+                print(action.message)
+                # Hold, but come back the moment the camera reappears so a
+                # replug recovers in seconds rather than a minute.
+                waited = 0.0
+                while waited < action.delay:
+                    if self._shutdown.wait(health.VANISHED_POLL_SECONDS):
+                        return
+                    waited += health.VANISHED_POLL_SECONDS
+                    if current_mode() is not None:
+                        break
+                continue
 
-            wait = backoff or FLOOR[mode]
-            print(f"engine died ({reason}); retrying {mode.value} in {wait:.0f}s")
-            if self._shutdown.wait(wait):
+            print(f"engine died ({reason}); retrying {mode.value} in {action.delay:.0f}s")
+            if self._shutdown.wait(action.delay):
                 return
 
             if not self._camera_settled():
@@ -832,36 +823,31 @@ class Daemon:
                 continue
 
             try:
-                if mode is Mode.CALL:
-                    self.enter_call()
-                else:
-                    self.enter_studio()
-                with self.lock:
-                    self.restarts += 1
-                    self.state.error = f"engine restarted after: {reason}"
-                print(f"engine restarted (total restarts: {self.restarts})")
-                backoff = 0.0
-                failures = 0
+                self._transition(mode, enforce_guard=False)
             except Exception as e:
-                failures += 1
-                backoff = min(max(backoff, FLOOR[mode]) * 2, MAX_BACKOFF)
-                print(f"restart failed ({failures}/{GIVE_UP_AFTER}): {e}")
-                if failures >= GIVE_UP_AFTER and mode is Mode.STUDIO:
+                if "already in progress" in str(e):
+                    # A client transition is underway; it owns the camera now.
+                    continue
+                followup = policy.on_reentry_failed(mode, str(e))
+                print(f"restart failed: {e}")
+                if followup.kind is health.Kind.FALLBACK_TO_CALL:
                     # Studio is the mode that reboots the camera. Falling back
                     # to Call stops the cycling and leaves a usable camera.
                     print("giving up on studio mode; falling back to call")
                     with self.lock:
-                        self.state.error = (
-                            f"studio mode failed {failures} times ({e}); "
-                            "fell back to call"
-                        )
+                        self.state.error = followup.message
                     with suppress(Exception):
-                        self.enter_call()
-                    failures = 0
-                    backoff = 0.0
+                        self._transition(Mode.CALL, enforce_guard=False)
                 else:
                     with self.lock:
                         self.state.error = f"engine restart failed: {type(e).__name__}: {e}"
+                continue
+
+            policy.on_reentry_ok()
+            with self.lock:
+                self.restarts += 1
+                self.state.error = f"engine restarted after: {reason}"
+            print(f"engine restarted (total restarts: {self.restarts})")
 
     def _camera_settled(self, dwell: float = 3.0) -> bool:
         """True if the camera is on the bus and has stayed put.

@@ -22,52 +22,23 @@ holding a depthai connection; leaving it is a side effect of releasing one.
 
 from __future__ import annotations
 
-import os
 import time
-from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-USB_VID = "03e7"
-PID_CALL = "f63d"
-PID_STUDIO = "f63b"
+# The domain facts live in the pure core; this module is the sysfs adapter
+# that observes them on the actual bus. Names are re-exported so existing
+# imports keep working.
+from opal_c1.core.model import (  # noqa: F401
+    CAPABILITIES,
+    Capabilities,
+    Mode,
+    PID_CALL,
+    PID_STUDIO,
+    USB_VID,
+)
 
 SYSFS_USB = Path("/sys/bus/usb/devices")
-
-
-class Mode(Enum):
-    CALL = "call"
-    STUDIO = "studio"
-
-    @property
-    def pid(self) -> str:
-        return PID_CALL if self is Mode.CALL else PID_STUDIO
-
-
-@dataclass(frozen=True)
-class Capabilities:
-    microphone: bool
-    video_node: bool
-    manual_focus: bool
-    manual_white_balance: bool
-    manual_exposure: bool
-    looks: bool = True
-
-
-CAPABILITIES = {
-    Mode.CALL: Capabilities(
-        microphone=True, video_node=True,
-        manual_focus=False, manual_white_balance=False, manual_exposure=True,
-    ),
-    Mode.STUDIO: Capabilities(
-        microphone=False, video_node=False,
-        manual_focus=True, manual_white_balance=True, manual_exposure=True,
-    ),
-}
-
-# Controls that exist only in Studio mode, so the CLI can route sensibly.
-STUDIO_ONLY = ("focus", "white_balance")
 
 
 def find_camera() -> Optional[Path]:
