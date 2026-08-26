@@ -173,3 +173,8 @@ On an RTX 4090, grading is free — the pipeline is camera-bound:
 
 The GPU stage costs nothing measurable, so the ceiling is the C1's USB bandwidth
 (4K NV12 at 30 fps is ~373 MB/s against a ~400 MB/s practical limit), not the looks.
+
+End to end into `/dev/video10` at 1080p the engine holds **29.6 fps**, and the node
+advertises itself to consumers as `NV12 1920x1080 @ 30fps`. Verified by reading the
+loopback back: `mono` arrives with chroma at exactly 128, `instant` warm-shifted to
+U 116.7 / V 138.5 — the grade reaches the application, not just the engine.
