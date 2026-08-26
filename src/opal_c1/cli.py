@@ -464,10 +464,31 @@ def _cmd_status(_: argparse.Namespace) -> int:
 
 
 def _cmd_stop(_: argparse.Namespace) -> int:
+    import time
+
+    from opal_c1.daemon import Client, socket_path
+
     resp = _client_call(cmd="stop")
-    if resp.get("ok"):
-        print("  daemon stopping")
-    return 0 if resp.get("ok") else 1
+    if not resp.get("ok"):
+        return 1
+    print("  daemon stopping", end="", flush=True)
+
+    # Wait for it to actually go. Shutdown releases the camera and stops the
+    # engine first, so `decomposer stop && decomposer daemon` would otherwise
+    # race and the new daemon would fail to bind.
+    path = socket_path()
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        try:
+            Client().request(cmd="status")
+        except Exception:
+            print(" — stopped")
+            return 0
+        print(".", end="", flush=True)
+        time.sleep(0.5)
+    print()
+    print("  daemon did not exit within 25s", file=sys.stderr)
+    return 1
 
 
 def _cmd_look(args: argparse.Namespace) -> int:

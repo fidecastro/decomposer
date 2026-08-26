@@ -19,11 +19,13 @@ per request.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from contextlib import suppress
@@ -444,15 +446,49 @@ class Daemon:
                 f.write((json.dumps(resp) + "\n").encode())
                 f.flush()
 
+    def _bind(self, server: socket.socket, path: Path, timeout: float = 20.0) -> bool:
+        """Take the socket, waiting out a predecessor that is still shutting down.
+
+        `decomposer stop` returns as soon as the daemon acknowledges the
+        request, but that daemon then stops the engine and releases the camera
+        before it unlinks the socket. A new daemon started immediately after
+        would otherwise hit EADDRINUSE and die. A socket with nothing listening
+        is a crash leftover and is safe to remove.
+        """
+        deadline = time.time() + timeout
+        announced = False
+        while True:
+            if path.exists():
+                if self._probe(path):
+                    if time.time() > deadline:
+                        print(
+                            f"another daemon is already listening on {path}. "
+                            "Stop it first with: decomposer stop",
+                            file=sys.stderr,
+                        )
+                        return False
+                    if not announced:
+                        print("waiting for the previous daemon to finish shutting down…")
+                        announced = True
+                    time.sleep(0.3)
+                    continue
+                with suppress(OSError):
+                    path.unlink()
+            try:
+                server.bind(str(path))
+                return True
+            except OSError as e:
+                if e.errno != errno.EADDRINUSE or time.time() > deadline:
+                    print(f"could not bind {path}: {e}", file=sys.stderr)
+                    return False
+                time.sleep(0.3)
+
     def run(self, initial_mode: str = "call") -> int:
         path = socket_path()
-        # A socket left by a crashed daemon would block bind().
-        with suppress(OSError):
-            if path.exists() and not self._probe(path):
-                path.unlink()
-
         server = socket.socket(socket.AF_UNIX)
-        server.bind(str(path))
+        if not self._bind(server, path):
+            server.close()
+            return 1
         server.listen(8)
         server.settimeout(0.5)
         print(f"daemon listening on {path}")
