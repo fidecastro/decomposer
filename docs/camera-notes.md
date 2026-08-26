@@ -417,3 +417,58 @@ So Opal's firmware almost certainly runs an XLink server alongside UVC and audio
 Reaching it needs an XLink client (protocol is public: `luxonis/XLink`) speaking
 over interface 0, plus the stream names Opal's app exposes. That is the one path
 that keeps video, mic and manual control at once.
+
+### Result: interface 0 is advertised but unserviced in camera mode
+
+A minimal XLink client (`src/opal_c1/xlink.py`) was written against the wire
+format in `luxonis/XLink`: `dispatcherEventSend` writes the 84-byte
+`xLinkEventHeader_t` raw to bulk OUT, payload only for `XLINK_WRITE_REQ`, and
+`XLinkConnect` sends `XLINK_PING_REQ` as its very first action. `usb_open_device`
+claims interface 0 and the first bulk OUT endpoint — exactly what we did.
+
+**In `f63d` (camera mode) the device never answers.** The diagnostic is the write
+side, not the read side:
+
+```
+write #1 (fresh claim, after clear_halt): TIMEOUT after 1.50s
+```
+
+The first write of a session succeeds only because the endpoint FIFO is empty;
+the packet is never consumed, so the next write blocks forever. **Nothing in
+Opal's camera-mode firmware services that endpoint.** It exists in the
+descriptor and is inert.
+
+**The client itself is correct.** Booting the device to `f63b`, killing the owning
+process, and pinging within the watchdog window with the same code gives:
+
+```
+PING_RESP id=1 stream='__log' streamId=1 size=8 flags=ack
+```
+
+So the silence is the camera's, not the client's.
+
+### Correction to the earlier inference
+
+The macOS argument was overstated here. The notes list three *available* camera
+devices; that is an enumeration, not proof that Composer streamed UVC and XLink
+simultaneously. Composer most likely either performed the same `f63d` -> `f63b`
+switch, or booted firmware with `BoardConfig.uvc.enable` set — DepthAI firmware
+can serve UVC video (`dai.node.UVC`), which would give video and XLink together.
+Neither option restores audio: **nothing in depthai touches UAC**.
+
+### The constraint, stated plainly
+
+| | Opal fw (`f63d`) | DepthAI fw (`f63b`) |
+|---|---|---|
+| Mic | **yes** | no |
+| Manual focus / white balance | no | **yes** |
+| Exposure, gain, brightness, contrast, saturation, hue, sharpness | yes (UVC) | yes |
+| Host-side looks | yes | yes |
+
+**Microphone and manual focus/white balance cannot coexist on this hardware.**
+Both paths were probed to exhaustion: the UVC extension unit is hollow, and the
+vendor endpoint is dead in camera mode.
+
+Note that the looks — the actual point of decomposer — work identically on both
+paths, and camera mode still offers manual exposure, gain, brightness, contrast,
+saturation, hue and sharpness over UVC. Only focus and white balance are lost.
