@@ -472,3 +472,21 @@ vendor endpoint is dead in camera mode.
 Note that the looks — the actual point of decomposer — work identically on both
 paths, and camera mode still offers manual exposure, gain, brightness, contrast,
 saturation, hue and sharpness over UVC. Only focus and white balance are lost.
+
+### The degraded state is Opal-firmware-specific (2026-08-26, evening)
+
+New fact with real diagnostic weight: in the degraded state, **Call mode dies
+~11 seconds into streaming** (`cannot submit urb (err = -19)`, device falls to
+its bootloader) **while Studio mode streams indefinitely**. Stock DepthAI
+firmware is stable on the same hardware, same cable, same port, same hour. So
+"the camera is sick" was too strong — it is Opal's UVC firmware that becomes
+unstable in this state; the sensor, the USB link and the Myriad are fine.
+
+Also observed: switching modes while the device is mid-reboot can attach
+depthai to the bootloader — the session then fails with *"Couldn't read data
+from stream: `_bootloader` (X_LINK_ERROR)"* — and a 30-second unplug does not
+always clear the degraded state; a 2-3 minute powerless rest did.
+
+Practical guidance until the daemon enforces it: avoid rapid mode switching -
+every switch is a firmware reboot and churn is what gets the device into this
+state. If Call mode keeps dying, Studio mode remains usable.
