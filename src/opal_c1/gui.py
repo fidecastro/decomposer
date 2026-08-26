@@ -378,7 +378,11 @@ class Panel(Gtk.Box):
         filters = Gio.ListStore.new(Gtk.FileFilter)
         filters.append(png)
         dialog.set_filters(filters)
-        dialog.open(self.get_root(), None, self._on_overlay_chosen)
+        # No transient parent. The panel is a layer surface, not an
+        # xdg_toplevel, and asking the compositor to parent a dialog to one is
+        # a protocol error: it disconnects the client, which looks exactly like
+        # the panel closing itself when the button is pressed.
+        dialog.open(None, None, self._on_overlay_chosen)
 
     def _on_overlay_chosen(self, dialog, result) -> None:
         try:

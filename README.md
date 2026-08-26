@@ -405,6 +405,15 @@ name is not on `PATH`, so the launcher starts nothing and gives no error.
 `install-desktop` writes the absolute path of the running console script and
 links `~/.local/bin/decomposer`.
 
+### Note on layer surfaces and dialogs
+
+A layer surface is not an `xdg_toplevel`, so it cannot be a dialog's transient
+parent. Passing it to something like `Gtk.FileDialog.open()` is a Wayland
+protocol error, and the compositor's response is to disconnect the client —
+which presents as the panel vanishing the instant the button is pressed, with no
+error anywhere obvious. Dialogs opened from the panel must pass `None` as the
+parent.
+
 ### Note on gtk4-layer-shell
 
 The library has to be loaded into the process *before* GTK opens the Wayland
