@@ -300,15 +300,36 @@ performs — verified against the references: at `0.0` the output reproduces the
 source, at `0.5` it lands on the exact midpoint, at `1.0` on the full look, all
 within the pipeline's own ~1.1/255 round-trip floor.
 
-That matters because Composer's preset schema defaults `filters.intensity` to
-**0.5**. If that is what the app ships, then `--strength 0.5` reproduces what a
-Composer user actually saw, and `1.0` is twice as strong. The LUTs are right
-either way; only the default is in question, and it is left at `1.0` — the
-measured value — rather than guessing. `decomposer daemon --default-strength 0.5`
-changes it.
+Looks therefore start at **0.5**. Full strength is the filter as its shader
+defines it, which is stronger than these are usually wanted; half is a better
+starting point and each look then remembers whatever you dial in.
+`--default-strength` changes where new looks begin.
 
 Intensity is remembered **per look**, since Composer's filters carry their own:
 a strength dialled in for `noir` does not follow you to `G1`.
+
+### Presets
+
+```bash
+decomposer preset save desk
+decomposer preset list
+decomposer preset load desk
+decomposer preset delete desk
+```
+
+A preset captures the look and its intensity, mirroring, the overlay with its
+placement and opacity, and the camera controls. They live in
+`~/.config/decomposer/presets`.
+
+The mode is recorded but **not** switched into on load unless `--with-mode` is
+given: switching reboots the camera and takes about fifteen seconds, which is not
+something a preset should do to you by surprise. Anything the current mode cannot
+apply — a focus value while in Call mode, an overlay file that has since moved —
+is reported rather than silently dropped.
+
+The panel has a dropdown to load and a popover to save. A popover rather than a
+dialog, because a layer surface cannot parent a dialog but `xdg_popup` is part of
+the protocol and works.
 
 ### Overlays
 

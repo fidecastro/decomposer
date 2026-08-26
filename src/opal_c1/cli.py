@@ -446,7 +446,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     return Daemon(
         output=args.output, width=args.width, height=args.height, fps=args.fps,
         tray_enabled=args.tray,
-        default_strength=args.default_strength,
+        **({} if args.default_strength is None
+           else {'default_strength': args.default_strength}),
     ).run(initial_mode=args.mode)
 
 
@@ -518,6 +519,48 @@ def _cmd_look(args: argparse.Namespace) -> int:
         return 1
     print(f"  look -> {resp.get('look')} @ {resp.get('strength')}")
     return 0
+
+
+def _cmd_preset(args: argparse.Namespace) -> int:
+    action = args.action
+    if action == "list":
+        resp = _client_call(cmd="preset_list")
+        if not resp.get("ok"):
+            return 1
+        presets = resp.get("presets") or []
+        if not presets:
+            print("  no presets saved yet")
+            return 0
+        for p in presets:
+            extra = "  +overlay" if p.get("overlay") else ""
+            print(f"  {p['name']:<20} {p.get('look')} @ {p.get('strength')}"
+                  f"  ({p.get('mode')}){extra}")
+        return 0
+
+    if not args.name:
+        print(f"  preset {action} needs a name", file=sys.stderr)
+        return 2
+
+    if action == "save":
+        resp = _client_call(cmd="preset_save", name=args.name)
+        if resp.get("ok"):
+            print(f"  saved {args.name} -> {resp.get('preset_saved')}")
+    elif action == "load":
+        resp = _client_call(
+            cmd="preset_load", name=args.name, with_mode=args.with_mode
+        )
+        if resp.get("ok"):
+            print(f"  loaded {args.name}: {resp.get('look')} @ {resp.get('strength')}")
+            for note in resp.get("notes") or []:
+                print(f"    note: {note}", file=sys.stderr)
+    elif action == "delete":
+        resp = _client_call(cmd="preset_delete", name=args.name)
+        if resp.get("ok"):
+            print(f"  deleted {args.name}")
+    else:
+        print(f"  unknown action {action!r}", file=sys.stderr)
+        return 2
+    return 0 if resp.get("ok") else 1
 
 
 def _cmd_overlay(args: argparse.Namespace) -> int:
@@ -702,12 +745,11 @@ def build_parser() -> argparse.ArgumentParser:
     dm.add_argument("--fps", type=float, default=30.0)
     dm.add_argument("--mode", choices=("call", "studio"), default="call")
     dm.add_argument(
-        "--default-strength", type=float, default=1.0,
+        "--default-strength", type=float, default=None,
         help=(
-            "Intensity a look starts at, 0.0 to 1.0. The LUTs are the filters "
-            "measured at full strength; Composer's preset schema defaults its "
-            "own filters.intensity to 0.5, so 0.5 may match the app more closely "
-            "than 1.0 does."
+            "Intensity a look starts at, 0.0 to 1.0 (default 0.5). The LUTs are "
+            "the filters measured at full strength, which is stronger than they "
+            "are usually wanted; each look then remembers what you dial in."
         ),
     )
     dm.add_argument(
@@ -759,6 +801,22 @@ def build_parser() -> argparse.ArgumentParser:
     lk.add_argument("name", nargs="?", default=None, help="Look name")
     lk.add_argument("--strength", type=float, default=None, help="0.0 to 1.0")
     lk.set_defaults(func=_cmd_look)
+
+    ps = sub.add_parser(
+        "preset",
+        help="Save, load, list or delete a named configuration",
+        description=(
+            "A preset captures the look and its intensity, mirroring, the "
+            "overlay and the camera controls. The mode is recorded but not "
+            "switched into on load unless --with-mode is given, since switching "
+            "reboots the camera and takes about fifteen seconds."
+        ),
+    )
+    ps.add_argument("action", choices=("save", "load", "list", "delete"))
+    ps.add_argument("name", nargs="?", default=None)
+    ps.add_argument("--with-mode", action="store_true",
+                    help="Also switch to the mode the preset was saved in")
+    ps.set_defaults(func=_cmd_preset)
 
     ov = sub.add_parser(
         "overlay",

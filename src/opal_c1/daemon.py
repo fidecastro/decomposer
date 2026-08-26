@@ -74,6 +74,11 @@ def available_looks() -> list[str]:
 
 LOOKS = available_looks()
 
+# A look at full strength is the filter as its shader defines it, which is
+# stronger than these are usually wanted. Half is a better starting point; each
+# look then remembers whatever you dial in for it.
+DEFAULT_STRENGTH = 0.5
+
 # Controls the daemon accepts in Call mode, mapped to V4L2 names.
 CALL_CONTROLS = {
     "brightness": "brightness",
@@ -110,6 +115,26 @@ def find_engine() -> Optional[str]:
     return None
 
 
+
+def preset_dir() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    d = Path(base) / "decomposer" / "presets"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _preset_path(name: str) -> Path:
+    """Resolve a preset name to a file, refusing anything path-like.
+
+    Preset names arrive over a socket, so a name containing a separator or ".."
+    would otherwise be a way to write wherever the daemon can reach.
+    """
+    clean = name.strip()
+    if not clean or clean != Path(clean).name or clean.startswith("."):
+        raise ValueError(f"invalid preset name {name!r}")
+    return preset_dir() / f"{clean}.json"
+
+
 @dataclass
 class State:
     mode: str = Mode.CALL.value
@@ -139,7 +164,7 @@ class Daemon:
     def __init__(
         self, output="/dev/video10", width=1920, height=1080, fps=30.0,
         tray_enabled: bool = False,
-        default_strength: float = 1.0,
+        default_strength: float = DEFAULT_STRENGTH,
     ):
         self.state = State(output=output, width=width, height=height)
         self.tray_enabled = tray_enabled
@@ -479,6 +504,109 @@ class Daemon:
             out["refused"] = refused
         return out
 
+    # -- presets ---------------------------------------------------------
+
+    def save_preset(self, name: str) -> dict:
+        """Capture the current look, framing and camera settings under a name."""
+        with self.lock:
+            st = self.state
+            data = {
+                "version": 1,
+                "name": name,
+                "mode": st.mode,
+                "look": st.look,
+                "strength": st.strength,
+                "look_strength": dict(st.look_strength),
+                "mirror_h": st.mirror_h,
+                "mirror_v": st.mirror_v,
+                "overlay": {
+                    "path": st.overlay,
+                    "x": st.overlay_x, "y": st.overlay_y,
+                    "width": st.overlay_w, "height": st.overlay_h,
+                    "opacity": st.overlay_opacity,
+                },
+                "controls": self._live_controls(),
+            }
+        path = _preset_path(name)
+        path.write_text(json.dumps(data, indent=2) + "\n")
+        out = self.status()
+        out["preset_saved"] = str(path)
+        return out
+
+    def load_preset(self, name: str, with_mode: bool = False) -> dict:
+        """Apply a saved preset.
+
+        The mode is recorded but not switched into unless asked: switching
+        reboots the camera and takes about fifteen seconds, which is not
+        something a preset should do to you by surprise. Controls the current
+        mode cannot reach are reported rather than silently dropped.
+        """
+        path = _preset_path(name)
+        if not path.is_file():
+            raise FileNotFoundError(f"no preset named {name!r} in {preset_dir()}")
+        data = json.loads(path.read_text())
+
+        notes = []
+        if with_mode and data.get("mode") and data["mode"] != self.state.mode:
+            self.set_mode(data["mode"])
+        elif data.get("mode") and data["mode"] != self.state.mode:
+            notes.append(
+                f"saved in {data['mode']} mode; still in {self.state.mode}"
+                " (pass with_mode to switch)"
+            )
+
+        with self.lock:
+            self.state.look_strength.update(data.get("look_strength") or {})
+        if data.get("look"):
+            self.set_look(data["look"], data.get("strength"))
+        self.set_mirror(data.get("mirror_h"), data.get("mirror_v"))
+
+        ov = data.get("overlay") or {}
+        try:
+            self.set_overlay(
+                path=ov.get("path") or "off",
+                x=ov.get("x"), y=ov.get("y"),
+                width=ov.get("width"), height=ov.get("height"),
+                opacity=ov.get("opacity"),
+            )
+        except FileNotFoundError as e:
+            notes.append(f"overlay skipped: {e}")
+
+        controls = data.get("controls") or {}
+        if controls:
+            applied = self.set_camera(**controls)
+            for key, why in (applied.get("refused") or {}).items():
+                notes.append(f"{key} skipped: {why}")
+
+        out = self.status()
+        out["preset_loaded"] = name
+        if notes:
+            out["notes"] = notes
+        return out
+
+    def list_presets(self) -> list[dict]:
+        found = []
+        for path in sorted(preset_dir().glob("*.json")):
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            found.append({
+                "name": path.stem,
+                "look": data.get("look"),
+                "strength": data.get("strength"),
+                "mode": data.get("mode"),
+                "overlay": bool((data.get("overlay") or {}).get("path")),
+            })
+        return found
+
+    def delete_preset(self, name: str) -> dict:
+        path = _preset_path(name)
+        if not path.is_file():
+            raise FileNotFoundError(f"no preset named {name!r}")
+        path.unlink()
+        return {"deleted": name}
+
     # -- status ---------------------------------------------------------
 
     def _live_controls(self) -> dict:
@@ -526,6 +654,7 @@ class Daemon:
         s["engine_alive"] = self.engine is not None and self.engine.poll() is None
         s["looks"] = available_looks()
         s["restarts"] = self.restarts
+        s["presets"] = [p["name"] for p in self.list_presets()]
         s["preview"] = str(self.preview_sock) if self.preview_sock.exists() else None
         with self.lock:
             s["engine_log"] = list(self.engine_log)
@@ -638,6 +767,16 @@ class Daemon:
                 return {"ok": True, **self.set_look(req.get("look"), req.get("strength"))}
             if cmd == "set_mode":
                 return {"ok": True, **self.set_mode(req.get("mode", "call"))}
+            if cmd == "preset_save":
+                return {"ok": True, **self.save_preset(req["name"])}
+            if cmd == "preset_load":
+                return {"ok": True, **self.load_preset(
+                    req["name"], bool(req.get("with_mode"))
+                )}
+            if cmd == "preset_list":
+                return {"ok": True, "presets": self.list_presets()}
+            if cmd == "preset_delete":
+                return {"ok": True, **self.delete_preset(req["name"])}
             if cmd == "set_overlay":
                 return {"ok": True, **self.set_overlay(**req.get("values", {}))}
             if cmd == "set_mirror":

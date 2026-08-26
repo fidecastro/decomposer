@@ -214,6 +214,7 @@ class Panel(Gtk.Box):
         body.append(self._sep())
         body.append(self._look_block())
         body.append(self._overlay_row())
+        body.append(self._preset_row())
         body.append(self._sep())
         body.append(self._camera_block())
         self.append(body)
@@ -368,6 +369,64 @@ class Panel(Gtk.Box):
         self.overlay_opacity.connect("value-changed", self._on_overlay_opacity)
         row.append(self.overlay_opacity)
         return row
+
+    def _preset_row(self) -> Gtk.Widget:
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        lbl = Gtk.Label(label="Preset", xalign=0)
+        lbl.add_css_class("dc-label")
+        lbl.set_size_request(64, -1)
+        row.append(lbl)
+
+        self.preset_names: list[str] = []
+        self.preset_drop = Gtk.DropDown.new_from_strings(["\u2014"])
+        self.preset_drop.set_hexpand(True)
+        self.preset_drop.connect("notify::selected", self._on_preset_selected)
+        row.append(self.preset_drop)
+
+        # A popover rather than a dialog: a layer surface cannot parent a
+        # dialog, but xdg_popup is part of the protocol and works.
+        self.preset_save = Gtk.MenuButton(label="save")
+        self.preset_save.add_css_class("dc-tiny")
+        self.preset_save.set_valign(Gtk.Align.CENTER)
+        popover = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.set_margin_top(6); box.set_margin_bottom(6)
+        box.set_margin_start(6); box.set_margin_end(6)
+        self.preset_entry = Gtk.Entry()
+        self.preset_entry.set_placeholder_text("preset name")
+        self.preset_entry.connect("activate", self._on_preset_save)
+        box.append(self.preset_entry)
+        confirm = Gtk.Button(label="Save")
+        confirm.add_css_class("dc-chip")
+        confirm.connect("clicked", self._on_preset_save)
+        box.append(confirm)
+        popover.set_child(box)
+        self.preset_save.set_popover(popover)
+        row.append(self.preset_save)
+        return row
+
+    def _on_preset_selected(self, drop, _param) -> None:
+        if self._suppress or not self._ready:
+            return
+        i = drop.get_selected()
+        if i == 0 or i - 1 >= len(self.preset_names):
+            return
+        name = self.preset_names[i - 1]
+        _worker(
+            lambda: self.client.request(cmd="preset_load", name=name),
+            self._on_result,
+        )
+
+    def _on_preset_save(self, _widget) -> None:
+        name = self.preset_entry.get_text().strip()
+        if not name:
+            return
+        self.preset_entry.set_text("")
+        self.preset_save.popdown()
+        _worker(
+            lambda: self.client.request(cmd="preset_save", name=name),
+            self._on_result,
+        )
 
     def _on_overlay_choose(self, _btn) -> None:
         dialog = Gtk.FileDialog()
@@ -614,6 +673,15 @@ class Panel(Gtk.Box):
 
         self._suppress = True
         try:
+            names = list(st.get("presets") or [])
+            if names != self.preset_names:
+                # Rebuilding the model resets the selection, so it must not be
+                # mistaken for the user picking something.
+                self.preset_names = names
+                self.preset_drop.set_model(
+                    Gtk.StringList.new(["\u2014"] + names)
+                )
+            self.preset_drop.set_sensitive(bool(names))
             self.overlay_opacity.set_value(float(st.get("overlay_opacity", 1.0)))
             self.strength.set_value(float(st.get("strength", 1.0)))
             controls = st.get("controls") or {}
