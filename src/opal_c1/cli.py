@@ -9,6 +9,34 @@ from pathlib import Path
 
 
 
+def _daemon_status() -> dict:
+    """The running daemon's status, or {} when none is listening."""
+    from opal_c1.daemon import Client
+
+    try:
+        return Client().request(cmd="status")
+    except Exception:
+        return {}
+
+
+def _refuse_if_daemon(what: str) -> bool:
+    """Direct-hardware commands and the daemon must not fight over the camera.
+
+    Two owners was a real failure mode, not a hypothetical: a direct command
+    rebooting the firmware out from under the daemon's engine looks exactly
+    like the camera dying. These commands remain available as diagnostics
+    when no daemon is running.
+    """
+    if not _daemon_status():
+        return False
+    print(
+        f"a decomposer daemon is running and owns the camera; {what}\n"
+        "  For direct hardware access, `decomposer stop` first.",
+        file=sys.stderr,
+    )
+    return True
+
+
 def _cmd_probe_xlink(args: argparse.Namespace) -> int:
     """Ask the vendor bulk interface whether anything is listening.
 
@@ -19,6 +47,16 @@ def _cmd_probe_xlink(args: argparse.Namespace) -> int:
     import usb.core
 
     from opal_c1.xlink import PID_CAMERA, PID_DEPTHAI, XLinkUSB
+
+    status = _daemon_status()
+    if status.get("mode") == "studio":
+        print(
+            "the daemon is in Studio mode: interface 0 carries its live XLink "
+            "session,\nand probing it would disrupt the stream. Switch to call "
+            "or `decomposer stop` first.",
+            file=sys.stderr,
+        )
+        return 2
 
     pid = PID_DEPTHAI if args.depthai_mode else PID_CAMERA
     print(f"Probing interface 0 on 03e7:{pid:04x} (read-only)")
@@ -53,6 +91,8 @@ def _cmd_probe_xu(args: argparse.Namespace) -> int:
 def _cmd_camera_info(args: argparse.Namespace) -> int:
     from opal_c1.device import OpalDevice
 
+    if _refuse_if_daemon("use `decomposer status` instead"):
+        return 2
     print("Attaching XLink — /dev/video0 will disappear until this exits.")
     with OpalDevice(width=args.width, height=args.height) as cam:
         for k, v in cam.describe().items():
@@ -82,7 +122,9 @@ def _cmd_mode(args: argparse.Namespace) -> int:
 
 
 def _cmd_control(args: argparse.Namespace) -> int:
-    """Apply controls, routing each to the mode that can serve it."""
+    """Apply controls directly to the hardware. Diagnostic path only."""
+    if _refuse_if_daemon("use `decomposer set ...` instead"):
+        return 2
     import time
 
     from opal_c1.modes import Mode, current_mode, wait_until_capturable
@@ -193,6 +235,8 @@ def _cmd_stream_nv12(args: argparse.Namespace) -> int:
 
         decomposer stream-nv12 --focus 150 | decomposer-engine --input - --output /dev/video10
     """
+    if _refuse_if_daemon("its engine already publishes to /dev/video10"):
+        return 2
     import signal
     import time
 
@@ -607,13 +651,16 @@ def _cmd_mirror(args: argparse.Namespace) -> int:
 
 
 def _cmd_switch(args: argparse.Namespace) -> int:
-    if args.to == "studio":
-        print("Switching to Studio mode - this takes ~5s and costs the C1 microphone.")
-    else:
-        print("Switching to Call mode - the camera reboots, so this takes ~15s.")
+    # No banner before the daemon agrees: a refused switch (rate limit,
+    # transition in progress) used to print "Switching..." and then deny it.
+    print(f"  requesting {args.to} mode…")
     resp = _client_call(cmd="set_mode", mode=args.to)
     if not resp.get("ok"):
         return 1
+    if args.to == "studio":
+        print("  in Studio mode: manual focus and WB live; the C1 mic is off.")
+    else:
+        print("  in Call mode: mic and /dev/video0 are back.")
     _print_status(resp)
     return 0
 

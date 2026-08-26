@@ -202,6 +202,7 @@ class Panel(Gtk.Box):
         # Building a Gtk.Scale emits value-changed; until the first status
         # arrives those signals carry widget defaults, not camera state.
         self._ready = False
+        self._refreshing = False
 
         self.set_size_request(WIDTH, -1)
         self.append(self._header())
@@ -664,7 +665,17 @@ class Panel(Gtk.Box):
             self.footer.set_text(message)
 
     def refresh(self) -> None:
-        _worker(lambda: self.client.request(cmd="status"), self._on_result)
+        # One in flight, ever: the 2s tick plus a slow daemon used to pile up
+        # worker threads, each parked on a 60s socket timeout.
+        if self._refreshing:
+            return
+        self._refreshing = True
+
+        def done(resp: dict) -> None:
+            self._refreshing = False
+            self._on_result(resp)
+
+        _worker(lambda: self.client.request(cmd="status"), done)
 
     def _tick(self) -> bool:
         if not self.busy:
@@ -693,6 +704,7 @@ class Panel(Gtk.Box):
     def _apply(self, st: dict) -> None:
         mode = st.get("mode", "call")
         studio = mode == "studio"
+        transitioning = bool(st.get("transitioning"))
 
         self.mode_pill.set_text(mode.upper())
         for cls in ("call", "studio", "off"):
@@ -706,7 +718,7 @@ class Panel(Gtk.Box):
             (b.add_css_class if st.get(key) else b.remove_css_class)("selected")
 
         for name, b in self.mode_buttons.items():
-            b.set_sensitive(True)
+            b.set_sensitive(not transitioning)
             (b.add_css_class if name == mode else b.remove_css_class)("selected")
 
         look = st.get("look", "none")
@@ -770,7 +782,9 @@ class Panel(Gtk.Box):
             else "focus, white balance, effects and tap-to-focus need Studio mode"
         )
 
-        if st.get("engine_alive"):
+        if transitioning:
+            self.footer.set_text("switching modes… the camera is rebooting")
+        elif st.get("engine_alive"):
             self.footer.set_text(
                 f"{st.get('width')}×{st.get('height')} → {st.get('output')}"
             )
@@ -788,9 +802,17 @@ class App(Adw.Application):
         if replace:
             flags |= Gio.ApplicationFlags.REPLACE
         super().__init__(application_id="dev.decomposer.Panel", flags=flags)
+        # Without this, a panel displaced by --replace lingers forever:
+        # windowless, invisible, still polling the daemon on outdated code.
+        # Two such ghosts were found running side by side.
+        self.connect("name-lost", self._on_name_lost)
         self.window: Optional[Gtk.Window] = None
         self.panel: Optional[Panel] = None
         self.connect("activate", self.on_activate)
+
+    def _on_name_lost(self, _app) -> bool:
+        self.quit()
+        return True
 
     def on_activate(self, _app) -> None:
         # Launching again is how the bar entry toggles the overlay.
