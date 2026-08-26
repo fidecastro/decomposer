@@ -167,7 +167,21 @@ class OpalDevice:
     # -- frames ----------------------------------------------------------
 
     def read(self) -> Frame:
-        img = self._queue.get()
+        """Block until the next frame. Only safe when something guarantees one."""
+        return self._wrap(self._queue.get())
+
+    def try_read(self) -> Optional[Frame]:
+        """Next frame if one is waiting, else None.
+
+        A blocking get cannot be interrupted, so a reader that must also watch
+        for a shutdown signal has to poll: when the camera stops delivering -
+        which is exactly what happens while it reboots - a blocking get parks
+        the thread inside depthai and the device can never be closed cleanly.
+        """
+        img = self._queue.tryGet()
+        return self._wrap(img) if img is not None else None
+
+    def _wrap(self, img) -> Frame:
         return Frame(
             data=img.getData(),
             width=img.getWidth(),

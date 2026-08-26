@@ -359,13 +359,22 @@ class Daemon:
     # -- studio frame pump ----------------------------------------------
 
     def _pump_frames(self) -> None:
-        """Studio mode: depthai -> engine stdin, until told to stop."""
+        """Studio mode: depthai -> engine stdin, until told to stop.
+
+        Polls rather than blocking. A blocking read cannot be interrupted, and
+        the camera stops delivering precisely when we most need to stop - during
+        a mode switch - which would park this thread inside depthai and make a
+        clean close impossible.
+        """
         assert self._cam is not None
         stdin = self.engine.stdin if self.engine else None
         try:
-            for frame in self._cam.frames():
-                if self._pump_stop.is_set() or stdin is None:
-                    break
+            while not self._pump_stop.is_set() and stdin is not None:
+                frame = self._cam.try_read()
+                if frame is None:
+                    # Well under a frame interval, so this costs no latency.
+                    self._pump_stop.wait(0.004)
+                    continue
                 stdin.write(frame.nv12())
                 with self.lock:
                     self.state.frames += 1
@@ -379,14 +388,35 @@ class Daemon:
     # -- modes ----------------------------------------------------------
 
     def _teardown(self) -> None:
+        """Release the engine and the camera, in an order that cannot deadlock.
+
+        The pump must be gone before the device is closed: closing depthai
+        underneath a thread that is still inside it leaves its watchdog running,
+        and the watchdog reboots the camera - repeatedly, since nothing ever
+        reconnects. That is what a failed mode switch used to look like from
+        outside: a camera cycling through its bootloader every fifteen seconds.
+        """
         self._pump_stop.set()
         if self._pump is not None:
             self._pump.join(timeout=5)
+            if self._pump.is_alive():
+                # Should not happen now the pump polls, but closing the device
+                # regardless would be worse than saying so.
+                print("warning: frame pump did not stop; not closing the device")
+                with self.lock:
+                    self.state.error = "frame pump would not stop"
+                self._pump = None
+                self._stop_engine()
+                return
             self._pump = None
         self._stop_engine()
         if self._cam is not None:
-            with suppress(Exception):
+            try:
                 self._cam.close()
+            except Exception as e:
+                print(f"warning: camera close failed: {e}")
+                with self.lock:
+                    self.state.error = f"camera close failed: {e}"
             self._cam = None
 
     def enter_call(self) -> None:
@@ -686,6 +716,7 @@ class Daemon:
 
         backoff = 0.0
         failures = 0
+        vanished = 0  # consecutive failures where the camera left the bus
 
         while not self._shutdown.wait(2.0):
             with self.lock:
@@ -697,6 +728,27 @@ class Daemon:
                     continue
                 reason = " | ".join(self.engine_log) or "no output"
                 mode = Mode(self.state.mode)
+
+            # A camera that keeps leaving the bus is not a software failure and
+            # retrying does not fix it. The C1 does this once its firmware gets
+            # into a bad state - typically after many mode switches - and only a
+            # power cycle clears it. Say so instead of thrashing.
+            if current_mode() is None:
+                vanished += 1
+                if vanished >= 3:
+                    message = (
+                        "the camera keeps dropping off the USB bus. This is the "
+                        "C1's firmware, not decomposer: unplug it for ~30s and "
+                        "plug it back into a direct USB 3 port. Retrying slowly."
+                    )
+                    with self.lock:
+                        self.state.error = message
+                    print(message)
+                    if self._shutdown.wait(60.0):
+                        return
+                    continue
+            else:
+                vanished = 0
 
             wait = backoff or FLOOR[mode]
             print(f"engine died ({reason}); retrying {mode.value} in {wait:.0f}s")
@@ -873,6 +925,13 @@ class Daemon:
                 time.sleep(0.3)
 
     def run(self, initial_mode: str = "call") -> int:
+        # Redirected output is block-buffered, which silently swallows every
+        # diagnostic the daemon prints for as long as it keeps running - which
+        # is exactly when they are needed.
+        with suppress(Exception):
+            sys.stdout.reconfigure(line_buffering=True)
+            sys.stderr.reconfigure(line_buffering=True)
+
         path = socket_path()
         server = socket.socket(socket.AF_UNIX)
         if not self._bind(server, path):
