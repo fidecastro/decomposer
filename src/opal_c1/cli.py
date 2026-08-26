@@ -619,6 +619,12 @@ def _cmd_switch(args: argparse.Namespace) -> int:
 
 
 def _cmd_set(args: argparse.Namespace) -> int:
+    def region(text):
+        parts = [int(v) for v in text.replace("x", ",").split(",") if v.strip()]
+        if len(parts) != 4:
+            raise SystemExit(f"  region must be x,y,w,h — got {text!r}")
+        return parts
+
     values = {
         k: v
         for k, v in (
@@ -626,6 +632,9 @@ def _cmd_set(args: argparse.Namespace) -> int:
             ("saturation", args.saturation), ("hue", args.hue),
             ("sharpness", args.sharpness), ("exposure", args.exposure),
             ("iso", args.iso), ("focus", args.focus), ("wb", args.wb),
+            ("effect", args.effect), ("scene", args.scene),
+            ("af_region", region(args.af_region) if args.af_region else None),
+            ("ae_region", region(args.ae_region) if args.ae_region else None),
         )
         if v is not None
     }
@@ -869,6 +878,16 @@ def build_parser() -> argparse.ArgumentParser:
         ("focus", "0-255, -1 for auto (Studio)"), ("wb", "1000-12000 K, -1 for auto (Studio)"),
     ):
         se.add_argument(f"--{name}", type=int, default=None, help=helptext)
+    se.add_argument("--af-region", default=None, metavar="X,Y,W,H",
+                    help="Focus on a frame region (Studio)")
+    se.add_argument("--ae-region", default=None, metavar="X,Y,W,H",
+                    help="Meter exposure from a frame region (Studio)")
+    se.add_argument("--effect", default=None,
+                    help="On-device effect: off, sepia, mono, negative, posterize, "
+                         "solarize, aqua, blackboard, whiteboard (Studio)")
+    se.add_argument("--scene", default=None,
+                    help="On-device scene program, e.g. face_priority, portrait, "
+                         "night; off resets (Studio)")
     se.set_defaults(func=_cmd_set)
 
     return p

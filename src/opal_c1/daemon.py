@@ -33,7 +33,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from opal_c1.modes import Mode, current_mode, wait_until_capturable
+from opal_c1.modes import Mode, camera_video_node, current_mode, wait_until_capturable
 from opal_c1.v4l2 import UvcControls
 
 # The eight Core Image effects Composer exposed, then its five own looks.
@@ -191,9 +191,12 @@ class Daemon:
             raise RuntimeError(
                 "decomposer-engine not found. Build it with: cd engine && cargo build --release"
             )
+        # Discovered per attempt: the number can change between retries when
+        # the camera has just re-enumerated.
+        cam_node = "-" if from_stdin else (camera_video_node() or "/dev/video0")
         return [
             binary,
-            "--input", "-" if from_stdin else "/dev/video0",
+            "--input", cam_node,
             "--output", self.state.output,
             "--width", str(self.state.width),
             "--height", str(self.state.height),
@@ -453,10 +456,20 @@ class Daemon:
 
     def set_mode(self, mode: str) -> dict:
         want = Mode(mode)
-        if want is Mode.CALL:
-            self.enter_call()
-        else:
-            self.enter_studio()
+        try:
+            if want is Mode.CALL:
+                self.enter_call()
+            else:
+                self.enter_studio()
+        except Exception as e:
+            # The mode is still what was asked for: leave `running` set so the
+            # supervisor keeps working toward it instead of going dormant. A
+            # switch issued while the camera is mid-reboot fails exactly once
+            # and used to strand the daemon until someone reissued it by hand.
+            with self.lock:
+                self.state.running = True
+                self.state.error = f"{type(e).__name__}: {e}"
+            raise
         return self.status()
 
     # -- controls -------------------------------------------------------
@@ -493,6 +506,21 @@ class Daemon:
             applied, refused = {}, {}
 
             if mode is Mode.STUDIO and self._cam is not None:
+                for region_key, setter in (
+                    ("af_region", self._cam.set_af_region),
+                    ("ae_region", self._cam.set_ae_region),
+                ):
+                    region = kw.get(region_key)
+                    if region:
+                        x, y, w, h = (int(v) for v in region)
+                        setter(x, y, w, h)
+                        applied[region_key] = [x, y, w, h]
+                if kw.get("effect") is not None:
+                    self._cam.set_effect(kw["effect"])
+                    applied["effect"] = kw["effect"]
+                if kw.get("scene") is not None:
+                    self._cam.set_scene(kw["scene"])
+                    applied["scene"] = kw["scene"]
                 if "focus" in kw and kw["focus"] is not None:
                     v = int(kw["focus"])
                     self._cam.set_focus(None if v < 0 else v)
@@ -506,7 +534,7 @@ class Daemon:
                     applied["exposure"] = kw.get("exposure")
                     applied["iso"] = kw.get("iso")
             else:
-                uvc = UvcControls()
+                uvc = UvcControls(camera_video_node() or "/dev/video0")
                 for key, name in CALL_CONTROLS.items():
                     if kw.get(key) is not None:
                         try:
@@ -520,11 +548,11 @@ class Daemon:
                         )
                     except (PermissionError, ValueError, OSError) as e:
                         refused["exposure"] = str(e)
-                for key in ("focus", "wb"):
+                for key in ("focus", "wb", "af_region", "ae_region", "effect", "scene"):
                     if kw.get(key) is not None:
                         refused[key] = (
-                            f"{key} needs Studio mode; the camera locks it to auto "
-                            "under Call-mode firmware"
+                            f"{key} needs Studio mode; it is an XLink control the "
+                            "Call-mode firmware does not expose"
                         )
 
             self.state.controls.update(applied)
@@ -658,7 +686,7 @@ class Daemon:
                         out[key] = value
         else:
             try:
-                uvc = UvcControls()
+                uvc = UvcControls(camera_video_node() or "/dev/video0")
                 for key, name in (
                     ("brightness", "brightness"), ("contrast", "contrast"),
                     ("saturation", "saturation"), ("sharpness", "sharpness"),
@@ -674,6 +702,10 @@ class Daemon:
         for key in ("focus", "wb"):
             if self.state.controls.get(key) == -1:
                 out[key] = -1
+        # Effect and scene have no live readback; report what was last set.
+        for key in ("effect", "scene"):
+            if key in self.state.controls:
+                out[key] = self.state.controls[key]
         return out
 
     def status(self) -> dict:
@@ -720,13 +752,15 @@ class Daemon:
 
         while not self._shutdown.wait(2.0):
             with self.lock:
-                if not self.state.running or self.engine is None:
+                if not self.state.running:
                     continue
-                if self.engine.poll() is None:
+                if self.engine is not None and self.engine.poll() is None:
                     backoff = 0.0
                     failures = 0
                     continue
-                reason = " | ".join(self.engine_log) or "no output"
+                # Covers both an engine that died and one that never started
+                # (a mode switch that failed mid-camera-reboot).
+                reason = " | ".join(self.engine_log) or "engine not started"
                 mode = Mode(self.state.mode)
 
             # A camera that keeps leaving the bus is not a software failure and

@@ -74,6 +74,9 @@ LOOK_BLURB = {
     "X1": "Composer's own \u2014 cool lift, strong",
 }
 
+EFFECTS = ["off", "sepia", "mono", "negative", "posterize",
+           "solarize", "aqua", "blackboard", "whiteboard"]
+
 AUTO_CAPABLE = ("focus", "wb")
 
 # Which modes can actually drive each control. Call mode reaches the camera
@@ -209,6 +212,9 @@ class Panel(Gtk.Box):
         body.set_margin_bottom(9)
 
         self.preview = Preview()
+        tap = Gtk.GestureClick()
+        tap.connect("released", self._on_preview_tap)
+        self.preview.add_controller(tap)
         body.append(self.preview)
         body.append(self._mode_row())
         body.append(self._sep())
@@ -510,6 +516,18 @@ class Panel(Gtk.Box):
             self.slider_labels[key] = row.get_first_child()
             box.append(row)
 
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        lbl = Gtk.Label(label="Effect", xalign=0)
+        lbl.add_css_class("dc-label")
+        lbl.set_size_request(64, -1)
+        row.append(lbl)
+        self.effect_drop = Gtk.DropDown.new_from_strings(EFFECTS)
+        self.effect_drop.set_hexpand(True)
+        self.effect_drop.connect("notify::selected", self._on_effect_selected)
+        row.append(self.effect_drop)
+        self.effect_label = lbl
+        box.append(row)
+
         self.camera_hint = Gtk.Label(xalign=0, wrap=True)
         self.camera_hint.add_css_class("dc-hint")
         box.append(self.camera_hint)
@@ -526,6 +544,42 @@ class Panel(Gtk.Box):
         return box
 
     # -- actions --------------------------------------------------------
+
+    def _on_preview_tap(self, gesture, _n_press, cx: float, cy: float) -> None:
+        """Tap to focus: aim autofocus and exposure metering where clicked."""
+        if self.busy or not self._ready:
+            return
+        if self.status.get("mode") != "studio":
+            self.footer.set_text("tap-to-focus needs Studio mode")
+            return
+        # The preview uses ContentFit.COVER, so the picture may be cropped;
+        # undo that mapping before converting to frame coordinates.
+        w = self.preview.get_width() or 1
+        h = self.preview.get_height() or 1
+        pw, ph = 480, 270
+        scale = max(w / pw, h / ph)
+        ix = (cx - (w - pw * scale) / 2) / scale
+        iy = (cy - (h - ph * scale) / 2) / scale
+        fx = max(0, min(1919, int(ix / pw * 1920)))
+        fy = max(0, min(1079, int(iy / ph * 1080)))
+        x0, y0 = max(0, fx - 128), max(0, fy - 128)
+        region = [x0, y0, 256, 256]
+        self.footer.set_text(f"focusing at {fx},{fy}…")
+        _worker(
+            lambda: self.client.request(
+                cmd="set_camera", values={"af_region": region, "ae_region": region}
+            ),
+            self._on_result,
+        )
+
+    def _on_effect_selected(self, drop, _param) -> None:
+        if self._suppress or not self._ready:
+            return
+        name = EFFECTS[drop.get_selected()]
+        _worker(
+            lambda: self.client.request(cmd="set_camera", values={"effect": name}),
+            self._on_result,
+        )
 
     def _on_mode(self, _btn, mode: str) -> None:
         if self.busy or self.status.get("mode") == mode:
@@ -711,9 +765,9 @@ class Panel(Gtk.Box):
         self._ready = True
 
         self.camera_hint.set_text(
-            "brightness, contrast, saturation and sharpness need Call mode"
+            "tap the preview to focus \u00b7 colour sliders need Call mode"
             if studio
-            else "focus and white balance need Studio mode"
+            else "focus, white balance, effects and tap-to-focus need Studio mode"
         )
 
         if st.get("engine_alive"):

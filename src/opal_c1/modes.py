@@ -89,6 +89,31 @@ def find_camera() -> Optional[Path]:
     return None
 
 
+def camera_video_node() -> Optional[str]:
+    """The C1's V4L2 capture node, discovered rather than assumed.
+
+    Node numbers are not stable: after enough re-enumerations the camera can
+    come back as /dev/video2 while other numbers stay taken, and everything
+    that hardcoded /dev/video0 starts failing with ENOENT.
+    """
+    entry = find_camera()
+    if entry is None:
+        return None
+    from opal_c1.v4l2 import capture_ready
+
+    numbers = []
+    for vd in entry.glob("*/video4linux/video*"):
+        try:
+            numbers.append(int(vd.name[5:]))
+        except ValueError:
+            continue
+    for n in sorted(numbers):
+        path = f"/dev/video{n}"
+        if capture_ready(path):
+            return path
+    return None
+
+
 def current_mode() -> Optional[Mode]:
     """Which mode the camera is in, or None if it is not on the bus.
 
@@ -122,11 +147,9 @@ def wait_until_capturable(timeout: float = 40.0) -> Optional[float]:
     opened before it will stream, so this checks it answers VIDIOC_QUERYCAP as
     a capture device rather than just testing for the path.
     """
-    from opal_c1.v4l2 import capture_ready
-
     t0 = time.time()
     while time.time() - t0 < timeout:
-        if capture_ready():
+        if camera_video_node() is not None:
             return round(time.time() - t0, 1)
         time.sleep(0.2)
     return None

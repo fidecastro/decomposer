@@ -249,6 +249,68 @@ class OpalDevice:
             c.setManualExposure(timedelta(microseconds=self._exposure_us), self._iso)
         self._send(c)
 
+    # On-device ISP effects. These run on the camera, cost nothing on the
+    # host, and stack with the host-side looks.
+    EFFECTS = (
+        "off", "sepia", "mono", "negative", "posterize",
+        "solarize", "aqua", "blackboard", "whiteboard",
+    )
+    SCENES = (
+        "face_priority", "action", "portrait", "landscape", "night",
+        "night_portrait", "theatre", "beach", "snow", "sunset",
+        "steadyphoto", "fireworks", "sports", "party", "candlelight", "barcode",
+    )
+
+    # Region controls take coordinates in the ISP's internal stream, which on
+    # this camera is the 4K mode (3840x2160), not the scaled output. Measured:
+    # metering a dark tile shifted exposure*iso from 11.6M to 19.3M with frame
+    # coordinates scaled by exactly 2, and not at 1x or 4.17x.
+    ISP_W, ISP_H = 3840, 2160
+
+    def _to_isp(self, x: int, y: int, w: int, h: int) -> tuple:
+        sx, sy = self.ISP_W / self.width, self.ISP_H / self.height
+        return (max(0, int(x * sx)), max(0, int(y * sy)),
+                max(1, int(w * sx)), max(1, int(h * sy)))
+
+    def set_af_region(self, x: int, y: int, w: int, h: int) -> None:
+        """Focus on a region, given in output-frame coordinates.
+
+        Re-arms autofocus with the region and triggers it, so this also works
+        after manual focus: tapping takes the lens back to auto, aimed there.
+        """
+        c = dai.CameraControl()
+        c.setAutoFocusMode(dai.CameraControl.AutoFocusMode.AUTO)
+        c.setAutoFocusRegion(*self._to_isp(x, y, w, h))
+        c.setAutoFocusTrigger()
+        self._send(c)
+
+    def set_ae_region(self, x: int, y: int, w: int, h: int) -> None:
+        """Meter exposure from a region, given in output-frame coordinates."""
+        c = dai.CameraControl()
+        c.setAutoExposureRegion(*self._to_isp(x, y, w, h))
+        self._send(c)
+
+    def set_effect(self, name: str) -> None:
+        key = name.strip().lower()
+        if key not in self.EFFECTS:
+            raise ValueError(f"unknown effect {name!r}. Known: {', '.join(self.EFFECTS)}")
+        c = dai.CameraControl()
+        c.setEffectMode(getattr(dai.CameraControl.EffectMode, key.upper()))
+        self._send(c)
+
+    def set_scene(self, name: str) -> None:
+        """Scene program. The enum has no OFF; UNSUPPORTED is the reset value."""
+        key = name.strip().lower()
+        if key == "off":
+            mode = dai.CameraControl.SceneMode.UNSUPPORTED
+        elif key in self.SCENES:
+            mode = getattr(dai.CameraControl.SceneMode, key.upper())
+        else:
+            raise ValueError(f"unknown scene {name!r}. Known: off, {', '.join(self.SCENES)}")
+        c = dai.CameraControl()
+        c.setSceneMode(mode)
+        self._send(c)
+
     def set_auto(self) -> None:
         """Return focus, white balance and exposure to automatic."""
         c = dai.CameraControl()
