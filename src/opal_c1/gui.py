@@ -12,6 +12,8 @@ takes up to fifteen seconds.
 
 from __future__ import annotations
 
+import json
+import os
 import socket
 import struct
 from pathlib import Path
@@ -41,6 +43,12 @@ except (ValueError, ImportError, OSError):
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+
+import cairo  # noqa: E402
+
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Pango, PangoCairo  # noqa: E402
 
 from opal_c1 import theme as omtheme  # noqa: E402
 from opal_c1.daemon import Client, runtime_dir  # noqa: E402
@@ -86,6 +94,28 @@ RESOLUTION_CHOICES = [
 
 AUTO_CAPABLE = ("focus", "wb")
 
+PANEL_CONFIG = (
+    Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    / "decomposer/panel.json"
+)
+
+
+def _panel_pref(key: str, default):
+    try:
+        return json.loads(PANEL_CONFIG.read_text()).get(key, default)
+    except (OSError, ValueError):
+        return default
+
+
+def _save_panel_pref(key: str, value) -> None:
+    try:
+        data = json.loads(PANEL_CONFIG.read_text())
+    except (OSError, ValueError):
+        data = {}
+    data[key] = value
+    PANEL_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    PANEL_CONFIG.write_text(json.dumps(data, indent=2) + "\n")
+
 # Which modes can actually drive each control. Call mode reaches the camera
 # over V4L2; Studio mode runs different firmware where /dev/video0 does not
 # exist and only the ISP controls are addressable. A control the current mode
@@ -123,6 +153,8 @@ class Preview(Gtk.Picture):
     pixels for a hidden window.
     """
 
+    PLACEHOLDER_STYLES = ("nofeed", "bars")
+
     def __init__(self):
         super().__init__()
         self.set_content_fit(Gtk.ContentFit.COVER)
@@ -131,6 +163,111 @@ class Preview(Gtk.Picture):
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._path = runtime_dir() / "preview.sock"
+        self.placeholder = _panel_pref("placeholder", "nofeed")
+        if self.placeholder not in self.PLACEHOLDER_STYLES:
+            self.placeholder = "nofeed"
+        self._ph_cache: dict = {}
+        self._had_frame = False
+        self._showing_placeholder = False
+        self.show_placeholder()
+
+    # -- placeholder ------------------------------------------------------
+
+    def cycle_placeholder(self) -> str:
+        """Right-click the preview: next placeholder style, persisted."""
+        styles = self.PLACEHOLDER_STYLES
+        self.placeholder = styles[
+            (styles.index(self.placeholder) + 1) % len(styles)
+        ]
+        _save_panel_pref("placeholder", self.placeholder)
+        if self._showing_placeholder:
+            self.show_placeholder()
+        return self.placeholder
+
+    def show_placeholder(self) -> None:
+        GLib.idle_add(self._paint_placeholder)
+
+    def _paint_placeholder(self) -> bool:
+        self.set_paintable(self._placeholder_texture(self.placeholder))
+        self._showing_placeholder = True
+        return False
+
+    def _placeholder_texture(self, style: str):
+        if style in self._ph_cache:
+            return self._ph_cache[style]
+        w, h = 480, 270
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+        ctx = cairo.Context(surface)
+        if style == "bars":
+            self._draw_bars(ctx, w, h)
+        else:
+            self._draw_nofeed(ctx, w, h)
+        surface.flush()
+        texture = Gdk.MemoryTexture.new(
+            w, h, Gdk.MemoryFormat.B8G8R8A8_PREMULTIPLIED,
+            GLib.Bytes.new(bytes(surface.get_data())), surface.get_stride(),
+        )
+        self._ph_cache[style] = texture
+        return texture
+
+    @staticmethod
+    def _draw_nofeed(ctx, w: int, h: int) -> None:
+        ctx.set_source_rgb(0.02, 0.02, 0.025)
+        ctx.paint()
+        layout = PangoCairo.create_layout(ctx)
+        family, _ = omtheme.system_font()
+        desc = Pango.FontDescription(f"{family} Bold 30")
+        layout.set_font_description(desc)
+        attrs = Pango.AttrList()
+        attrs.insert(Pango.attr_letter_spacing_new(8 * Pango.SCALE))
+        layout.set_attributes(attrs)
+        layout.set_text("NO FEED", -1)
+        _, logical = layout.get_pixel_extents()
+        ctx.set_source_rgb(0.72, 0.73, 0.76)
+        ctx.move_to((w - logical.width) / 2, (h - logical.height) / 2)
+        PangoCairo.show_layout(ctx, layout)
+
+    @staticmethod
+    def _draw_bars(ctx, w: int, h: int) -> None:
+        """The broadcast test card: 75% SMPTE bars with castellations."""
+        bars = [
+            (0.75, 0.75, 0.75), (0.75, 0.75, 0.0), (0.0, 0.75, 0.75),
+            (0.0, 0.75, 0.0), (0.75, 0.0, 0.75), (0.75, 0.0, 0.0),
+            (0.0, 0.0, 0.75),
+        ]
+        top = int(h * 0.67)
+        bw = w / len(bars)
+        for i, rgb in enumerate(bars):
+            ctx.set_source_rgb(*rgb)
+            ctx.rectangle(i * bw, 0, bw + 1, top)
+            ctx.fill()
+        mid = int(h * 0.08)
+        castell = [
+            (0.0, 0.0, 0.75), (0.075, 0.075, 0.075), (0.75, 0.0, 0.75),
+            (0.075, 0.075, 0.075), (0.0, 0.75, 0.75), (0.075, 0.075, 0.075),
+            (0.75, 0.75, 0.75),
+        ]
+        for i, rgb in enumerate(castell):
+            ctx.set_source_rgb(*rgb)
+            ctx.rectangle(i * bw, top, bw + 1, mid)
+            ctx.fill()
+        bottom_y = top + mid
+        bottom_h = h - bottom_y
+        blocks = [
+            ((0.0, 0.129, 0.298), w * 0.25), ((1.0, 1.0, 1.0), w * 0.125),
+            ((0.196, 0.0, 0.416), w * 0.25), ((0.075, 0.075, 0.075), w * 0.375),
+        ]
+        x = 0.0
+        for rgb, bwidth in blocks:
+            ctx.set_source_rgb(*rgb)
+            ctx.rectangle(x, bottom_y, bwidth + 1, bottom_h)
+            ctx.fill()
+            x += bwidth
+        # pluge strip inside the last black block
+        for i, lum in enumerate((0.035, 0.075, 0.115)):
+            ctx.set_source_rgb(lum, lum, lum)
+            ctx.rectangle(w * 0.63 + i * w * 0.04, bottom_y, w * 0.04, bottom_h)
+            ctx.fill()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -148,6 +285,7 @@ class Preview(Gtk.Picture):
                 sock = socket.socket(socket.AF_UNIX)
                 sock.settimeout(3.0)
                 sock.connect(str(self._path))
+                self._had_frame = False
                 header = self._recv_exact(sock, 8)
                 if header is None:
                     raise OSError("no header")
@@ -166,6 +304,9 @@ class Preview(Gtk.Picture):
                     sock.close()
                 except Exception:
                     pass
+            # No connection or the stream ended: say so instead of freezing
+            # on the last frame forever.
+            self.show_placeholder()
             # The engine restarts on mode switches; just keep trying.
             if self._stop.wait(1.0):
                 return
@@ -189,6 +330,7 @@ class Preview(Gtk.Picture):
                 w, h, Gdk.MemoryFormat.R8G8B8, GLib.Bytes.new(data), w * 3
             )
             self.set_paintable(texture)
+            self._showing_placeholder = False
         except Exception:
             pass
         return False
@@ -210,6 +352,10 @@ class Panel(Gtk.Box):
         # arrives those signals carry widget defaults, not camera state.
         self._ready = False
         self._refreshing = False
+        # Which controls the user touched recently: the status poller may not
+        # move those sliders for a grace period, or dragging becomes a
+        # tug-of-war against the camera's own automatics.
+        self._touched: dict = {}
 
         self.set_size_request(WIDTH, -1)
         self.append(self._header())
@@ -232,6 +378,10 @@ class Panel(Gtk.Box):
         drag.connect("drag-begin", self._on_pan_begin)
         drag.connect("drag-update", self._on_pan_update)
         self.preview.add_controller(drag)
+        right = Gtk.GestureClick()
+        right.set_button(3)
+        right.connect("released", self._on_preview_menu)
+        self.preview.add_controller(right)
         self._pan_base = (0.0, 0.0)
         body.append(self.preview)
         body.append(self._mode_row())
@@ -418,7 +568,7 @@ class Panel(Gtk.Box):
         return row
 
     def _on_zoom(self, scale: Gtk.Scale) -> None:
-        self.zoom_value.set_text(f"{scale.get_value():.1f}x")
+        self._set_value_text(self.zoom_value, f"{scale.get_value():.1f}")
         if self._suppress or not self._ready:
             return
         self._queue({"zoom": round(scale.get_value(), 2)})
@@ -464,7 +614,7 @@ class Panel(Gtk.Box):
         return row
 
     def _on_clahe(self, scale: Gtk.Scale) -> None:
-        self.clahe_value.set_text(f"{scale.get_value():.2f}")
+        self._set_value_text(self.clahe_value, f"{scale.get_value():.2f}")
         if self._suppress or not self._ready:
             return
         self._queue({"clahe": round(scale.get_value(), 2)})
@@ -574,17 +724,47 @@ class Panel(Gtk.Box):
 
         scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, step)
         scale.set_hexpand(True)
-        scale.set_draw_value(False)  # the number lives in its own label
+        scale.set_draw_value(False)  # the number lives in its own entry
         scale.set_valign(Gtk.Align.CENTER)
         if digits == 0:
             scale.set_round_digits(0)
         row.append(scale)
 
-        value = Gtk.Label(xalign=1)
-        value.add_css_class("dc-value")
-        value.set_size_request(38, -1)
+        # The value is an entry dressed as a label: exact numbers are typed,
+        # Enter commits (clamped to the slider's range).
+        value = Gtk.Entry()
+        value.add_css_class("dc-entry")
+        value.set_has_frame(False)
+        value.set_width_chars(6)
+        value.set_max_width_chars(7)
+        value.set_alignment(1.0)
+        value.set_valign(Gtk.Align.CENTER)
         row.append(value)
+
+        def commit(_widget=None):
+            text = value.get_text().strip().rstrip("x")
+            try:
+                v = float(text)
+            except ValueError:
+                value.set_text(f"{scale.get_value():.{digits}f}")
+                return
+            adj = scale.get_adjustment()
+            scale.set_value(max(adj.get_lower(), min(adj.get_upper(), v)))
+            value.set_text(f"{scale.get_value():.{digits}f}")
+            root = self.get_root()
+            if root is not None:
+                root.set_focus(None)
+
+        value.connect("activate", commit)
+        focus = Gtk.EventControllerFocus()
+        focus.connect("leave", lambda *_: commit())
+        value.add_controller(focus)
         return row, scale, value
+
+    def _set_value_text(self, entry: Gtk.Entry, text: str) -> None:
+        """Update a value box unless the user is typing in it."""
+        if not entry.has_focus():
+            entry.set_text(text)
 
     def _camera_block(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -649,6 +829,11 @@ class Panel(Gtk.Box):
             ),
             self._on_result,
         )
+
+    def _on_preview_menu(self, *_args) -> None:
+        style = self.preview.cycle_placeholder()
+        pretty = {"nofeed": "NO FEED card", "bars": "broadcast bars"}[style]
+        self.footer.set_text(f"no-feed placeholder: {pretty}")
 
     def _on_preview_tap(self, gesture, _n_press, cx: float, cy: float) -> None:
         """Tap to focus: aim autofocus and exposure metering where clicked."""
@@ -716,15 +901,16 @@ class Panel(Gtk.Box):
         )
 
     def _on_strength(self, scale: Gtk.Scale) -> None:
-        self.strength_value.set_text(f"{scale.get_value():.2f}")
+        self._set_value_text(self.strength_value, f"{scale.get_value():.2f}")
         if self._suppress or not self._ready:
             return
         self._queue({"strength": round(scale.get_value(), 2)})
 
     def _on_slider(self, scale: Gtk.Scale, key: str) -> None:
-        self.slider_values[key].set_text(f"{int(scale.get_value())}")
+        self._set_value_text(self.slider_values[key], f"{int(scale.get_value())}")
         if self._suppress or not self._ready:
             return
+        self._touched[key] = time.monotonic()
         self._queue({key: int(scale.get_value())})
 
     def _queue(self, values: dict) -> None:
@@ -887,10 +1073,15 @@ class Panel(Gtk.Box):
             self.clahe_scale.set_value(float(st.get("clahe", 0.0)))
             self.strength.set_value(float(st.get("strength", 1.0)))
             controls = st.get("controls") or {}
+            now = time.monotonic()
             for key, scale in self.sliders.items():
                 available = mode in SLIDER_MODES[key]
                 scale.set_sensitive(available)
                 self.slider_labels[key].set_opacity(1.0 if available else 0.4)
+                if now - self._touched.get(key, 0.0) < 3.0:
+                    # The user owns this control right now; the camera's
+                    # readback may not yank it out of their hand.
+                    continue
                 value = controls.get(key)
                 on_auto = value == -1
                 if key in self.auto_buttons:
@@ -907,7 +1098,7 @@ class Panel(Gtk.Box):
                     text = "auto"
                 else:
                     text = f"{int(scale.get_value())}"
-                self.slider_values[key].set_text(text)
+                self._set_value_text(self.slider_values[key], text)
         finally:
             self._suppress = False
         self._ready = True
@@ -925,6 +1116,7 @@ class Panel(Gtk.Box):
                 f"{st.get('width')}×{st.get('height')} → {st.get('output')}"
             )
         else:
+            self.preview.show_placeholder()
             message = st.get("error") or "engine not running"
             # Engine logs can be a wall; the footer is one line of truth.
             if len(message) > 160:

@@ -177,6 +177,18 @@ def css(t: Theme) -> str:
 
     .dc-warn {{ color: {red}; font-size: {small - 1.5:.1f}pt; }}
 
+    /* Value boxes: editable, but dressed as labels until focused. */
+    entry.dc-entry {{
+        background: transparent; border: none; box-shadow: none;
+        color: {fg_dim}; font-size: {small - 1.0:.1f}pt;
+        padding: 0; margin: 0; min-height: 0;
+        caret-color: {accent};
+    }}
+    entry.dc-entry:focus {{
+        color: {fg_bright};
+        border-bottom: 1px solid {accent};
+    }}
+
     /* Compact sliders: no drawn value, the number lives in its own label. */
     scale {{ min-height: 16px; padding: 0; margin: 0; }}
     scale trough {{

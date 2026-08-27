@@ -279,6 +279,17 @@ already has to 480x270 RGB and serves it on a Unix socket, publishing every
 other frame and dropping frames for a slow panel rather than stalling the
 pipeline.
 
+Every slider's number is an **editable value box**: click it, type an exact
+ISO or exposure, Enter commits (clamped to range). While you are touching a
+slider the status poller keeps its hands off it for a few seconds, so adjusting
+a control the camera is auto-driving is no longer a tug-of-war — the readback
+resumes flowing once you let go.
+
+When no frames arrive the preview shows a placeholder instead of freezing on
+the last frame: a NO FEED card, or classic broadcast colour bars.
+**Right-click the preview** to switch between them; the choice persists in
+`~/.config/decomposer/panel.json`.
+
 Focus and white balance each have an **auto** button. When a control is on
 automatic the button lights and the value reads `auto` — the daemon stores auto
 as `-1`, and clamping that onto the slider would display `0`, a real and very
