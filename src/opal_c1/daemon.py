@@ -112,6 +112,11 @@ def find_engine() -> Optional[str]:
 
 
 
+def models_file() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    return Path(base) / "decomposer" / "models.json"
+
+
 def preset_dir() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
     d = Path(base) / "decomposer" / "presets"
@@ -119,9 +124,21 @@ def preset_dir() -> Path:
     return d
 
 
-def _preset_path(name: str) -> Path:
-    """Resolve a preset name to a file. Validation lives in the pure core."""
-    return preset_dir() / f"{preset_codec.validate_name(name)}.json"
+def _preset_path(name: str, mode: str) -> Path:
+    """Resolve a preset name to a file. Validation lives in the pure core.
+
+    Presets are namespaced by mode: the two firmwares expose different
+    controls, so a Studio preset is not meaningfully loadable in Call. A
+    legacy flat-file preset (pre-namespacing) is still found for loading.
+    """
+    name = preset_codec.validate_name(name)
+    namespaced = preset_dir() / mode / f"{name}.json"
+    if namespaced.is_file():
+        return namespaced
+    legacy = preset_dir() / f"{name}.json"
+    if legacy.is_file():
+        return legacy
+    return namespaced
 
 
 @dataclass
@@ -137,6 +154,7 @@ class State:
     output: str = "/dev/video10"
     overlay: Optional[str] = None
     blur: float = 0.0
+    blur_style: int = 0
     background: Optional[str] = None
     # The user's model chain: [{"path", "device", "strength"}, ...].
     # Membership and device changes restart the engine; strengths are live.
@@ -197,6 +215,22 @@ class Daemon:
         # Segmentation choices are engine-startup facts, not live state.
         self.seg_model = seg_model
         self.seg_device = seg_device
+        # The model chain persists across daemon restarts; a saved model
+        # whose file has gone missing is flagged and bypassed, not dropped -
+        # the user's configuration outlives a moved file.
+        try:
+            saved = json.loads(models_file().read_text())
+            if isinstance(saved, list):
+                for m in saved:
+                    if isinstance(m, dict) and m.get("path"):
+                        self.state.models.append({
+                            "path": str(m["path"]),
+                            "device": m.get("device", "cpu"),
+                            "strength": max(0.0, min(1.0, float(m.get("strength", 1.0)))),
+                        })
+        except (OSError, ValueError):
+            pass
+        self._mark_missing_models()
         self._shutdown = threading.Event()
         # Set by the USB hotplug watcher; interrupts supervisor holds so a
         # replug recovers in seconds instead of riding out a blind wait.
@@ -237,6 +271,7 @@ class Daemon:
         The input node is discovered at call time: its number changes across
         re-enumerations, which is why the config is rebuilt per start attempt.
         """
+        self._mark_missing_models()
         st = self.state
         return model.EngineConfig(
             input="-" if from_stdin else (camera_video_node() or "/dev/video0"),
@@ -253,10 +288,16 @@ class Daemon:
             in_width=st.in_width, in_height=st.in_height,
             zoom=st.zoom, pan_x=st.pan_x, pan_y=st.pan_y,
             clahe=st.clahe,
-            blur=st.blur, background=st.background,
+            blur=st.blur, blur_style=st.blur_style,
+            background=st.background,
             seg_model=self.seg_model, seg_device=self.seg_device,
-            models=tuple((m["path"], m["device"]) for m in st.models),
-            model_strengths=tuple(m["strength"] for m in st.models),
+            models=tuple(
+                (m["path"], m["device"])
+                for m in st.models if not m.get("missing")
+            ),
+            model_strengths=tuple(
+                m["strength"] for m in st.models if not m.get("missing")
+            ),
             lut_dir=str(lut_dir()) if lut_dir() else None,
         )
 
@@ -306,8 +347,11 @@ class Daemon:
                 overlay_opacity=st.overlay_opacity,
                 zoom=st.zoom, pan_x=st.pan_x, pan_y=st.pan_y,
                 clahe=st.clahe,
-                blur=st.blur, background=st.background,
-                model_strengths=tuple(m["strength"] for m in st.models),
+                blur=st.blur, blur_style=st.blur_style,
+                background=st.background,
+                model_strengths=tuple(
+                    m["strength"] for m in st.models if not m.get("missing")
+                ),
             )
         with suppress(Exception):
             engine.apply_live(**live)
@@ -561,6 +605,10 @@ class Daemon:
                 with self.lock:
                     self._ledger.in_progress = False
                     self._ledger.current = Mode(self.state.mode)
+                # Presets are namespaced by mode; the list the panel shows
+                # changes with the firmware.
+                with suppress(Exception):
+                    self._refresh_presets()
                 request.done.set()
 
     def set_mode(self, mode: str) -> dict:
@@ -637,11 +685,20 @@ class Daemon:
         self._sync_engine()
         return self.status()
 
-    def set_blur(self, strength) -> dict:
+    def set_blur(self, strength=None, style=None) -> dict:
         """Background blur. Needs a mask, so the first frames after enabling
-        may pass through unblurred while segmentation warms up."""
+        may pass through unblurred while segmentation warms up.
+
+        `style`: "smooth" averages the background away; "bokeh" weights the
+        disc taps by their highlights, blooming bright points into balls."""
         with self.lock:
-            self.state.blur = max(0.0, min(1.0, float(strength)))
+            if strength is not None:
+                self.state.blur = max(0.0, min(1.0, float(strength)))
+            if style is not None:
+                names = {"smooth": 0, "bokeh": 1, 0: 0, 1: 1}
+                if style not in names:
+                    raise ValueError(f"unknown blur style {style!r}")
+                self.state.blur_style = names[style]
         self._sync_engine()
         return self.status()
 
@@ -659,6 +716,23 @@ class Daemon:
         self._sync_engine()
         return self.status()
 
+    def _mark_missing_models(self) -> None:
+        """Stamp each chain entry with whether its file exists right now.
+
+        Called at startup, on chain edits, and per engine start - never from
+        status(), which must stay IO-free."""
+        with self.lock:
+            for m in self.state.models:
+                m["missing"] = not Path(m["path"]).is_file()
+
+    def _save_models(self) -> None:
+        data = [
+            {k: m[k] for k in ("path", "device", "strength")}
+            for m in self.state.models
+        ]
+        models_file().parent.mkdir(parents=True, exist_ok=True)
+        models_file().write_text(json.dumps(data, indent=2) + "\n")
+
     def set_models(self, models) -> dict:
         """Replace the model chain. Membership and devices are session
         facts - the ONNX sessions are built at engine startup - so this
@@ -666,20 +740,22 @@ class Daemon:
         cleaned = []
         for m in models or []:
             path = Path(str(m.get("path", ""))).expanduser().resolve()
-            if not path.is_file():
-                raise FileNotFoundError(f"no such model: {path}")
             device = m.get("device") or "cpu"
             if device not in ("cpu", "cuda"):
                 raise ValueError(f"unknown device {device!r} (cpu or cuda)")
             strength = max(0.0, min(1.0, float(m.get("strength", 1.0))))
-            cleaned.append(
-                {"path": str(path), "device": device, "strength": strength}
-            )
+            # A missing file is flagged and bypassed, never an error: the
+            # entry survives so the model comes back when the file does.
+            cleaned.append({
+                "path": str(path), "device": device, "strength": strength,
+                "missing": not path.is_file(),
+            })
         with self.lock:
             if self._ledger.in_progress or not self._requests.empty():
                 raise RuntimeError("a mode transition is already in progress")
             self.state.models = cleaned
             mode = Mode(self.state.mode)
+        self._save_models()
         self.request_transition(mode, enforce_guard=False)
         return self.status()
 
@@ -753,6 +829,7 @@ class Daemon:
                 "pan_y": st.pan_y,
                 "clahe": st.clahe,
                 "blur": st.blur,
+                "blur_style": st.blur_style,
                 "background": st.background,
                 "overlay": {
                     "path": st.overlay,
@@ -762,7 +839,8 @@ class Daemon:
                 },
                 "controls": dict(self._snapshot.get("controls") or {}),
             }
-        path = _preset_path(name)
+        path = preset_dir() / st.mode / f"{preset_codec.validate_name(name)}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2) + "\n")
         self._refresh_presets()
         out = self.status()
@@ -777,9 +855,11 @@ class Daemon:
         something a preset should do to you by surprise. Controls the current
         mode cannot reach are reported rather than silently dropped.
         """
-        path = _preset_path(name)
+        path = _preset_path(name, self.state.mode)
         if not path.is_file():
-            raise FileNotFoundError(f"no preset named {name!r} in {preset_dir()}")
+            raise FileNotFoundError(
+                f"no preset named {name!r} for {self.state.mode} mode"
+            )
         # The pure codec normalizes: unknown fields dropped, out-of-range
         # values clamped, and every such repair reported rather than silent.
         data, notes = preset_codec.decode(json.loads(path.read_text()))
@@ -793,7 +873,7 @@ class Daemon:
         if data.get("clahe") is not None:
             self.set_clahe(data["clahe"])
         if data.get("blur") is not None:
-            self.set_blur(data["blur"])
+            self.set_blur(data["blur"], data.get("blur_style"))
         try:
             self.set_background(data.get("background"))
         except FileNotFoundError as e:
@@ -843,8 +923,11 @@ class Daemon:
         return out
 
     def list_presets(self) -> list[dict]:
+        """Presets for the current mode, plus legacy un-namespaced ones."""
+        mode_dir = preset_dir() / self.state.mode
+        paths = sorted(mode_dir.glob("*.json")) + sorted(preset_dir().glob("*.json"))
         found = []
-        for path in sorted(preset_dir().glob("*.json")):
+        for path in paths:
             try:
                 data = json.loads(path.read_text())
             except (OSError, ValueError):
@@ -859,7 +942,7 @@ class Daemon:
         return found
 
     def delete_preset(self, name: str) -> dict:
-        path = _preset_path(name)
+        path = _preset_path(name, self.state.mode)
         if not path.is_file():
             raise FileNotFoundError(f"no preset named {name!r}")
         path.unlink()
@@ -1188,7 +1271,8 @@ class Daemon:
                 return {"ok": True, **self.set_model_strength(
                     req.get("index"), req.get("strength"))}
             if cmd == "set_blur":
-                return {"ok": True, **self.set_blur(req.get("strength", 0.0))}
+                return {"ok": True, **self.set_blur(
+                    req.get("strength"), req.get("style"))}
             if cmd == "set_background":
                 return {"ok": True, **self.set_background(req.get("path"))}
             if cmd == "set_overlay":

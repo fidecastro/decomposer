@@ -829,7 +829,8 @@ def _print_models(models: list) -> None:
               "backs blur/background)")
         return
     for i, m in enumerate(models):
-        print(f"  [{i}] {m['path']}  {m['device']}  strength {m['strength']}")
+        gone = "  (missing - bypassed)" if m.get("missing") else ""
+        print(f"  [{i}] {m['path']}  {m['device']}  strength {m['strength']}{gone}")
 
 
 def _cmd_model(args: argparse.Namespace) -> int:
@@ -874,14 +875,17 @@ def _cmd_model(args: argparse.Namespace) -> int:
 
 
 def _cmd_blur(args: argparse.Namespace) -> int:
-    if args.strength is None:
+    if args.strength is None and args.style is None:
         resp = _client_call(cmd="status")
     else:
-        v = 0.0 if args.strength == "off" else float(args.strength)
-        resp = _client_call(cmd="set_blur", strength=v)
+        strength = None
+        if args.strength is not None:
+            strength = 0.0 if args.strength == "off" else float(args.strength)
+        resp = _client_call(cmd="set_blur", strength=strength, style=args.style)
     if not resp.get("ok"):
         return 1
-    print(f"  background blur {resp.get('blur')}")
+    style = "bokeh" if resp.get("blur_style") else "smooth"
+    print(f"  background blur {resp.get('blur')} ({style})")
     return 0
 
 
@@ -1260,6 +1264,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     bl.add_argument("strength", nargs="?", default=None, help="0.0-1.0, or 'off'")
+    bl.add_argument("--style", choices=("smooth", "bokeh"), default=None,
+                    help="smooth averages the background; bokeh blooms "
+                         "highlights into balls")
     bl.set_defaults(func=_cmd_blur)
 
     bg = sub.add_parser(

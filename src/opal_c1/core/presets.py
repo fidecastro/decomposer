@@ -88,6 +88,9 @@ def decode(raw: dict) -> Tuple[dict, list]:
     blur = _clamp(raw.get("blur"), 0.0, 1.0)
     if blur is not None:
         out["blur"] = blur
+    style = raw.get("blur_style")
+    if style in (0, 1):
+        out["blur_style"] = style
     background = raw.get("background")
     if isinstance(background, str) and background:
         out["background"] = background

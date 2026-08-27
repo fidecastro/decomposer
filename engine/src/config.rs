@@ -34,6 +34,8 @@ pub struct Config {
     pub clahe: f32,
     /// Background blur strength (0 = off, and segmentation idles).
     pub blur: f32,
+    /// 0 = smooth blur, 1 = bokeh (highlight-weighted disc).
+    pub blur_style: u32,
     /// Background replacement image; like the overlay, loading is a file
     /// decode and must not run on every uniform tweak.
     pub bg_path: Option<String>,
@@ -64,6 +66,7 @@ pub fn shared(look: u32, name: String, strength: f32, flip: u32) -> Shared {
         pan_y: 0.0,
         clahe: 0.0,
         blur: 0.0,
+        blur_style: 0,
         bg_path: None,
         bg_dirty: false,
         model_strengths: Vec::new(),
@@ -169,6 +172,14 @@ pub fn apply_line(line: &str, state: &Shared) {
         "blur" => match rest.parse::<f32>() {
             Ok(v) => {
                 s.blur = v.clamp(0.0, 1.0);
+                s.dirty = true;
+                true
+            }
+            Err(_) => false,
+        },
+        "blur-style" => match rest.parse::<u32>() {
+            Ok(v) => {
+                s.blur_style = v.min(1);
                 s.dirty = true;
                 true
             }

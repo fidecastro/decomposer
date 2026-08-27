@@ -111,6 +111,10 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     blur: f32,
 
+    /// Blur style: 0 = smooth, 1 = bokeh (highlight-weighted disc)
+    #[arg(long, default_value_t = 0)]
+    blur_style: u32,
+
     /// PNG to replace the background with (implies segmentation)
     #[arg(long)]
     background: Option<String>,
@@ -261,6 +265,7 @@ fn main() -> Result<()> {
         s.pan_y = args.pan_y.clamp(-1.0, 1.0);
         s.clahe = args.clahe.clamp(0.0, 1.0);
         s.blur = args.blur.clamp(0.0, 1.0);
+        s.blur_style = args.blur_style.min(1);
         s.bg_path = args.background.clone();
         s.bg_dirty = s.bg_path.is_some();
         // Force the first pass through the resolver so the initial --look
@@ -351,17 +356,18 @@ fn main() -> Result<()> {
                 s.dirty.then(|| {
                     s.dirty = false;
                     (s.look, s.look_name.clone(), s.strength, s.flip,
-                     s.zoom, s.pan_x, s.pan_y, s.clahe, s.blur)
+                     s.zoom, s.pan_x, s.pan_y, s.clahe, s.blur, s.blur_style)
                 })
             };
-            if let Some((look, name, strength, flip, zoom, pan_x, pan_y, clahe, blur)) =
-                pending
+            if let Some((
+                look, name, strength, flip, zoom, pan_x, pan_y, clahe, blur, blur_style,
+            )) = pending
             {
                 g.set_look(look, strength);
                 g.set_flip(flip);
                 g.set_zoom(zoom, pan_x, pan_y);
                 g.set_clahe(clahe);
-                g.set_blur(blur);
+                g.set_blur(blur, blur_style);
                 // Reloading the same LUT every strength tweak would be wasteful,
                 // so only touch it when the name actually changes.
                 if name != applied_look {

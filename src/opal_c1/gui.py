@@ -53,8 +53,17 @@ from gi.repository import Pango, PangoCairo  # noqa: E402
 
 from opal_c1 import theme as omtheme  # noqa: E402
 from opal_c1.daemon import Client, runtime_dir  # noqa: E402
+from opal_c1.core.model import Mode as _Mode, controls_for as _controls_for  # noqa: E402
 
-WIDTH = 384
+
+def model_controls_for(mode: str) -> frozenset:
+    try:
+        return _controls_for(_Mode(mode))
+    except ValueError:
+        return frozenset()
+
+WIDTH = 384          # one column: the preview pane, and the controls pane
+PANEL_W = 800        # both columns plus margins
 PREVIEW_H = 216
 
 # Composer's eight Core Image effects, then its own five. Both groups are
@@ -133,7 +142,6 @@ SLIDERS = [
     ("focus", "Focus", 0, 255, 1, (STUDIO,)),
     ("wb", "White bal.", 1000, 12000, 100, (STUDIO,)),
 ]
-SLIDER_MODES = {key: modes for key, _, _, _, _, modes in SLIDERS}
 
 
 def _worker(fn: Callable[[], dict], done: Callable[[dict], None]) -> None:
@@ -358,13 +366,28 @@ class Panel(Gtk.Box):
         # tug-of-war against the camera's own automatics.
         self._touched: dict = {}
 
-        self.set_size_request(WIDTH, -1)
+        self.set_size_request(PANEL_W, -1)
         self.append(self._header())
 
+        # Composer's shape: the camera view on the left, controls on the
+        # right. The camera-control area is a two-page stack (one page per
+        # mode, only that mode's controls on it); the stack sizes itself to
+        # the larger page, so the panel's footprint never changes with the
+        # mode.
+        main = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
+        left.set_margin_start(10)
+        left.set_margin_end(8)
+        left.set_margin_bottom(9)
+        left.set_size_request(WIDTH, -1)
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
-        body.set_margin_start(10)
+        body.set_margin_start(8)
         body.set_margin_end(10)
         body.set_margin_bottom(9)
+        body.set_size_request(WIDTH, -1)
+        # Pack from the top: leftover height stays as a quiet gap at the
+        # bottom instead of inflating every row.
+        body.set_valign(Gtk.Align.START)
 
         self.preview = Preview()
         tap = Gtk.GestureClick()
@@ -384,10 +407,12 @@ class Panel(Gtk.Box):
         right.connect("released", self._on_preview_menu)
         self.preview.add_controller(right)
         self._pan_base = (0.0, 0.0)
-        body.append(self.preview)
-        body.append(self._mode_row())
-        body.append(self._sep())
+        left.append(self.preview)
+        left.append(self._mode_row())
+        left.append(self._sep())
+        left.append(self._camera_block())
         body.append(self._look_block())
+        body.append(self._sep())
         body.append(self._overlay_row())
         body.append(self._zoom_row())
         body.append(self._clahe_row())
@@ -395,9 +420,12 @@ class Panel(Gtk.Box):
         body.append(self._background_row())
         body.append(self._models_section())
         body.append(self._preset_row())
-        body.append(self._sep())
-        body.append(self._camera_block())
-        self.append(body)
+        main.append(left)
+        vsep = Gtk.Box()
+        vsep.add_css_class("dc-vsep")
+        main.append(vsep)
+        main.append(body)
+        self.append(main)
         self.append(self._footer())
 
         self.refresh()
@@ -637,7 +665,19 @@ class Panel(Gtk.Box):
             "your own process via the engine's mask socket"
         )
         self.blur_scale.connect("value-changed", self._on_blur)
+        self.blur_label = row.get_first_child()
+        self.blur_label.set_tooltip_text("Click to switch between Blur and Bokeh")
+        toggle = Gtk.GestureClick()
+        toggle.connect("released", self._on_blur_style_toggle)
+        self.blur_label.add_controller(toggle)
         return row
+
+    def _on_blur_style_toggle(self, *_a) -> None:
+        style = "smooth" if (self.status.get("blur_style") or 0) else "bokeh"
+        _worker(
+            lambda: self.client.request(cmd="set_blur", style=style),
+            self._on_result,
+        )
 
     def _on_blur(self, scale: Gtk.Scale) -> None:
         self._set_value_text(self.blur_value, f"{scale.get_value():.2f}")
@@ -735,7 +775,13 @@ class Panel(Gtk.Box):
             name.add_css_class("dc-hint")
             name.set_ellipsize(3)  # Pango.EllipsizeMode.END
             name.set_size_request(110, -1)
-            name.set_tooltip_text(m["path"])
+            if m.get("missing"):
+                name.set_opacity(0.4)
+                name.set_tooltip_text(
+                    f"{m['path']}\nmissing \u2014 bypassed until the file returns"
+                )
+            else:
+                name.set_tooltip_text(m["path"])
             row.append(name)
 
             dev = Gtk.Button(label=m["device"])
@@ -967,13 +1013,32 @@ class Panel(Gtk.Box):
             entry.set_text(text)
 
     def _camera_block(self) -> Gtk.Widget:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self.sliders = {}
+        """Camera controls as a stack: one page per mode, each showing only
+        the controls that mode's firmware can actually drive. The stack is
+        homogeneous, so both pages occupy the larger page's space and the
+        panel never changes size with the mode."""
+        self.sliders = {}        # key -> [scale, ...] (shared keys: one per page)
         self.slider_labels = {}
         self.slider_values = {}
         self.auto_buttons = {}
 
-        for key, label, lo, hi, step, _modes in SLIDERS:
+        self.camera_stack = Gtk.Stack()
+        for page_mode in (CALL, STUDIO):
+            self.camera_stack.add_named(self._camera_page(page_mode), page_mode)
+
+        self.camera_hint = Gtk.Label(xalign=0, wrap=True)
+        self.camera_hint.add_css_class("dc-hint")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.append(self.camera_stack)
+        box.append(self.camera_hint)
+        return box
+
+    def _camera_page(self, page_mode: str) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_valign(Gtk.Align.START)
+        for key, label, lo, hi, step, modes in SLIDERS:
+            if page_mode not in modes:
+                continue
             row, scale, value = self._slider_row(label, lo, hi, step)
             scale.connect("value-changed", self._on_slider, key)
             if key in AUTO_CAPABLE:
@@ -983,27 +1048,23 @@ class Panel(Gtk.Box):
                 auto.set_tooltip_text(f"Hand {label.lower()} back to the camera")
                 auto.connect("clicked", self._on_auto, key)
                 row.append(auto)
-                self.auto_buttons[key] = auto
-            self.sliders[key] = scale
-            self.slider_values[key] = value
-            self.slider_labels[key] = row.get_first_child()
+                self.auto_buttons.setdefault(key, []).append(auto)
+            self.sliders.setdefault(key, []).append(scale)
+            self.slider_values.setdefault(key, []).append(value)
+            self.slider_labels.setdefault(key, []).append(row.get_first_child())
             box.append(row)
 
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
-        lbl = Gtk.Label(label="Effect", xalign=0)
-        lbl.add_css_class("dc-label")
-        lbl.set_size_request(64, -1)
-        row.append(lbl)
-        self.effect_drop = Gtk.DropDown.new_from_strings(EFFECTS)
-        self.effect_drop.set_hexpand(True)
-        self.effect_drop.connect("notify::selected", self._on_effect_selected)
-        row.append(self.effect_drop)
-        self.effect_label = lbl
-        box.append(row)
-
-        self.camera_hint = Gtk.Label(xalign=0, wrap=True)
-        self.camera_hint.add_css_class("dc-hint")
-        box.append(self.camera_hint)
+        if page_mode == STUDIO:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+            lbl = Gtk.Label(label="Effect", xalign=0)
+            lbl.add_css_class("dc-label")
+            lbl.set_size_request(64, -1)
+            row.append(lbl)
+            self.effect_drop = Gtk.DropDown.new_from_strings(EFFECTS)
+            self.effect_drop.set_hexpand(True)
+            self.effect_drop.connect("notify::selected", self._on_effect_selected)
+            row.append(self.effect_drop)
+            box.append(row)
         return box
 
     def _footer(self) -> Gtk.Widget:
@@ -1168,7 +1229,8 @@ class Panel(Gtk.Box):
         self._queue({"strength": round(scale.get_value(), 2)})
 
     def _on_slider(self, scale: Gtk.Scale, key: str) -> None:
-        self._set_value_text(self.slider_values[key], f"{int(scale.get_value())}")
+        for entry in self.slider_values[key]:
+            self._set_value_text(entry, f"{int(scale.get_value())}")
         if self._suppress or not self._ready:
             return
         self._touched[key] = time.monotonic()
@@ -1275,8 +1337,7 @@ class Panel(Gtk.Box):
             self.footer.add_css_class("dc-warn")
             for b in list(self.mode_buttons.values()) + list(self.look_buttons.values()):
                 b.set_sensitive(False)
-            for s in self.sliders.values():
-                s.set_sensitive(False)
+            self.camera_stack.set_sensitive(False)
             return False
         self.footer.remove_css_class("dc-warn")
         refused = resp.get("refused") or {}
@@ -1299,11 +1360,6 @@ class Panel(Gtk.Box):
         self.mode_pill.add_css_class(mode if mode in ("call", "studio") else "off")
         self.mode_hint.set_text("")
         self._update_mic_chip(studio)
-        self.effect_drop.set_sensitive(studio)
-        self.effect_label.set_opacity(1.0 if studio else 0.4)
-        self.effect_drop.set_tooltip_text(
-            None if studio else "Effects are an XLink control: Studio mode only"
-        )
 
         for axis, key in (("horizontal", "mirror_h"), ("vertical", "mirror_v")):
             b = self.mirror_buttons[axis]
@@ -1344,8 +1400,9 @@ class Panel(Gtk.Box):
         self.overlay_clear.set_sensitive(bool(overlay))
         self.overlay_opacity.set_sensitive(bool(overlay))
         models = st.get("models") or []
-        membership = [(m["path"], m["device"]) for m in models]
-        if membership != [(m["path"], m["device"]) for m in self._models_cache]:
+        def _sig(items):
+            return [(m["path"], m["device"], bool(m.get("missing"))) for m in items]
+        if _sig(models) != _sig(self._models_cache):
             self._rebuild_model_rows(models)
         self._models_cache = models
         background = st.get("background")
@@ -1369,45 +1426,55 @@ class Panel(Gtk.Box):
             self.zoom_scale.set_value(float(st.get("zoom", 1.0)))
             self.clahe_scale.set_value(float(st.get("clahe", 0.0)))
             self.blur_scale.set_value(float(st.get("blur", 0.0)))
+            self.blur_label.set_text(
+                "Bokeh" if st.get("blur_style") else "Blur"
+            )
             effect = (st.get("controls") or {}).get("effect", "off")
             if effect in EFFECTS:
                 self.effect_drop.set_selected(EFFECTS.index(effect))
             self.strength.set_value(float(st.get("strength", 1.0)))
             controls = st.get("controls") or {}
             now = time.monotonic()
-            for key, scale in self.sliders.items():
-                available = mode in SLIDER_MODES[key]
-                scale.set_sensitive(available)
-                self.slider_labels[key].set_opacity(1.0 if available else 0.4)
+            # The stack shows only the current mode's page; while the feed
+            # is down the whole page dims until it restarts.
+            self.camera_stack.set_visible_child_name(
+                mode if mode in (CALL, STUDIO) else CALL
+            )
+            feed_ok = bool(st.get("engine_alive")) and not transitioning
+            self.camera_stack.set_sensitive(feed_ok)
+            self.camera_stack.set_opacity(1.0 if feed_ok else 0.45)
+            for key, scales in self.sliders.items():
                 if now - self._touched.get(key, 0.0) < 3.0:
                     # The user owns this control right now; the camera's
                     # readback may not yank it out of their hand.
                     continue
                 value = controls.get(key)
                 on_auto = value == -1
-                if key in self.auto_buttons:
-                    self.auto_buttons[key].set_sensitive(available)
-                    # -1 means the camera is driving it. Clamping that onto the
-                    # slider would read as "focus 0", a very different setting.
-                    (self.auto_buttons[key].add_css_class if on_auto
-                     else self.auto_buttons[key].remove_css_class)("selected")
-                if value is not None and not on_auto:
-                    scale.set_value(float(value))
-                if not available:
-                    text = "-"
-                elif on_auto:
-                    text = "auto"
-                else:
-                    text = f"{int(scale.get_value())}"
-                self._set_value_text(self.slider_values[key], text)
+                # A value the current mode cannot report shows "-": drawing
+                # the slider at minimum would claim a setting of zero.
+                known = key in model_controls_for(mode)
+                for auto in self.auto_buttons.get(key, []):
+                    # -1 means the camera is driving it.
+                    (auto.add_css_class if on_auto
+                     else auto.remove_css_class)("selected")
+                for scale, entry in zip(scales, self.slider_values[key]):
+                    if value is not None and not on_auto:
+                        scale.set_value(float(value))
+                    if not known:
+                        text = "-"
+                    elif on_auto:
+                        text = "auto"
+                    else:
+                        text = f"{int(scale.get_value())}"
+                    self._set_value_text(entry, text)
         finally:
             self._suppress = False
         self._ready = True
 
         self.camera_hint.set_text(
-            "tap the preview to focus \u00b7 colour sliders need Call mode"
+            "tap the preview to focus \u00b7 scroll to zoom, drag to pan"
             if studio
-            else "focus, white balance, effects and tap-to-focus need Studio mode"
+            else "focus, white balance and effects live in Studio mode"
         )
 
         if time.monotonic() < getattr(self, "_flash_until", 0.0):
@@ -1475,14 +1542,17 @@ class App(Adw.Application):
         win = Gtk.ApplicationWindow(application=self)
         win.set_title("decomposer")
         win.add_css_class("decomposer")
-        win.set_default_size(WIDTH, -1)
+        win.set_default_size(PANEL_W, -1)
         win.set_resizable(False)
 
         if HAVE_LAYER_SHELL and LayerShell.is_supported():
             # A layer surface drops from the bar instead of being a managed
             # window the compositor will tile or centre.
             LayerShell.init_for_window(win)
-            LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+            # TOP, not OVERLAY: fullscreen surfaces (the Omarchy
+            # screensaver, a fullscreen video) render above the top layer,
+            # so they cover the panel instead of being haunted by it.
+            LayerShell.set_layer(win, LayerShell.Layer.TOP)
             LayerShell.set_anchor(win, LayerShell.Edge.TOP, True)
             LayerShell.set_anchor(win, LayerShell.Edge.RIGHT, True)
             LayerShell.set_margin(win, LayerShell.Edge.TOP, 6)

@@ -314,6 +314,21 @@ Or bypass ONNX entirely — connect to the engine's `mask.sock`, send
 process in any framework; the internal model yields while you're connected.
 See docs/background-blur.md.
 
+The panel mirrors Composer's shape: the live preview sits on the left with
+the mode switch and **only the current mode's camera controls** beneath it
+(colour controls in Call; focus, white balance and effects in Studio — the
+other mode's controls are not drawn at all, and the panel keeps one size in
+both modes). Engine-side controls — looks, overlay, zoom, clarity, blur,
+backdrop, models, presets — live on the right. While the feed is down the
+camera controls dim until it returns. **Presets are per-mode**: a Studio
+preset never shows up in Call's list. Click the **Blur** label to switch it
+to **Bokeh**, which blooms background highlights into the classic lens
+balls (a kernel change, not another model). Model-chain entries persist in
+`~/.config/decomposer/models.json`; an entry whose file has gone missing is
+shown dimmed and bypassed until the file returns. The panel also stays out
+of the way of fullscreen surfaces (screensaver included) by living on the
+layer-shell TOP layer.
+
 **Health check**: `decomposer doctor` walks the whole stack — engine,
 LUTs, model, loopback module, udev rules, USB quirk, camera presence,
 layer-shell, daemon — and says exactly which piece is missing and how to

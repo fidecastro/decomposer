@@ -155,8 +155,10 @@ class EngineConfig:
     pan_x: float = 0.0
     pan_y: float = 0.0
     clahe: float = 0.0
-    # Background effect: blur strength (0 = off) and replacement image.
+    # Background effect: blur strength (0 = off), style (0 smooth,
+    # 1 bokeh), and replacement image.
     blur: float = 0.0
+    blur_style: int = 0
     background: Optional[str] = None
     # Person segmentation: model file and device. The ONNX session is built
     # at engine startup, so changing either restarts the engine; None means
@@ -214,6 +216,8 @@ def engine_cli_args(config: EngineConfig) -> list:
         args += ["--pan-x", str(config.pan_x), "--pan-y", str(config.pan_y)]
     if config.blur > 0.0:
         args += ["--blur", str(config.blur)]
+    if config.blur_style:
+        args += ["--blur-style", str(config.blur_style)]
     if config.background:
         args += ["--background", config.background]
     if config.seg_model:
@@ -261,6 +265,8 @@ def engine_delta_lines(old: EngineConfig, new: EngineConfig) -> list:
         lines.append(f"clahe {new.clahe}")
     if new.blur != old.blur:
         lines.append(f"blur {new.blur}")
+    if new.blur_style != old.blur_style:
+        lines.append(f"blur-style {new.blur_style}")
     if new.background != old.background:
         lines.append(f"background {new.background or 'off'}")
     if len(new.model_strengths) == len(old.model_strengths):

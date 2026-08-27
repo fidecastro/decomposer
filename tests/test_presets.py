@@ -68,3 +68,10 @@ def test_blur_and_background_decode():
     assert fields["background"] == "/tmp/bg.png"
     fields, _ = decode({"blur": "junk", "background": 42})
     assert "blur" not in fields and "background" not in fields
+
+
+def test_blur_style_decode():
+    fields, _ = decode({"blur_style": 1})
+    assert fields["blur_style"] == 1
+    fields, _ = decode({"blur_style": 7})
+    assert "blur_style" not in fields

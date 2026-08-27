@@ -53,9 +53,11 @@ struct Params {
     /// Filter-layer residual size; layer_w == 0 means no filters active.
     layer_w: u32,
     layer_h: u32,
+    /// 0 = smooth blur, 1 = bokeh (highlight-weighted disc).
+    blur_style: u32,
     // WGSL rounds uniform structs up to 16 bytes; pad explicitly so the Rust
     // and shader layouts cannot silently disagree.
-    _pad: [u32; 3],
+    _pad: [u32; 2],
 }
 
 pub struct Gpu {
@@ -122,7 +124,8 @@ impl Gpu {
             clahe: 0.0, clahe_clip: 2.5,
             blur: 0.0, mask_w: 0, mask_h: 0, bg_w: 0, bg_h: 0,
             layer_w: 0, layer_h: 0,
-            _pad: [0; 3],
+            blur_style: 0,
+            _pad: [0; 2],
         };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -413,8 +416,9 @@ impl Gpu {
 
     /// Background blur strength. The heavy work only happens in the shader
     /// when both blur > 0 and a mask has actually arrived.
-    pub fn set_blur(&mut self, blur: f32) {
+    pub fn set_blur(&mut self, blur: f32, style: u32) {
         self.params.blur = blur.clamp(0.0, 1.0);
+        self.params.blur_style = style.min(1);
         self.upload_params();
     }
 

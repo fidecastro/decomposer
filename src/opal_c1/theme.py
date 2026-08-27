@@ -177,6 +177,12 @@ def css(t: Theme) -> str:
 
     .dc-warn {{ color: {red}; font-size: {small - 1.5:.1f}pt; }}
 
+    .dc-vsep {{
+        min-width: 1px;
+        background: alpha({muted}, 0.25);
+        margin-top: 4px; margin-bottom: 10px;
+    }}
+
     .dc-mic {{
         border-radius: 5px; padding: 1px 7px; font-weight: 700;
         font-size: {small - 2.0:.1f}pt;

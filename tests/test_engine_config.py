@@ -135,3 +135,11 @@ def test_model_chain_projections():
     tweaked = replace(base, model_strengths=(1.0, 0.9))
     assert not tweaked.needs_restart_from(base)
     assert engine_delta_lines(base, tweaked) == ["model-strength 1 0.9"]
+
+
+def test_blur_style_is_live():
+    base = cfg(blur=0.5)
+    styled = replace(base, blur_style=1)
+    assert not styled.needs_restart_from(base)
+    assert engine_delta_lines(base, styled) == ["blur-style 1"]
+    assert "--blur-style 1" in " ".join(engine_cli_args(styled))

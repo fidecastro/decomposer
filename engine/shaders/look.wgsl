@@ -45,9 +45,10 @@ struct Params {
     // Filter-layer residual size; layer_w == 0 means no filters active.
     layer_w: u32,
     layer_h: u32,
+    // 0 = smooth blur, 1 = bokeh (highlight-weighted disc).
+    blur_style: u32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -424,15 +425,28 @@ const TAP_DIRS = array<vec2<f32>, 12>(
 
 // Blur built from background pixels only: a tap that lands on the person is
 // weighted out, which is what stops the subject smearing into the bokeh.
+// Style 1 additionally weights taps by their highlights raised to a power -
+// the classic fake-lens trick that blooms bright points into bokeh balls
+// instead of averaging them away.
 fn blurred_bg(sc: vec2<f32>) -> vec3<f32> {
-    let radius = params.blur * f32(params.src_w) / max(params.zoom, 1.0) * 0.025;
-    var acc = source_rgb(sc.x, sc.y) * 0.15;
+    let bokeh = params.blur_style == 1u;
+    var radius = params.blur * f32(params.src_w) / max(params.zoom, 1.0) * 0.025;
+    if (bokeh) {
+        radius = radius * 1.3;
+    }
+    let center = source_rgb(sc.x, sc.y);
+    var acc = center * 0.15;
     var wsum = 0.15;
     for (var i = 0u; i < BG_TAPS; i = i + 1u) {
         let r = select(radius, radius * 0.45, (i & 1u) != 0u);
         let pos = sc + TAP_DIRS[i] * r;
-        let w = 1.0 - mask_at(pos.x, pos.y);
-        acc = acc + source_rgb(pos.x, pos.y) * w;
+        var w = 1.0 - mask_at(pos.x, pos.y);
+        let rgb = source_rgb(pos.x, pos.y);
+        if (bokeh) {
+            let lum = max(rgb.r, max(rgb.g, rgb.b));
+            w = w * (0.25 + 6.0 * lum * lum * lum * lum);
+        }
+        acc = acc + rgb * w;
         wsum = wsum + w;
     }
     return acc / wsum;
