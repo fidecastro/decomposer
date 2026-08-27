@@ -17,6 +17,7 @@ mod gpu;
 mod lut;
 mod overlay;
 mod preview;
+mod chain;
 mod seg;
 mod source;
 use source::{FrameSource, StdinSource, V4l2Source};
@@ -122,6 +123,12 @@ struct Args {
     /// Where to run segmentation: cpu or cuda (cuda falls back to cpu)
     #[arg(long, default_value = "cpu")]
     seg_device: String,
+
+    /// Extra model in the chain: path[:cpu|cuda][:strength]. Repeatable;
+    /// a one-channel output joins the person mask (strength = weight), a
+    /// three-channel output filters the image (strength = blend)
+    #[arg(long = "model", action = clap::ArgAction::Append)]
+    models: Vec<String>,
 
     /// Unix socket accepting person masks from an external producer; while
     /// a client is connected the internal model yields
@@ -256,9 +263,14 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    // Segmentation: resolved like the LUT dir - an explicit flag wins, the
-    // vendored model next to the binary is the default. A missing model is
-    // only an error if something actually needs masks.
+    // The model chain: the user's --model entries, plus the person-mask
+    // default appended last so user model indexes stay stable. The default
+    // is resolved like the LUT dir - an explicit --seg-model wins, the
+    // vendored model next to the binary otherwise.
+    let mut specs: Vec<chain::Spec> = Vec::new();
+    for arg in &args.models {
+        specs.push(chain::Spec::parse(arg)?);
+    }
     let seg_model = args.seg_model.clone().or_else(|| {
         std::env::current_exe().ok().and_then(|exe| {
             exe.ancestors()
@@ -267,20 +279,39 @@ fn main() -> Result<()> {
                 .map(|p| p.display().to_string())
         })
     });
-    let seg = match (&seg_model, engine.is_some()) {
-        (Some(path), true) => match seg::Seg::start(path, &args.seg_device) {
-            Ok(s) => Some(s),
+    let mut model_chain = if engine.is_some() {
+        match chain::Chain::start(&specs) {
+            Ok(c) => Some(c),
             Err(e) => {
-                eprintln!("seg unavailable: {e:#}");
+                eprintln!("model chain unavailable: {e:#}");
                 None
             }
-        },
-        _ => None,
+        }
+    } else {
+        None
     };
-    if let (Some(s), Some(path)) = (&seg, args.mask_sock.clone()) {
-        s.serve_mask_socket(path)?;
+    // A missing default is only an error if something actually needs masks.
+    if let Some(c) = model_chain.as_mut() {
+        if !c.has_mask_models() {
+            if let Some(path) = &seg_model {
+                let spec = chain::Spec {
+                    path: path.clone(),
+                    device: args.seg_device.clone(),
+                    strength: 1.0,
+                };
+                if let Err(e) = c.push(&spec) {
+                    eprintln!("default person model unavailable: {e:#}");
+                }
+            }
+        }
+    }
+    let external_mask: std::sync::Arc<std::sync::Mutex<Option<seg::Mask>>> =
+        Default::default();
+    if let (Some(c), Some(path)) = (&model_chain, args.mask_sock.clone()) {
+        seg::serve_mask_socket(path, external_mask.clone(), c.external.clone())?;
     }
     let mut seg_frame = 0u64;
+    let mut layer_live = false;
 
     let mut n: u64 = 0;
     loop {
@@ -386,20 +417,33 @@ fn main() -> Result<()> {
                 }
             }
         }
-        if let (Some(s), Some(g)) = (&seg, engine.as_mut()) {
-            let (want_blur, want_bg) = {
-                let st = look_state.lock().unwrap();
-                (st.blur > 0.0, st.bg_path.is_some())
+        if let (Some(c), Some(g)) = (model_chain.as_mut(), engine.as_mut()) {
+            let (want_blur, want_bg, strength_updates) = {
+                let mut st = look_state.lock().unwrap();
+                (st.blur > 0.0, st.bg_path.is_some(),
+                 std::mem::take(&mut st.model_strengths))
             };
-            s.set_wanted(want_blur || want_bg);
-            seg_frame += 1;
-            // Every other frame is plenty: masks change slower than pixels,
-            // and the EMA smooths the seams.
-            if s.wanted() && seg_frame % 2 == 0 {
-                s.submit(seg::downscale_nv12(frame, w, h, s.in_w, s.in_h));
+            for (i, v) in strength_updates {
+                c.set_strength(i, v);
             }
-            if let Some(mask) = s.take_mask() {
+            c.set_mask_wanted(want_blur || want_bg);
+            seg_frame += 1;
+            // Every other frame is plenty: model outputs change slower than
+            // pixels, and the EMA smooths the seams.
+            if c.active() && seg_frame % 2 == 0 {
+                c.submit(frame, w, h);
+            }
+            if let Some(mask) = external_mask.lock().unwrap().take() {
                 g.set_mask(&mask.data, mask.width, mask.height);
+            } else if let Some(mask) = c.take_mask() {
+                g.set_mask(&mask.data, mask.width, mask.height);
+            }
+            if let Some((layer, lw, lh)) = c.take_layer(frame, w, h) {
+                g.set_layer(&layer, lw, lh);
+                layer_live = true;
+            } else if layer_live && !c.filters_active() {
+                g.set_layer(&[], 0, 0);
+                layer_live = false;
             }
         }
         let out = match engine.as_mut() {

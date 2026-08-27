@@ -50,9 +50,12 @@ struct Params {
     /// Background image size; bg_w == 0 means blur, not replace.
     bg_w: u32,
     bg_h: u32,
+    /// Filter-layer residual size; layer_w == 0 means no filters active.
+    layer_w: u32,
+    layer_h: u32,
     // WGSL rounds uniform structs up to 16 bytes; pad explicitly so the Rust
     // and shader layouts cannot silently disagree.
-    _pad: [u32; 1],
+    _pad: [u32; 3],
 }
 
 pub struct Gpu {
@@ -72,6 +75,7 @@ pub struct Gpu {
     clahe_lut: wgpu::Buffer,
     mask_buf: wgpu::Buffer,
     bg_buf: wgpu::Buffer,
+    layer_buf: wgpu::Buffer,
     staging: wgpu::Buffer,
     params: Params,
     size: u64,
@@ -99,6 +103,10 @@ impl Gpu {
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("decomposer"),
+                // The default limits are the WebGPU browser baseline (8
+                // storage buffers per stage); we bind 9. This is a native
+                // app: ask for what the hardware actually has.
+                required_limits: adapter.limits(),
                 ..Default::default()
             }))
             .map_err(|e| anyhow!("could not create GPU device: {e}"))?;
@@ -113,7 +121,8 @@ impl Gpu {
             zoom: 1.0, pan_x: 0.0, pan_y: 0.0,
             clahe: 0.0, clahe_clip: 2.5,
             blur: 0.0, mask_w: 0, mask_h: 0, bg_w: 0, bg_h: 0,
-            _pad: [0; 1],
+            layer_w: 0, layer_h: 0,
+            _pad: [0; 3],
         };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -158,6 +167,11 @@ impl Gpu {
         });
         let bg_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("background"),
+            contents: bytemuck::cast_slice(&[0u32]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let layer_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("filter-layer"),
             contents: bytemuck::cast_slice(&[0u32]),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
@@ -248,12 +262,18 @@ impl Gpu {
                     ty: storage(true),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: storage(true),
+                    count: None,
+                },
             ],
         });
 
         let bind_group = make_bind_group(
             &device, &layout, &params_buf, &src_buf, &dst_buf, &overlay_buf,
-            &lut_buf, &clahe_hist, &clahe_lut, &mask_buf, &bg_buf,
+            &lut_buf, &clahe_hist, &clahe_lut, &mask_buf, &bg_buf, &layer_buf,
         );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -279,7 +299,7 @@ impl Gpu {
             device, queue, pipeline, hist_pipeline, cdf_pipeline,
             bind_group, layout, params_buf, src_buf, dst_buf,
             overlay_buf, lut_buf, clahe_hist, clahe_lut,
-            mask_buf, bg_buf,
+            mask_buf, bg_buf, layer_buf,
             staging, params, size, src_size,
             out: vec![0u8; size as usize], adapter_name,
         })
@@ -311,7 +331,7 @@ impl Gpu {
                         &self.device, &self.layout, &self.params_buf,
                         &self.src_buf, &self.dst_buf, &self.overlay_buf,
                         &self.lut_buf, &self.clahe_hist, &self.clahe_lut,
-                        &self.mask_buf, &self.bg_buf,
+                        &self.mask_buf, &self.bg_buf, &self.layer_buf,
                     );
                 }
                 self.queue.write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(&l.data));
@@ -354,7 +374,7 @@ impl Gpu {
                         &self.device, &self.layout, &self.params_buf,
                         &self.src_buf, &self.dst_buf, &self.overlay_buf,
                         &self.lut_buf, &self.clahe_hist, &self.clahe_lut,
-                        &self.mask_buf, &self.bg_buf,
+                        &self.mask_buf, &self.bg_buf, &self.layer_buf,
                     );
                 }
                 self.queue.write_buffer(
@@ -451,12 +471,39 @@ impl Gpu {
         self.upload_params();
     }
 
+    /// Install a filter-layer residual (RGB u8, biased at 128, source
+    /// space), or clear it with an empty slice.
+    pub fn set_layer(&mut self, layer: &[u8], w: u32, h: u32) {
+        if layer.is_empty() {
+            self.params.layer_w = 0;
+            self.params.layer_h = 0;
+            self.upload_params();
+            return;
+        }
+        let needed = (layer.len().div_ceil(4) * 4) as u64;
+        if self.layer_buf.size() < needed {
+            self.layer_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("filter-layer"),
+                size: needed,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.rebind();
+        }
+        let mut padded = layer.to_vec();
+        padded.resize(needed as usize, 0);
+        self.queue.write_buffer(&self.layer_buf, 0, &padded);
+        self.params.layer_w = w;
+        self.params.layer_h = h;
+        self.upload_params();
+    }
+
     fn rebind(&mut self) {
         self.bind_group = make_bind_group(
             &self.device, &self.layout, &self.params_buf,
             &self.src_buf, &self.dst_buf, &self.overlay_buf,
             &self.lut_buf, &self.clahe_hist, &self.clahe_lut,
-            &self.mask_buf, &self.bg_buf,
+            &self.mask_buf, &self.bg_buf, &self.layer_buf,
         );
     }
 
@@ -530,6 +577,7 @@ fn make_bind_group(
     clahe_lut: &wgpu::Buffer,
     mask: &wgpu::Buffer,
     bg: &wgpu::Buffer,
+    layer: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("look-bind"),
@@ -544,6 +592,7 @@ fn make_bind_group(
             wgpu::BindGroupEntry { binding: 6, resource: clahe_lut.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 7, resource: mask.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 8, resource: bg.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 9, resource: layer.as_entire_binding() },
         ],
     })
 }

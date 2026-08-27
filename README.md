@@ -297,6 +297,15 @@ GPU; `decomposer background ~/beach.png` composites an image behind you
 instead. Both live in the panel as a Blur slider and a Backdrop chooser,
 and both work identically in Call and Studio mode.
 
+**The model chain**: run the feed through any ONNX models of your own —
+`decomposer model add style.onnx --device cuda`, then
+`decomposer model strength 0 0.5` (live, no restart). A model with a
+one-channel output joins the person mask (strength = its weight); a
+three-channel output recolors the frame (strength = blend), applied as a
+detail-preserving residual so a low-resolution model never softens the
+image. The panel's Models section gives each entry a strength slider, a
+cpu/cuda toggle, and a remove button.
+
 The mask is a port, not a feature: bring your own model with
 `decomposer daemon --seg-model your.onnx` (any image-in/mask-out ONNX;
 shapes are autodetected) and pick where it runs with `--seg-device cpu|cuda`.

@@ -393,6 +393,7 @@ class Panel(Gtk.Box):
         body.append(self._clahe_row())
         body.append(self._blur_row())
         body.append(self._background_row())
+        body.append(self._models_section())
         body.append(self._preset_row())
         body.append(self._sep())
         body.append(self._camera_block())
@@ -698,6 +699,125 @@ class Panel(Gtk.Box):
             lambda: self.client.request(cmd="set_background", path=None),
             self._on_result,
         )
+
+    def _models_section(self) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        lbl = Gtk.Label(label="Models", xalign=0)
+        lbl.add_css_class("dc-label")
+        lbl.set_size_request(64, -1)
+        lbl.set_tooltip_text(
+            "Your own ONNX models over the feed. One-channel output = joins "
+            "the person mask; three-channel output = recolors the frame. "
+            "Strength is live; add/remove/device restarts the engine"
+        )
+        head.append(lbl)
+        add = Gtk.Button(label="add model…")
+        add.add_css_class("dc-chip")
+        add.set_hexpand(True)
+        add.connect("clicked", self._on_model_add)
+        head.append(add)
+        box.append(head)
+        self.models_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        box.append(self.models_box)
+        self._models_cache: list = []
+        return box
+
+    def _rebuild_model_rows(self, models: list) -> None:
+        child = self.models_box.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.models_box.remove(child)
+            child = nxt
+        for i, m in enumerate(models):
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+            name = Gtk.Label(label=Path(m["path"]).name, xalign=0)
+            name.add_css_class("dc-hint")
+            name.set_ellipsize(3)  # Pango.EllipsizeMode.END
+            name.set_size_request(110, -1)
+            name.set_tooltip_text(m["path"])
+            row.append(name)
+
+            dev = Gtk.Button(label=m["device"])
+            dev.add_css_class("dc-tiny")
+            dev.set_valign(Gtk.Align.CENTER)
+            dev.set_tooltip_text("Toggle cpu/cuda (restarts the engine)")
+            dev.connect("clicked", self._on_model_device, i)
+            row.append(dev)
+
+            scale = Gtk.Scale.new_with_range(
+                Gtk.Orientation.HORIZONTAL, 0.0, 1.0, 0.05
+            )
+            scale.set_draw_value(False)
+            scale.set_hexpand(True)
+            scale.set_valign(Gtk.Align.CENTER)
+            scale.set_value(float(m["strength"]))
+            scale.set_tooltip_text("Strength (live)")
+            scale.connect("value-changed", self._on_model_strength, i)
+            row.append(scale)
+
+            rm = Gtk.Button(label="×")
+            rm.add_css_class("dc-tiny")
+            rm.set_valign(Gtk.Align.CENTER)
+            rm.set_tooltip_text("Remove from the chain (restarts the engine)")
+            rm.connect("clicked", self._on_model_rm, i)
+            row.append(rm)
+            self.models_box.append(row)
+
+    def _on_model_add(self, _btn) -> None:
+        dialog = Gtk.FileDialog()
+        dialog.set_title("Choose an ONNX model")
+        onnx = Gtk.FileFilter()
+        onnx.set_name("ONNX models")
+        onnx.add_pattern("*.onnx")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(onnx)
+        dialog.set_filters(filters)
+        # No transient parent - see _on_overlay_choose.
+        dialog.open(None, None, self._on_model_chosen)
+
+    def _on_model_chosen(self, dialog, result) -> None:
+        try:
+            path = dialog.open_finish(result).get_path()
+        except Exception:
+            return  # cancelled
+        if not path:
+            return
+        models = list(self._models_cache) + [
+            {"path": path, "device": "cpu", "strength": 1.0}
+        ]
+        self._set_busy(True, "adding model… the engine restarts")
+        _worker(
+            lambda: self.client.request(cmd="set_models", models=models),
+            self._on_result,
+        )
+
+    def _on_model_rm(self, _btn, index: int) -> None:
+        models = [m for i, m in enumerate(self._models_cache) if i != index]
+        self._set_busy(True, "removing model… the engine restarts")
+        _worker(
+            lambda: self.client.request(cmd="set_models", models=models),
+            self._on_result,
+        )
+
+    def _on_model_device(self, _btn, index: int) -> None:
+        models = [dict(m) for m in self._models_cache]
+        if not 0 <= index < len(models):
+            return
+        models[index]["device"] = (
+            "cuda" if models[index]["device"] == "cpu" else "cpu"
+        )
+        self._set_busy(True, "switching device… the engine restarts")
+        _worker(
+            lambda: self.client.request(cmd="set_models", models=models),
+            self._on_result,
+        )
+
+    def _on_model_strength(self, scale: Gtk.Scale, index: int) -> None:
+        if self._suppress or not self._ready:
+            return
+        value = round(scale.get_value(), 2)
+        self._queue({f"model_strength_{index}": value})
 
     def _preset_row(self) -> Gtk.Widget:
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
@@ -1065,6 +1185,15 @@ class Panel(Gtk.Box):
         pending, self._pending = self._pending, {}
         if not pending:
             return False
+        for key in [k for k in pending if k.startswith("model_strength_")]:
+            index = int(key.rsplit("_", 1)[1])
+            value = pending.pop(key)
+            _worker(
+                lambda i=index, v=value: self.client.request(
+                    cmd="set_model_strength", index=i, strength=v
+                ),
+                self._on_result,
+            )
         blur = pending.pop("blur", None)
         if blur is not None:
             _worker(
@@ -1204,6 +1333,11 @@ class Panel(Gtk.Box):
         self.overlay_button.set_tooltip_text(overlay or "No overlay")
         self.overlay_clear.set_sensitive(bool(overlay))
         self.overlay_opacity.set_sensitive(bool(overlay))
+        models = st.get("models") or []
+        membership = [(m["path"], m["device"]) for m in models]
+        if membership != [(m["path"], m["device"]) for m in self._models_cache]:
+            self._rebuild_model_rows(models)
+        self._models_cache = models
         background = st.get("background")
         self.background_button.set_label(
             Path(background).name if background else "choose\u2026"

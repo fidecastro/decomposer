@@ -122,3 +122,16 @@ def test_cli_args_carry_seg_and_blur():
     assert "--seg-device cuda" in text
     clean = " ".join(engine_cli_args(cfg()))
     assert "--blur" not in clean and "--seg-" not in clean
+
+
+def test_model_chain_projections():
+    base = cfg(models=(("/m/a.onnx", "cpu"), ("/m/b.onnx", "cuda")),
+               model_strengths=(1.0, 0.5))
+    text = " ".join(engine_cli_args(base))
+    assert "--model /m/a.onnx:cpu:1.0" in text
+    assert "--model /m/b.onnx:cuda:0.5" in text
+    # Membership changes restart; strength changes are live lines.
+    assert cfg(models=(("/m/a.onnx", "cpu"),)).needs_restart_from(cfg())
+    tweaked = replace(base, model_strengths=(1.0, 0.9))
+    assert not tweaked.needs_restart_from(base)
+    assert engine_delta_lines(base, tweaked) == ["model-strength 1 0.9"]

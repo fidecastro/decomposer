@@ -42,7 +42,12 @@ struct Params {
     mask_h: u32,
     bg_w: u32,
     bg_h: u32,
+    // Filter-layer residual size; layer_w == 0 means no filters active.
+    layer_w: u32,
+    layer_h: u32,
     _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -63,6 +68,10 @@ struct Params {
 @group(0) @binding(7) var<storage, read> seg_mask: array<u32>;
 // Replacement background, RGBA8 one pixel per u32, pre-scaled to the output.
 @group(0) @binding(8) var<storage, read> bg_img: array<u32>;
+// Filter-model residual: RGB u8 packed four to a word, biased at 128, in
+// source space. 128 + (filtered - original)/2, applied additively so a
+// low-resolution model recolors the frame without softening it.
+@group(0) @binding(9) var<storage, read> filter_layer: array<u32>;
 
 const CLAHE_TX: u32 = 8u;
 const CLAHE_TY: u32 = 8u;
@@ -438,6 +447,40 @@ fn bg_pixel(px: u32, py: u32) -> vec3<f32> {
     ) / 255.0;
 }
 
+fn layer_byte(idx: u32) -> f32 {
+    return f32((filter_layer[idx >> 2u] >> ((idx & 3u) * 8u)) & 0xffu);
+}
+
+// Bilinear residual sample at a source-space position.
+fn layer_residual(sx: f32, sy: f32) -> vec3<f32> {
+    let lw = f32(params.layer_w);
+    let lh = f32(params.layer_h);
+    let fx = clamp(sx / f32(params.src_w), 0.0, 1.0) * lw - 0.5;
+    let fy = clamp(sy / f32(params.src_h), 0.0, 1.0) * lh - 0.5;
+    let x0i = i32(floor(fx));
+    let y0i = i32(floor(fy));
+    let tx = fract(fx);
+    let ty = fract(fy);
+    let x0 = u32(clamp(x0i, 0, i32(params.layer_w) - 1));
+    let x1 = u32(clamp(x0i + 1, 0, i32(params.layer_w) - 1));
+    let y0 = u32(clamp(y0i, 0, i32(params.layer_h) - 1));
+    let y1 = u32(clamp(y0i + 1, 0, i32(params.layer_h) - 1));
+    var acc = vec3<f32>(0.0);
+    let w00 = (1.0 - tx) * (1.0 - ty);
+    let w10 = tx * (1.0 - ty);
+    let w01 = (1.0 - tx) * ty;
+    let w11 = tx * ty;
+    for (var c = 0u; c < 3u; c = c + 1u) {
+        acc[c] =
+            layer_byte((y0 * params.layer_w + x0) * 3u + c) * w00 +
+            layer_byte((y0 * params.layer_w + x1) * 3u + c) * w10 +
+            layer_byte((y1 * params.layer_w + x0) * 3u + c) * w01 +
+            layer_byte((y1 * params.layer_w + x1) * 3u + c) * w11;
+    }
+    // Decode the bias: residual in [-1, 1].
+    return (acc / 255.0 - 0.501960784) * 2.0;
+}
+
 fn graded(px: u32, py: u32) -> vec3<f32> {
     let sc = source_coord(px, py);
     let y = clahe_remap(px, py, sample_y(sc.x, sc.y));
@@ -452,6 +495,9 @@ fn graded(px: u32, py: u32) -> vec3<f32> {
             bg = blurred_bg(sc);
         }
         rgb = mix(bg, rgb, m);
+    }
+    if (params.layer_w != 0u) {
+        rgb = clamp(rgb + layer_residual(sc.x, sc.y), vec3<f32>(0.0), vec3<f32>(1.0));
     }
     rgb = apply_look(rgb);
     return composite(px, py, rgb);

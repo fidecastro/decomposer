@@ -75,6 +75,21 @@ The model is user-replaceable at three levels:
    external client is connected, the internal runner yields. This is the
    port; the ort runner is just the default adapter driving it.
 
+## The model chain
+
+Generalized 2026-08-27: `--model path[:cpu|cuda][:strength]`, repeatable.
+Contracts are read from the model itself — one output channel makes a MASK
+model (weighted-max union into the person mask), three make a FILTER model
+(blended at strength, composited in chain order). Filters reach the GPU as
+a biased residual (128 + (filtered − original)/2, source space), so a
+512×288 model recolors a 4K frame at full sharpness; structural edits are
+out of scope for low-res models by nature. Strengths are live protocol
+lines (`model-strength <i> <v>`); membership and device changes rebuild
+ONNX sessions and so restart the engine. The bundled MediaPipe model is
+appended after user models when no user mask model exists, keeping user
+indexes stable. Verified live: sepia 1×1-conv filter + person mask + blur
+simultaneously at 279 fps offline, and on the running camera.
+
 ## Open questions
 
 - Blur look: plain Gaussian first; a disc kernel ("bokeh") later if the

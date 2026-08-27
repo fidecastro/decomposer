@@ -163,12 +163,17 @@ class EngineConfig:
     # the engine's own default (the vendored MediaPipe model, on cpu).
     seg_model: Optional[str] = None
     seg_device: Optional[str] = None
+    # The user's model chain: ((path, device), ...) plus one strength per
+    # entry. Membership and devices are session facts (restart); strengths
+    # are live protocol lines.
+    models: tuple = ()
+    model_strengths: tuple = ()
 
     # Fields whose change cannot be applied over the control socket: the
     # engine has to be restarted for them. Everything else is a live update.
     RESTART_FIELDS = (
         "input", "output", "width", "height", "in_width", "in_height",
-        "lut_dir", "seg_model", "seg_device",
+        "lut_dir", "seg_model", "seg_device", "models",
     )
 
     def needs_restart_from(self, other: "EngineConfig") -> bool:
@@ -215,6 +220,12 @@ def engine_cli_args(config: EngineConfig) -> list:
         args += ["--seg-model", config.seg_model]
     if config.seg_device:
         args += ["--seg-device", config.seg_device]
+    for i, (path, device) in enumerate(config.models):
+        strength = (
+            config.model_strengths[i]
+            if i < len(config.model_strengths) else 1.0
+        )
+        args += ["--model", f"{path}:{device}:{strength}"]
     if config.lut_dir:
         args += ["--lut-dir", config.lut_dir]
     if config.overlay:
@@ -252,6 +263,10 @@ def engine_delta_lines(old: EngineConfig, new: EngineConfig) -> list:
         lines.append(f"blur {new.blur}")
     if new.background != old.background:
         lines.append(f"background {new.background or 'off'}")
+    if len(new.model_strengths) == len(old.model_strengths):
+        for i, (a, b) in enumerate(zip(old.model_strengths, new.model_strengths)):
+            if a != b:
+                lines.append(f"model-strength {i} {b}")
     return lines
 
 

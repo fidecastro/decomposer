@@ -136,6 +136,9 @@ class State:
     overlay: Optional[str] = None
     blur: float = 0.0
     background: Optional[str] = None
+    # The user's model chain: [{"path", "device", "strength"}, ...].
+    # Membership and device changes restart the engine; strengths are live.
+    models: list = field(default_factory=list)
     overlay_x: int = 0
     overlay_y: int = 0
     overlay_w: int = 0
@@ -250,6 +253,8 @@ class Daemon:
             clahe=st.clahe,
             blur=st.blur, background=st.background,
             seg_model=self.seg_model, seg_device=self.seg_device,
+            models=tuple((m["path"], m["device"]) for m in st.models),
+            model_strengths=tuple(m["strength"] for m in st.models),
             lut_dir=str(lut_dir()) if lut_dir() else None,
         )
 
@@ -300,6 +305,7 @@ class Daemon:
                 zoom=st.zoom, pan_x=st.pan_x, pan_y=st.pan_y,
                 clahe=st.clahe,
                 blur=st.blur, background=st.background,
+                model_strengths=tuple(m["strength"] for m in st.models),
             )
         with suppress(Exception):
             engine.apply_live(**live)
@@ -648,6 +654,41 @@ class Daemon:
                 if not resolved.is_file():
                     raise FileNotFoundError(f"no such background image: {resolved}")
                 self.state.background = str(resolved)
+        self._sync_engine()
+        return self.status()
+
+    def set_models(self, models) -> dict:
+        """Replace the model chain. Membership and devices are session
+        facts - the ONNX sessions are built at engine startup - so this
+        re-enters the current mode, like a resolution change."""
+        cleaned = []
+        for m in models or []:
+            path = Path(str(m.get("path", ""))).expanduser().resolve()
+            if not path.is_file():
+                raise FileNotFoundError(f"no such model: {path}")
+            device = m.get("device") or "cpu"
+            if device not in ("cpu", "cuda"):
+                raise ValueError(f"unknown device {device!r} (cpu or cuda)")
+            strength = max(0.0, min(1.0, float(m.get("strength", 1.0))))
+            cleaned.append(
+                {"path": str(path), "device": device, "strength": strength}
+            )
+        with self.lock:
+            if self._ledger.in_progress or not self._requests.empty():
+                raise RuntimeError("a mode transition is already in progress")
+            self.state.models = cleaned
+            mode = Mode(self.state.mode)
+        self.request_transition(mode, enforce_guard=False)
+        return self.status()
+
+    def set_model_strength(self, index, strength) -> dict:
+        """Live per-model strength: a protocol line, never a restart."""
+        with self.lock:
+            models = self.state.models
+            i = int(index)
+            if not 0 <= i < len(models):
+                raise IndexError(f"no model at index {i}")
+            models[i]["strength"] = max(0.0, min(1.0, float(strength)))
         self._sync_engine()
         return self.status()
 
@@ -1126,6 +1167,11 @@ class Daemon:
                 return {"ok": True, "presets": self.list_presets()}
             if cmd == "preset_delete":
                 return {"ok": True, **self.delete_preset(req["name"])}
+            if cmd == "set_models":
+                return {"ok": True, **self.set_models(req.get("models"))}
+            if cmd == "set_model_strength":
+                return {"ok": True, **self.set_model_strength(
+                    req.get("index"), req.get("strength"))}
             if cmd == "set_blur":
                 return {"ok": True, **self.set_blur(req.get("strength", 0.0))}
             if cmd == "set_background":

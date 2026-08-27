@@ -38,6 +38,9 @@ pub struct Config {
     /// decode and must not run on every uniform tweak.
     pub bg_path: Option<String>,
     pub bg_dirty: bool,
+    /// Per-model strengths for the model chain, sparse updates: (index,
+    /// value) pairs drained by the render loop each frame.
+    pub model_strengths: Vec<(usize, f32)>,
 }
 
 pub type Shared = Arc<Mutex<Config>>;
@@ -63,6 +66,7 @@ pub fn shared(look: u32, name: String, strength: f32, flip: u32) -> Shared {
         blur: 0.0,
         bg_path: None,
         bg_dirty: false,
+        model_strengths: Vec::new(),
     }))
 }
 
@@ -170,6 +174,22 @@ pub fn apply_line(line: &str, state: &Shared) {
             }
             Err(_) => false,
         },
+        "model-strength" => {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            match (
+                parts.first().and_then(|v| v.parse::<usize>().ok()),
+                parts.get(1).and_then(|v| v.parse::<f32>().ok()),
+            ) {
+                (Some(i), Some(v)) if parts.len() == 2 => {
+                    s.model_strengths.push((i, v.clamp(0.0, 1.0)));
+                    true
+                }
+                _ => {
+                    eprintln!("model-strength needs: <index> <0.0-1.0>");
+                    false
+                }
+            }
+        }
         "background" => {
             s.bg_path = if rest == "off" { None } else { Some(rest.to_string()) };
             s.bg_dirty = true;

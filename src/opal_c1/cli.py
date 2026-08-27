@@ -702,6 +702,56 @@ def _cmd_resolution(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_models(models: list) -> None:
+    if not models:
+        print("  (no models in the chain; the bundled person model still "
+              "backs blur/background)")
+        return
+    for i, m in enumerate(models):
+        print(f"  [{i}] {m['path']}  {m['device']}  strength {m['strength']}")
+
+
+def _cmd_model(args: argparse.Namespace) -> int:
+    if args.action == "list" or args.action is None:
+        resp = _client_call(cmd="status")
+        if not resp.get("ok"):
+            return 1
+        _print_models(resp.get("models") or [])
+        return 0
+    if args.action == "strength":
+        resp = _client_call(
+            cmd="set_model_strength",
+            index=int(args.arg), strength=float(args.value),
+        )
+        if not resp.get("ok"):
+            return 1
+        _print_models(resp.get("models") or [])
+        return 0
+    # add / rm rewrite the whole chain (engine restart).
+    status = _client_call(cmd="status")
+    if not status.get("ok"):
+        return 1
+    models = list(status.get("models") or [])
+    if args.action == "add":
+        models.append({
+            "path": args.arg,
+            "device": args.device,
+            "strength": args.value if args.value is not None else 1.0,
+        })
+    elif args.action == "rm":
+        i = int(args.arg)
+        if not 0 <= i < len(models):
+            print(f"no model at index {i}")
+            return 1
+        models.pop(i)
+    resp = _client_call(cmd="set_models", models=models)
+    if not resp.get("ok"):
+        return 1
+    print("  chain updated; the engine restarts")
+    _print_models(resp.get("models") or [])
+    return 0
+
+
 def _cmd_blur(args: argparse.Namespace) -> int:
     if args.strength is None:
         resp = _client_call(cmd="status")
@@ -1044,6 +1094,27 @@ def build_parser() -> argparse.ArgumentParser:
     rs.add_argument("--capture-4k", action="store_true",
                     help="Capture 4K while publishing smaller: lossless zoom to 2x")
     rs.set_defaults(func=_cmd_resolution)
+
+    md = sub.add_parser(
+        "model",
+        help="The ONNX model chain over the feed",
+        description=(
+            "Run the feed through your own models. A one-channel output "
+            "joins the person mask (strength = weight); a three-channel "
+            "output recolors the frame (strength = blend), applied as a "
+            "detail-preserving residual. Strength changes are live; adding, "
+            "removing, or changing device restarts the engine."
+        ),
+    )
+    md.add_argument("action", nargs="?", default=None,
+                    choices=("list", "add", "rm", "strength"))
+    md.add_argument("arg", nargs="?", default=None,
+                    help="add: model path; rm/strength: index")
+    md.add_argument("value", nargs="?", type=float, default=None,
+                    help="Strength, 0.0 to 1.0")
+    md.add_argument("--device", choices=("cpu", "cuda"), default="cpu",
+                    help="Where the model runs (add only)")
+    md.set_defaults(func=_cmd_model)
 
     bl = sub.add_parser(
         "blur",
