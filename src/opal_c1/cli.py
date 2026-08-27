@@ -671,14 +671,24 @@ def _cmd_zoom(args: argparse.Namespace) -> int:
     return 0
 
 
-RESOLUTIONS = {
-    "720p": (1280, 720),
-    "1080p": (1920, 1080),
-    "1440p": (2560, 1440),
-    "4k": (3840, 2160),
-    "12mp": (4000, 3000),    # Studio only: the 4:3 sensor config
-    "32mp": (5312, 6000),    # Studio only: near-full-res, fps <= 10
-}
+def _resolutions() -> dict:
+    """Short names for every geometry the core knows. Derived, not copied:
+    a hand-maintained duplicate of the core's resolution facts went stale
+    the first time those facts changed (it kept offering a mode the camera
+    cannot deliver)."""
+    from opal_c1.core.model import RESOLUTIONS_STUDIO
+
+    out = {}
+    for label, w, h, _iw, _ih in RESOLUTIONS_STUDIO:
+        short = label.lower().split()[0].replace("k", "k")
+        if "\u00b7" in label or "·" in label:
+            continue  # the 4K-capture variant has its own flag
+        out[short] = (w, h)
+    out["12mp"] = out.pop("12", (4000, 3000))
+    return out
+
+
+RESOLUTIONS = _resolutions()
 
 
 def _cmd_resolution(args: argparse.Namespace) -> int:

@@ -157,6 +157,13 @@ class OpalDevice:
         self._queue = out.createOutputQueue(maxSize=4, blocking=False)
         self._control = cam.inputControl.createInputQueue()
         self._pipeline.start()
+        # Anti-banding from the first frame: at rates that do not divide the
+        # mains frequency (42 fps under 50 Hz light, say), rolling exposure
+        # bands appear as wave-like undulations. AUTO lets the ISP pick the
+        # local mains and quantize exposure to its half-period.
+        ctrl = dai.CameraControl()
+        ctrl.setAntiBandingMode(dai.CameraControl.AntiBandingMode.AUTO)
+        self._control.send(ctrl)
         return self
 
     def close(self) -> None:

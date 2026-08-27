@@ -177,6 +177,12 @@ def css(t: Theme) -> str:
 
     .dc-warn {{ color: {red}; font-size: {small - 1.5:.1f}pt; }}
 
+    /* Click and type affordances: the discrete mouseover. */
+    .dc-clickable:hover {{ color: {accent}; }}
+    entry.dc-entry:hover {{
+        border-bottom: 1px solid alpha({accent}, 0.55);
+    }}
+
     .dc-vsep {{
         min-width: 1px;
         background: alpha({muted}, 0.25);

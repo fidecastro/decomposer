@@ -52,7 +52,14 @@ def test_daemon_touches_hardware_only_through_backends():
 def test_engine_protocol_is_composed_in_one_place():
     # The literal protocol verbs may appear only where they are defined
     # (core/model.py) — anywhere else is the argv/socket drift coming back.
-    pattern = re.compile(r'f?"(look|strength|flip|overlay-rect|overlay-opacity) ')
+    # Every verb the protocol knows. A new verb must be added here when it
+    # is added to core/model.py, or this guard cannot see its drift. The
+    # brace requirement is what separates composing a protocol line
+    # (f"blur {v}") from merely mentioning a word in prose or help text.
+    pattern = re.compile(
+        r'f?"(look|strength|flip|overlay-rect|overlay-opacity|overlay'
+        r'|zoom|pan|clahe|blur|blur-style|background|model-strength) \{'
+    )
     offenders = []
     for path in SRC.rglob("*.py"):
         if path.relative_to(SRC).as_posix() == "core/model.py":
@@ -71,3 +78,15 @@ def test_gui_and_cli_speak_only_to_the_daemon():
             assert not module.startswith("opal_c1.adapters"), (
                 f"{name} imports {module}: the panel talks to the daemon only"
             )
+
+
+def test_cli_resolution_names_derive_from_core():
+    # The CLI's short names must be a projection of the core's resolution
+    # facts, never a second copy: the copy once kept offering a geometry
+    # the camera cannot deliver.
+    from opal_c1.cli import RESOLUTIONS
+    from opal_c1.core.model import RESOLUTIONS_STUDIO
+
+    core_sizes = {(r[1], r[2]) for r in RESOLUTIONS_STUDIO}
+    assert set(RESOLUTIONS.values()) <= core_sizes
+    assert (5312, 6000) not in RESOLUTIONS.values()

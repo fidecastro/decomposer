@@ -164,7 +164,11 @@ class Preview(Gtk.Picture):
 
     def __init__(self):
         super().__init__()
-        self.set_content_fit(Gtk.ContentFit.COVER)
+        # CONTAIN, not COVER: the stream's aspect follows the published
+        # resolution (4:3 at 12 MP), and the honest rendering letterboxes
+        # rather than crops or stretches.
+        self.set_content_fit(Gtk.ContentFit.CONTAIN)
+        self.stream_w, self.stream_h = 480, 270
         self.set_size_request(WIDTH - 20, PREVIEW_H)
         self.add_css_class("dc-preview")
         self._stop = threading.Event()
@@ -297,6 +301,7 @@ class Preview(Gtk.Picture):
                 if header is None:
                     raise OSError("no header")
                 w, h = struct.unpack("<II", header)
+                self.stream_w, self.stream_h = w, h
                 size = w * h * 3
                 sock.settimeout(5.0)
                 while not self._stop.is_set():
@@ -475,8 +480,24 @@ class Panel(Gtk.Box):
         self.fps_entry.set_alignment(1.0)
         self.fps_entry.set_valign(Gtk.Align.CENTER)
         self.fps_entry.connect("activate", self._on_fps_commit)
+        # Clamping happens ONLY on Enter. Correcting while someone is still
+        # typing makes the box unusable - the sync loop keeps its hands off
+        # from the first keystroke until commit (or focus loss reverts).
+        self._fps_syncing = False
+        self._fps_edited = False
+
+        def fps_changed(_e):
+            if not self._fps_syncing:
+                self._fps_edited = True
+
+        self.fps_entry.connect("changed", fps_changed)
         focus = Gtk.EventControllerFocus()
-        focus.connect("leave", lambda *_: self._on_fps_commit(self.fps_entry))
+
+        def fps_focus_leave(*_a):
+            self._fps_edited = False
+            self._sync_fps_entry()
+
+        focus.connect("leave", fps_focus_leave)
         self.fps_entry.add_controller(focus)
         bar.append(self.fps_entry)
         fps_lbl = Gtk.Label(label="fps")
@@ -684,6 +705,8 @@ class Panel(Gtk.Box):
         )
         self.blur_scale.connect("value-changed", self._on_blur)
         self.blur_label = row.get_first_child()
+        self.blur_label.add_css_class("dc-clickable")
+        self.blur_label.set_cursor(Gdk.Cursor.new_from_name("pointer"))
         self.blur_label.set_tooltip_text("Click to switch between Blur and Bokeh")
         toggle = Gtk.GestureClick()
         toggle.connect("released", self._on_blur_style_toggle)
@@ -1066,30 +1089,51 @@ class Panel(Gtk.Box):
         value.set_valign(Gtk.Align.CENTER)
         row.append(value)
 
+        # From the first keystroke until Enter, the box belongs to the
+        # user: no clamping, no sync overwrites. Enter commits (clamped to
+        # the slider's range); leaving without Enter reverts the display.
+        value._dc_edited = False
+
+        def changed(_e):
+            if not getattr(value, "_dc_syncing", False):
+                value._dc_edited = True
+
+        value.connect("changed", changed)
+
         def commit(_widget=None):
+            value._dc_edited = False
             text = value.get_text().strip().rstrip("x")
             try:
                 v = float(text)
             except ValueError:
-                value.set_text(f"{scale.get_value():.{digits}f}")
+                self._set_value_text(value, f"{scale.get_value():.{digits}f}")
                 return
             adj = scale.get_adjustment()
             scale.set_value(max(adj.get_lower(), min(adj.get_upper(), v)))
-            value.set_text(f"{scale.get_value():.{digits}f}")
+            self._set_value_text(value, f"{scale.get_value():.{digits}f}")
             root = self.get_root()
             if root is not None:
                 root.set_focus(None)
 
+        def revert(*_a):
+            value._dc_edited = False
+            self._set_value_text(value, f"{scale.get_value():.{digits}f}")
+
         value.connect("activate", commit)
         focus = Gtk.EventControllerFocus()
-        focus.connect("leave", lambda *_: commit())
+        focus.connect("leave", revert)
         value.add_controller(focus)
         return row, scale, value
 
     def _set_value_text(self, entry: Gtk.Entry, text: str) -> None:
-        """Update a value box unless the user is typing in it."""
-        if not entry.has_focus():
+        """Update a value box unless the user is editing it."""
+        if entry.has_focus() or getattr(entry, "_dc_edited", False):
+            return
+        entry._dc_syncing = True
+        try:
             entry.set_text(text)
+        finally:
+            entry._dc_syncing = False
 
     def _camera_block(self) -> Gtk.Widget:
         """Camera controls as a stack: one page per mode, each showing only
@@ -1278,6 +1322,7 @@ class Panel(Gtk.Box):
         if self._suppress or not self._ready or self.busy:
             return
         mode = self._current_res_mode()
+        self._fps_edited = False
         try:
             wanted = float(entry.get_text().strip())
         except ValueError:
@@ -1306,8 +1351,13 @@ class Panel(Gtk.Box):
         )
 
     def _sync_fps_entry(self) -> None:
-        if not self.fps_entry.has_focus():
+        if self._fps_edited or self.fps_entry.has_focus():
+            return
+        self._fps_syncing = True
+        try:
             self.fps_entry.set_text(f"{float(self.status.get('fps') or 30.0):g}")
+        finally:
+            self._fps_syncing = False
 
     def _on_preview_menu(self, *_args) -> None:
         style = self.preview.cycle_placeholder()
@@ -1321,16 +1371,21 @@ class Panel(Gtk.Box):
         if self.status.get("mode") != "studio":
             self.footer.set_text("tap-to-focus needs Studio mode")
             return
-        # The preview uses ContentFit.COVER, so the picture may be cropped;
-        # undo that mapping before converting to frame coordinates.
+        # The preview uses ContentFit.CONTAIN (letterboxed), so undo that
+        # mapping - with the stream's actual aspect - before converting to
+        # frame coordinates.
         w = self.preview.get_width() or 1
         h = self.preview.get_height() or 1
-        pw, ph = 480, 270
-        scale = max(w / pw, h / ph)
+        pw, ph = self.preview.stream_w or 1, self.preview.stream_h or 1
+        scale = min(w / pw, h / ph)
         ix = (cx - (w - pw * scale) / 2) / scale
         iy = (cy - (h - ph * scale) / 2) / scale
-        fx = max(0, min(1919, int(ix / pw * 1920)))
-        fy = max(0, min(1079, int(iy / ph * 1080)))
+        if not (0 <= ix < pw and 0 <= iy < ph):
+            return  # tapped the letterbox, not the picture
+        fw = int(self.status.get("width") or 1920)
+        fh = int(self.status.get("height") or 1080)
+        fx = max(0, min(fw - 1, int(ix / pw * fw)))
+        fy = max(0, min(fh - 1, int(iy / ph * fh)))
         x0, y0 = max(0, fx - 128), max(0, fy - 128)
         region = [x0, y0, 256, 256]
         self.footer.set_text(f"focusing at {fx},{fy}…")

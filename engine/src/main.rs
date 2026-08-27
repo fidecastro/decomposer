@@ -277,7 +277,7 @@ fn main() -> Result<()> {
     }
 
     let mut preview = match args.preview.clone() {
-        Some(path) => Some(preview::Preview::new(path, args.preview_every)?),
+        Some(path) => Some(preview::Preview::new(path, args.preview_every, out_w, out_h)?),
         None => None,
     };
 
