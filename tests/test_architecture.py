@@ -90,3 +90,22 @@ def test_cli_resolution_names_derive_from_core():
     core_sizes = {(r[1], r[2]) for r in RESOLUTIONS_STUDIO}
     assert set(RESOLUTIONS.values()) <= core_sizes
     assert (5312, 6000) not in RESOLUTIONS.values()
+
+
+def test_privileged_commands_live_in_docs_not_code():
+    # Code diagnoses; the repository prescribes. Every sudo/package-manager
+    # command belongs in docs/SETUP.md, where a human reads it before
+    # running it - never in a string the binary prints.
+    offenders = []
+    roots = [SRC, SRC.parent.parent / "engine" / "src"]
+    for root in roots:
+        for path in root.rglob("*"):
+            if path.suffix not in (".py", ".rs"):
+                continue
+            for n, line in enumerate(path.read_text().splitlines(), 1):
+                if any(cmd in line for cmd in ("sudo ", "pacman -S", "pip install")):
+                    offenders.append(f"{path.name}:{n}: {line.strip()[:70]}")
+    assert not offenders, (
+        "privileged-command strings belong in docs/SETUP.md:\n  "
+        + "\n  ".join(offenders)
+    )

@@ -54,9 +54,10 @@ python -m venv .venv && .venv/bin/pip install -e .
 .venv/bin/decomposer daemon        # the camera comes alive on /dev/video10
 ```
 
-`doctor` walks the whole stack and prints a fix for every gap it finds.
-The files under `packaging/` cover the virtual camera module, udev rules,
-a systemd service and an Arch PKGBUILD.
+`doctor` walks the whole stack and points at what is missing. Every
+command that touches your system lives in
+**[docs/SETUP.md](docs/SETUP.md)** — the app never runs a privileged
+command, and never asks you to from inside the code.
 
 ## The bar widget
 

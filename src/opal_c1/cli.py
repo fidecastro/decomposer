@@ -475,10 +475,11 @@ def _cmd_gui(args: argparse.Namespace) -> int:
     try:
         from opal_c1.gui import main as gui_main
     except (ImportError, ValueError) as e:
+        # The fix involves installing packages; the commands live in the
+        # repository docs, deliberately not in this binary.
         print(
             f"GUI needs PyGObject with GTK4 and libadwaita ({e}).\n"
-            "  Arch: sudo pacman -S python-gobject gtk4 libadwaita\n"
-            "  or:   pip install 'decomposer[gui]'",
+            "  see docs/SETUP.md \u00a7 GUI dependencies",
             file=sys.stderr,
         )
         return 1
@@ -753,20 +754,18 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
 
     loop = Path("/dev/video10")
     check(loop.exists(), "v4l2loopback node", str(loop),
-          "sudo cp packaging/v4l2loopback*.conf /etc/modprobe.d/ "
-          "&& sudo modprobe v4l2loopback")
+          "see docs/SETUP.md \u00a7 The virtual camera")
     caps = Path("/sys/module/v4l2loopback/parameters/exclusive_caps")
     # The parameter prints as a bool array ("Y,N,N,..."), one slot per
     # possible device; ours is the first.
     caps_ok = caps.is_file() and caps.read_text().strip().split(",")[0] in ("Y", "1")
     check(caps_ok, "exclusive_caps",
           "", "apps only see the camera when the engine publishes; "
-          "set exclusive_caps=1 (packaging/v4l2loopback.conf)")
+          "see docs/SETUP.md \u00a7 The virtual camera")
 
     rules = Path("/etc/udev/rules.d/60-opal-c1.rules")
     check(rules.is_file(), "udev rules", str(rules),
-          "sudo cp packaging/60-opal-c1.rules /etc/udev/rules.d/ "
-          "&& sudo udevadm control --reload")
+          "see docs/SETUP.md \u00a7 udev rules")
 
     camera = None
     for dev in Path("/sys/bus/usb/devices").glob("*"):
@@ -783,8 +782,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     quirks = Path("/sys/module/usbcore/parameters/quirks")
     quirk_ok = quirks.is_file() and "03e7:f63d" in quirks.read_text()
     check(quirk_ok, "USB NO_LPM quirk", "",
-          "optional but recommended: sudo cp packaging/decomposer-usb.conf "
-          "/etc/tmpfiles.d/ && sudo systemd-tmpfiles --create")
+          "optional but recommended: see docs/SETUP.md \u00a7 USB quirk")
 
     layer = ctypes.util.find_library("gtk4-layer-shell")
     check(layer is not None, "gtk4-layer-shell", layer or "",

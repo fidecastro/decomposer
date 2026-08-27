@@ -144,7 +144,7 @@ impl V4l2Sink {
         if got.width != width || got.height != height || &got.fourcc.repr != b"YU12" {
             bail!(
                 "{path} rejected {width}x{height} YU12 (got {}x{} {}). \
-                 Is v4l2loopback loaded? See packaging/v4l2loopback.conf",
+                 Is v4l2loopback loaded? See docs/SETUP.md",
                 got.width, got.height, got.fourcc
             );
         }
