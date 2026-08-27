@@ -290,6 +290,12 @@ the last frame: a NO FEED card, or classic broadcast colour bars.
 **Right-click the preview** to switch between them; the choice persists in
 `~/.config/decomposer/panel.json`.
 
+A **MIC chip** in the mode row tells the audio truth: green when the C1's
+microphone card is actually registered (Call mode), dimmed when it does not
+exist (Studio firmware has no audio at all — a hardware fact, not a setting).
+If the C1 is your system default microphone, switching to Studio flashes a
+heads-up that apps will fall back to another source.
+
 Focus and white balance each have an **auto** button. When a control is on
 automatic the button lights and the value reads `auto` — the daemon stores auto
 as `-1`, and clamping that onto the slider would display `0`, a real and very

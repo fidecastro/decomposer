@@ -509,6 +509,13 @@ def _print_status(st: dict) -> None:
         print(f"  controls  {st['controls']}")
     for line in st.get("engine_log") or []:
         print(f"  engine    {line}")
+    mode_name = st.get("mode")
+    if mode_name in ("call", "studio"):
+        from opal_c1.core.model import CAPABILITIES, Mode
+        if CAPABILITIES[Mode(mode_name)].microphone:
+            print("  mic       live — select 'Opal C1' in your app")
+        else:
+            print("  mic       none — Studio firmware has no microphone")
     if st.get("notice"):
         print(f"  notice    {st['notice']}")
     if st.get("last_event"):

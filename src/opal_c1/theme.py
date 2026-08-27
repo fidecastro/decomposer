@@ -177,6 +177,14 @@ def css(t: Theme) -> str:
 
     .dc-warn {{ color: {red}; font-size: {small - 1.5:.1f}pt; }}
 
+    .dc-mic {{
+        border-radius: 5px; padding: 1px 7px; font-weight: 700;
+        font-size: {small - 2.0:.1f}pt;
+        border: 1px solid {muted};
+    }}
+    .dc-mic.live {{ color: {green}; border-color: {green}; }}
+    .dc-mic.dead {{ color: {muted}; opacity: 0.7; }}
+
     /* Value boxes: editable, but dressed as labels until focused. */
     entry.dc-entry {{
         background: transparent; border: none; box-shadow: none;

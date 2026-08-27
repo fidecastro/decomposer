@@ -17,6 +17,7 @@ import os
 import socket
 import struct
 from pathlib import Path
+import subprocess
 import threading
 import time
 from typing import Callable, Optional
@@ -483,6 +484,10 @@ class Panel(Gtk.Box):
         self.mode_hint.add_css_class("dc-hint")
         self.mode_hint.set_valign(Gtk.Align.CENTER)
         row.append(self.mode_hint)
+        self.mic_chip = Gtk.Label(label="MIC")
+        self.mic_chip.add_css_class("dc-mic")
+        self.mic_chip.set_valign(Gtk.Align.CENTER)
+        row.append(self.mic_chip)
         return row
 
     def _look_block(self) -> Gtk.Widget:
@@ -871,11 +876,72 @@ class Panel(Gtk.Box):
             self._on_result,
         )
 
+    @staticmethod
+    def _c1_mic_present() -> bool:
+        """The truthful check: is the C1's UAC2 card actually registered?
+
+        Mode implies what *should* exist; /proc/asound says what does. The
+        two disagree exactly during firmware reboots, which is when a user
+        looks at the chip.
+        """
+        try:
+            return "C1" in Path("/proc/asound/cards").read_text()
+        except OSError:
+            return False
+
+    def _update_mic_chip(self, studio: bool) -> None:
+        live = self._c1_mic_present()
+        self.mic_chip.set_text("MIC \u25cf" if live else "MIC \u2013")
+        for cls in ("live", "dead"):
+            self.mic_chip.remove_css_class(cls)
+        self.mic_chip.add_css_class("live" if live else "dead")
+        if live:
+            tip = "The C1's microphone is live — pick “Opal C1” in your call app."
+        elif studio:
+            tip = (
+                "Studio firmware has no microphone — the mic only exists "
+                "under Call mode's Opal firmware."
+            )
+        else:
+            tip = "The C1's mic card is not registered (camera rebooting?)."
+        self.mic_chip.set_tooltip_text(tip)
+
     def _on_mode(self, _btn, mode: str) -> None:
         if self.busy or self.status.get("mode") == mode:
             return
+        if mode == "studio":
+            self._warn_if_default_mic()
         self._set_busy(True, f"switching to {mode}, the camera reboots…")
         _worker(lambda: self.client.request(cmd="set_mode", mode=mode), self._on_result)
+
+    def _warn_if_default_mic(self) -> None:
+        """If the system's default mic is the C1, say what Studio costs.
+
+        The check runs off-thread (pactl can dawdle); the warning lands in
+        the footer as a timed flash that outlives the switch chatter.
+        """
+        def check():
+            try:
+                name = subprocess.run(
+                    ["pactl", "get-default-source"],
+                    capture_output=True, text=True, timeout=3,
+                ).stdout.strip().lower()
+            except Exception:
+                return
+            if "opal" in name or "c1" in name:
+                GLib.idle_add(
+                    self._flash,
+                    "heads-up: the C1 mic disappears in Studio — apps on it "
+                    "fall back to another source",
+                    12.0,
+                )
+        threading.Thread(target=check, daemon=True).start()
+
+    def _flash(self, text: str, seconds: float = 8.0) -> bool:
+        self._flash_text = text
+        self._flash_until = time.monotonic() + seconds
+        self.footer.set_text(text)
+        return False
 
     def _on_mirror(self, _btn, axis: str) -> None:
         if self.busy:
@@ -1016,7 +1082,8 @@ class Panel(Gtk.Box):
         for cls in ("call", "studio", "off"):
             self.mode_pill.remove_css_class(cls)
         self.mode_pill.add_css_class(mode if mode in ("call", "studio") else "off")
-        self.mode_hint.set_text("mic off" if studio else "mic on")
+        self.mode_hint.set_text("")
+        self._update_mic_chip(studio)
 
         for axis, key in (("horizontal", "mirror_h"), ("vertical", "mirror_v")):
             b = self.mirror_buttons[axis]
@@ -1109,7 +1176,9 @@ class Panel(Gtk.Box):
             else "focus, white balance, effects and tap-to-focus need Studio mode"
         )
 
-        if transitioning:
+        if time.monotonic() < getattr(self, "_flash_until", 0.0):
+            self.footer.set_text(self._flash_text)
+        elif transitioning:
             self.footer.set_text("switching modes… the camera is rebooting")
         elif st.get("engine_alive"):
             self.footer.set_text(
