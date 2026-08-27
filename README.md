@@ -58,6 +58,14 @@ python -m venv .venv && .venv/bin/pip install -e .
 The files under `packaging/` cover the virtual camera module, udev rules,
 a systemd service and an Arch PKGBUILD.
 
+## The bar widget
+
+The repo doubles as an **Omarchy plugin**: `manifest.json` and
+`BarWidget.qml` at the root give the bar a pixel-mark button that
+toggles the panel. Install it from the Omarchy plugin marketplace, or
+locally with `decomposer install-plugin --add-to-bar`. The widget runs
+`decomposer toggle`, so the app itself needs to be installed either way.
+
 ## Agents and developers
 
 Read **[docs/ENGINEERING.md](docs/ENGINEERING.md)** to know more: the

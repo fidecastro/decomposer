@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "decomposer.overlay",
+  "name": "decomposer",
+  "version": "1.0.0",
+  "author": "Felipe Infante de Castro",
+  "description": "Linux software for the Opal C1 webcam: GPU looks, background blur, manual focus - toggled from the bar",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "decomposer",
+    "description": "Toggle the Opal C1 overlay",
+    "category": "Hardware",
+    "allowMultiple": false
+  }
+}

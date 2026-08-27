@@ -183,8 +183,11 @@ def qml_manifest(module_id: str = "decomposer.overlay") -> str:
             "id": module_id,
             "name": "decomposer",
             "version": "1.0.0",
-            "author": "decomposer",
-            "description": "Opal C1 looks, focus and white balance",
+            "author": "Felipe Infante de Castro",
+            "description": (
+                "Linux software for the Opal C1 webcam: GPU looks, "
+                "background blur, manual focus - toggled from the bar"
+            ),
             "kinds": ["bar-widget"],
             "entryPoints": {"barWidget": "BarWidget.qml"},
             "barWidget": {
