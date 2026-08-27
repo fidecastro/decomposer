@@ -524,3 +524,17 @@ reset `short_lives` (it would defeat the sick-hold forever); and
 `state.frames` counts only in Studio (the Call engine reads V4L2 itself),
 so anything gated on it — the arrival notice — must key off the preview
 watchdog's frame progress instead.
+
+
+## Frame geometry and rate: the measured truth (2026-08-27)
+
+Call mode (UVC): four 16:9 modes, NV12 only, all fixed at 30 fps. Studio
+mode drives the sensor's configs directly: 16:9 (from the 3840x2160
+binned config) runs 1.67-42 fps (1080p42 measured sustained at 42.2);
+4000x3000 4:3 runs up to 30 (measured 16.9 at a requested 20 -
+bus-limited, ~360 MB/s of the ~400 MB/s practical ceiling); and the
+5312x6000 config is RAW-ONLY - an NV12 request at that size is silently
+downgraded by depthai to 4000x3000 with no error, which sliced at
+47.8 MB boundaries is exactly a garbage feed. The adapter now raises on
+any delivered-size mismatch instead of streaming misaligned bytes, and
+32 MP is deliberately not offered.

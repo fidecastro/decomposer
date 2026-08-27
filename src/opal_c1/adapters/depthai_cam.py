@@ -44,6 +44,17 @@ class XLinkBackend:
             return None
         frame = self._dev.try_read()
         if frame is not None:
+            if (frame.width, frame.height) != (self._width, self._height):
+                # depthai downgrades an undeliverable geometry SILENTLY
+                # (a 5312x6000 NV12 request comes back 4000x3000: the ISP
+                # cannot go higher). Streaming that into a consumer sized
+                # for the request is how "the feed is garbage" happens - a
+                # loud error here is the honest failure.
+                raise RuntimeError(
+                    f"camera delivered {frame.width}x{frame.height} for a "
+                    f"{self._width}x{self._height} request; this geometry "
+                    "is not deliverable over the ISP"
+                )
             self._last_frame = frame
         return frame
 

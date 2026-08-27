@@ -106,9 +106,10 @@ def test_fps_limits_follow_the_firmware():
     assert clamp_fps(Mode.STUDIO, 1920, 1080, 0.5) == 1.67
     # The big sensor configs carry their own ceilings.
     assert fps_limits(Mode.STUDIO, 4000, 3000)[1] == 30.0
-    assert fps_limits(Mode.STUDIO, 5312, 6000) == (0.93, 10.0)
-    # And only Studio offers the non-16:9 geometries.
+    # And only Studio offers the 4:3 geometry. 5312x6000 exists as a sensor
+    # config but is RAW-only - an NV12 request is silently downgraded to
+    # 4000x3000 (measured) - so it is deliberately NOT offered.
     call_sizes = {(r[1], r[2]) for r in resolutions_for(Mode.CALL)}
     studio_sizes = {(r[1], r[2]) for r in resolutions_for(Mode.STUDIO)}
-    assert (5312, 6000) in studio_sizes - call_sizes
     assert (4000, 3000) in studio_sizes - call_sizes
+    assert (5312, 6000) not in studio_sizes

@@ -86,7 +86,9 @@ RESOLUTIONS_CALL = (
 )
 RESOLUTIONS_STUDIO = RESOLUTIONS_CALL + (
     ("12 MP 4:3", 4000, 3000, 0, 0),
-    ("32 MP", 5312, 6000, 0, 0),
+    # The 5312x6000 sensor config is real but RAW-only: an NV12 request at
+    # that size is silently downgraded to 4000x3000 by the ISP (measured),
+    # so offering it would only ever deliver garbage or an error.
 )
 
 
