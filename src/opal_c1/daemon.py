@@ -609,6 +609,9 @@ class Daemon:
                 # changes with the firmware.
                 with suppress(Exception):
                     self._refresh_presets()
+                # The switch's own re-enumerations set the camera event; a
+                # stale one would wake the next supervisor hold instantly.
+                self._camera_event.clear()
                 request.done.set()
 
     def set_mode(self, mode: str) -> dict:
@@ -1138,6 +1141,10 @@ class Daemon:
             with self.lock:
                 if not self.state.running:
                     continue
+                if self._ledger.in_progress or not self._requests.empty():
+                    # A client transition owns the camera; its stopped engine
+                    # is not a death and must not feed the policy counters.
+                    continue
                 engine = self._engine
                 if engine is not None and engine.alive():
                     policy.note_alive()
@@ -1202,6 +1209,15 @@ class Daemon:
             with self.lock:
                 if self._ledger.in_progress or not self._requests.empty():
                     # A client transition is underway; it owns the camera now.
+                    continue
+                current = self._engine
+                if current is not None and current.alive():
+                    # The engine came back while we were holding - a client
+                    # transition finished, or the hold's own replug wake was
+                    # the switch's re-enumeration. Re-entering now would
+                    # reboot a healthy camera: the second restart users saw
+                    # on every mode switch.
+                    policy.note_alive()
                     continue
             try:
                 self.request_transition(mode, enforce_guard=False)

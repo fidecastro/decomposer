@@ -1167,6 +1167,12 @@ class Panel(Gtk.Box):
             return
         if mode == "studio":
             self._warn_if_default_mic()
+        # Dim right now, not at the next status tick: the click is the
+        # moment the controls stop being real.
+        self.camera_stack.set_sensitive(False)
+        self.camera_stack.set_opacity(0.45)
+        for b in self.mode_buttons.values():
+            b.set_sensitive(False)
         self._set_busy(True, f"switching to {mode}, the camera reboots…")
         _worker(lambda: self.client.request(cmd="set_mode", mode=mode), self._on_result)
 
@@ -1317,13 +1323,23 @@ class Panel(Gtk.Box):
 
         def done(resp: dict) -> None:
             self._refreshing = False
+            if self.busy:
+                # A long action (a mode switch) is in flight. Show its
+                # progress - transitioning dims the controls - but leave
+                # busy for the action's own completion to clear, so the
+                # buttons stay locked until it actually finishes.
+                if resp.get("ok"):
+                    self.status = resp
+                    self._apply(resp)
+                return
             self._on_result(resp)
 
         _worker(lambda: self.client.request(cmd="status"), done)
 
     def _tick(self) -> bool:
-        if not self.busy:
-            self.refresh()
+        # Ticks run during long actions too: status is a cheap snapshot,
+        # and a 15-second mode switch with a frozen panel reads as a hang.
+        self.refresh()
         return True
 
     def _on_result(self, resp: dict) -> bool:

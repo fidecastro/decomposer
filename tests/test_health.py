@@ -154,3 +154,15 @@ def test_replug_does_not_launder_short_lives():
     policy.on_replug()
     action = policy.on_death(Mode.CALL, uptime=11.0, camera_on_bus=True)
     assert action.kind is Kind.HOLD_SICK
+
+
+# The double-restart regression is daemon wiring, not policy - but the
+# policy-side invariant it depends on is pinned here: note_alive after a
+# hold must fully clear the retry pressure.
+def test_note_alive_clears_retry_pressure():
+    policy = EnginePolicy()
+    policy.on_death(Mode.STUDIO, uptime=3000.0, camera_on_bus=True)
+    policy.on_reentry_failed(Mode.STUDIO, "x")
+    policy.note_alive()
+    assert policy.backoff == 0.0
+    assert policy.failures == 0
