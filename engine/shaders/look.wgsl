@@ -34,8 +34,15 @@ struct Params {
     // CLAHE: strength 0 disables; clip limits how far a tile may equalize.
     clahe: f32,
     clahe_clip: f32,
+    // Background effect: blur strength, person-mask size (mask_w == 0 means
+    // no mask has arrived, everything below is skipped), and replacement
+    // image size (bg_w == 0 means blur rather than replace).
+    blur: f32,
+    mask_w: u32,
+    mask_h: u32,
+    bg_w: u32,
+    bg_h: u32,
     _pad0: u32,
-    _pad1: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -50,6 +57,12 @@ struct Params {
 // separate clear is needed between frames.
 @group(0) @binding(5) var<storage, read_write> clahe_hist: array<atomic<u32>>;
 @group(0) @binding(6) var<storage, read_write> clahe_lut: array<f32>;
+// Person mask, u8 packed four to a word, mask_w x mask_h, source-frame space:
+// sampled through the same source_coord mapping as the video, so zoom, pan
+// and mirror apply to it for free.
+@group(0) @binding(7) var<storage, read> seg_mask: array<u32>;
+// Replacement background, RGBA8 one pixel per u32, pre-scaled to the output.
+@group(0) @binding(8) var<storage, read> bg_img: array<u32>;
 
 const CLAHE_TX: u32 = 8u;
 const CLAHE_TY: u32 = 8u;
@@ -356,11 +369,91 @@ fn clahe_remap(px: u32, py: u32, y: f32) -> f32 {
     return mix(y, mix(a, b, ty), params.clahe);
 }
 
+// -- Background blur / replacement ---------------------------------------
+
+fn mask_byte(x: u32, y: u32) -> f32 {
+    let idx = y * params.mask_w + x;
+    let word = seg_mask[idx >> 2u];
+    return f32((word >> ((idx & 3u) * 8u)) & 0xffu) / 255.0;
+}
+
+// Bilinear person-probability at a source-space position.
+fn mask_at(sx: f32, sy: f32) -> f32 {
+    let mw = f32(params.mask_w);
+    let mh = f32(params.mask_h);
+    let fx = clamp(sx / f32(params.src_w), 0.0, 1.0) * mw - 0.5;
+    let fy = clamp(sy / f32(params.src_h), 0.0, 1.0) * mh - 0.5;
+    let x0i = i32(floor(fx));
+    let y0i = i32(floor(fy));
+    let tx = fract(fx);
+    let ty = fract(fy);
+    let x0 = u32(clamp(x0i, 0, i32(params.mask_w) - 1));
+    let x1 = u32(clamp(x0i + 1, 0, i32(params.mask_w) - 1));
+    let y0 = u32(clamp(y0i, 0, i32(params.mask_h) - 1));
+    let y1 = u32(clamp(y0i + 1, 0, i32(params.mask_h) - 1));
+    let a = mix(mask_byte(x0, y0), mask_byte(x1, y0), tx);
+    let b = mix(mask_byte(x0, y1), mask_byte(x1, y1), tx);
+    return mix(a, b, ty);
+}
+
+fn source_rgb(sx: f32, sy: f32) -> vec3<f32> {
+    let uv = sample_uv(sx, sy);
+    return ycbcr_to_rgb(sample_y(sx, sy), uv.x, uv.y);
+}
+
+// Poisson-ish disc, two rings. Fixed taps keep the pass single-dispatch;
+// at 4K x 24 extra NV12 samples the 4090 does not notice.
+const BG_TAPS = 12u;
+const TAP_DIRS = array<vec2<f32>, 12>(
+    vec2<f32>( 1.000,  0.000), vec2<f32>( 0.500,  0.866),
+    vec2<f32>(-0.500,  0.866), vec2<f32>(-1.000,  0.000),
+    vec2<f32>(-0.500, -0.866), vec2<f32>( 0.500, -0.866),
+    vec2<f32>( 0.866,  0.500), vec2<f32>( 0.000,  1.000),
+    vec2<f32>(-0.866,  0.500), vec2<f32>(-0.866, -0.500),
+    vec2<f32>( 0.000, -1.000), vec2<f32>( 0.866, -0.500),
+);
+
+// Blur built from background pixels only: a tap that lands on the person is
+// weighted out, which is what stops the subject smearing into the bokeh.
+fn blurred_bg(sc: vec2<f32>) -> vec3<f32> {
+    let radius = params.blur * f32(params.src_w) / max(params.zoom, 1.0) * 0.025;
+    var acc = source_rgb(sc.x, sc.y) * 0.15;
+    var wsum = 0.15;
+    for (var i = 0u; i < BG_TAPS; i = i + 1u) {
+        let r = select(radius, radius * 0.45, (i & 1u) != 0u);
+        let pos = sc + TAP_DIRS[i] * r;
+        let w = 1.0 - mask_at(pos.x, pos.y);
+        acc = acc + source_rgb(pos.x, pos.y) * w;
+        wsum = wsum + w;
+    }
+    return acc / wsum;
+}
+
+fn bg_pixel(px: u32, py: u32) -> vec3<f32> {
+    let x = min(px * params.bg_w / params.width, params.bg_w - 1u);
+    let y = min(py * params.bg_h / params.height, params.bg_h - 1u);
+    let p = bg_img[y * params.bg_w + x];
+    return vec3<f32>(
+        f32(p & 0xffu), f32((p >> 8u) & 0xffu), f32((p >> 16u) & 0xffu),
+    ) / 255.0;
+}
+
 fn graded(px: u32, py: u32) -> vec3<f32> {
     let sc = source_coord(px, py);
     let y = clahe_remap(px, py, sample_y(sc.x, sc.y));
     let uv = sample_uv(sc.x, sc.y);
-    let rgb = apply_look(ycbcr_to_rgb(y, uv.x, uv.y));
+    var rgb = ycbcr_to_rgb(y, uv.x, uv.y);
+    if (params.mask_w != 0u && (params.blur > 0.0 || params.bg_w != 0u)) {
+        let m = mask_at(sc.x, sc.y);
+        var bg: vec3<f32>;
+        if (params.bg_w != 0u) {
+            bg = bg_pixel(px, py);
+        } else {
+            bg = blurred_bg(sc);
+        }
+        rgb = mix(bg, rgb, m);
+    }
+    rgb = apply_look(rgb);
     return composite(px, py, rgb);
 }
 

@@ -85,6 +85,12 @@ def decode(raw: dict) -> Tuple[dict, list]:
     clahe = _clamp(raw.get("clahe"), 0.0, 1.0)
     if clahe is not None:
         out["clahe"] = clahe
+    blur = _clamp(raw.get("blur"), 0.0, 1.0)
+    if blur is not None:
+        out["blur"] = blur
+    background = raw.get("background")
+    if isinstance(background, str) and background:
+        out["background"] = background
     for key in ("pan_x", "pan_y"):
         v = _clamp(raw.get(key), -1.0, 1.0)
         if v is not None:

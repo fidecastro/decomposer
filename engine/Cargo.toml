@@ -8,6 +8,7 @@ description = "GPU look engine for the Opal C1: capture -> look -> virtual camer
 anyhow = "1"
 bytemuck = "1.25.2"
 clap = { version = "4", features = ["derive"] }
+ort = { version = "2.0.0-rc.13", features = ["cuda"] }
 png = "0.18.1"
 pollster = "1.0.1"
 v4l = "0.14"

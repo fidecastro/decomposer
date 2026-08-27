@@ -1,6 +1,8 @@
 # Background blur / replacement — research and design
 
-*Research pass 2026-08-27. The last big Composer-parity gap.*
+*Research pass 2026-08-27; implemented the same day. Verified offline:
+blur and replacement on a real portrait, external mask socket driven by a
+20-line Python client, 458 fps at 1080p with segmentation active.*
 
 ## Model candidates
 
@@ -55,6 +57,23 @@ model-agnostic either way.
 
 Pipeline today runs ~2–4 ms/frame at 4K on the 4090. The blur pass adds
 ~1 ms; inference is off the critical path entirely. No frame-rate risk.
+
+## The mask is a port, not a feature
+
+The model is user-replaceable at three levels:
+
+1. **Default**: the vendored MediaPipe ONNX runs in-engine via ort.
+2. **`--seg-model <path.onnx>`**: any ONNX model whose contract fits —
+   input NxHxWx3 (or NxCxHxW) float RGB, output HxW single-channel mask,
+   sizes read from the model itself. `--seg-device cpu|cuda` picks the
+   execution provider; cuda falls back to cpu with a logged reason when
+   the runtime is missing.
+3. **The mask socket**: the engine exposes `mask.sock` next to the preview
+   socket. An external process — any framework, any language — reads
+   frames from the preview socket and writes masks back
+   (header: u32 width, u32 height, LE; then w*h u8 frames). While an
+   external client is connected, the internal runner yields. This is the
+   port; the ort runner is just the default adapter driving it.
 
 ## Open questions
 

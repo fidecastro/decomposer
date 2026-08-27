@@ -290,6 +290,21 @@ the last frame: a NO FEED card, or classic broadcast colour bars.
 **Right-click the preview** to switch between them; the choice persists in
 `~/.config/decomposer/panel.json`.
 
+**Background blur and replacement**: `decomposer blur 0.6` masks you out
+with person segmentation (the bundled MediaPipe model, Apache-2.0, running
+on CPU in single-digit milliseconds) and disc-blurs everything else on the
+GPU; `decomposer background ~/beach.png` composites an image behind you
+instead. Both live in the panel as a Blur slider and a Backdrop chooser,
+and both work identically in Call and Studio mode.
+
+The mask is a port, not a feature: bring your own model with
+`decomposer daemon --seg-model your.onnx` (any image-in/mask-out ONNX;
+shapes are autodetected) and pick where it runs with `--seg-device cpu|cuda`.
+Or bypass ONNX entirely — connect to the engine's `mask.sock`, send
+`u32 width, u32 height` (LE) and then raw `w*h` u8 mask frames from any
+process in any framework; the internal model yields while you're connected.
+See docs/background-blur.md.
+
 A **MIC chip** in the mode row tells the audio truth: green when the C1's
 microphone card is actually registered (Call mode), dimmed when it does not
 exist (Studio firmware has no audio at all — a hardware fact, not a setting).

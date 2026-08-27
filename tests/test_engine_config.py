@@ -92,3 +92,33 @@ def test_cli_args_omit_absent_optionals():
     text = " ".join(engine_cli_args(cfg()))
     assert "--lut-dir" not in text
     assert "--overlay " not in text
+
+
+def test_blur_and_background_lines():
+    base = cfg()
+    assert engine_delta_lines(base, replace(base, blur=0.7)) == ["blur 0.7"]
+    assert engine_delta_lines(
+        base, replace(base, background="/tmp/bg.png")
+    ) == ["background /tmp/bg.png"]
+    assert engine_delta_lines(
+        cfg(background="/tmp/bg.png"), base
+    ) == ["background off"]
+
+
+def test_seg_choices_are_restart_fields():
+    assert cfg(seg_model="/opt/m.onnx").needs_restart_from(cfg())
+    assert cfg(seg_device="cuda").needs_restart_from(cfg())
+    assert not cfg(blur=0.9, background="/x.png").needs_restart_from(cfg())
+
+
+def test_cli_args_carry_seg_and_blur():
+    text = " ".join(engine_cli_args(cfg(
+        blur=0.5, background="/tmp/bg.png",
+        seg_model="/opt/m.onnx", seg_device="cuda",
+    )))
+    assert "--blur 0.5" in text
+    assert "--background /tmp/bg.png" in text
+    assert "--seg-model /opt/m.onnx" in text
+    assert "--seg-device cuda" in text
+    clean = " ".join(engine_cli_args(cfg()))
+    assert "--blur" not in clean and "--seg-" not in clean

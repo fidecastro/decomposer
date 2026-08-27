@@ -491,6 +491,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         output=args.output, width=args.width, height=args.height, fps=args.fps,
         tray_enabled=args.tray,
         in_width=args.in_width, in_height=args.in_height,
+        seg_model=args.seg_model, seg_device=args.seg_device,
         **({} if args.default_strength is None
            else {'default_strength': args.default_strength}),
     ).run(initial_mode=args.mode)
@@ -701,6 +702,31 @@ def _cmd_resolution(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_blur(args: argparse.Namespace) -> int:
+    if args.strength is None:
+        resp = _client_call(cmd="status")
+    else:
+        v = 0.0 if args.strength == "off" else float(args.strength)
+        resp = _client_call(cmd="set_blur", strength=v)
+    if not resp.get("ok"):
+        return 1
+    print(f"  background blur {resp.get('blur')}")
+    return 0
+
+
+def _cmd_background(args: argparse.Namespace) -> int:
+    if args.path is None:
+        resp = _client_call(cmd="status")
+    elif args.path == "off":
+        resp = _client_call(cmd="set_background", path=None)
+    else:
+        resp = _client_call(cmd="set_background", path=args.path)
+    if not resp.get("ok"):
+        return 1
+    print(f"  background {resp.get('background') or '(blur or none)'}")
+    return 0
+
+
 def _cmd_clahe(args: argparse.Namespace) -> int:
     if args.strength is None:
         resp = _client_call(cmd="status")
@@ -899,6 +925,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also register a StatusNotifierItem (for desktops without the "
              "Omarchy bar plugin; on Omarchy this duplicates the widget)",
     )
+    dm.add_argument(
+        "--seg-model", default=None,
+        help="Person-segmentation ONNX model for background blur/replacement "
+             "(default: the bundled MediaPipe model). Any model with an "
+             "image input and a mask output works",
+    )
+    dm.add_argument(
+        "--seg-device", choices=("cpu", "cuda"), default=None,
+        help="Where segmentation runs (default cpu; cuda falls back to cpu "
+             "if the CUDA runtime is missing)",
+    )
     dm.set_defaults(func=_cmd_daemon)
 
     idt = sub.add_parser(
@@ -1007,6 +1044,31 @@ def build_parser() -> argparse.ArgumentParser:
     rs.add_argument("--capture-4k", action="store_true",
                     help="Capture 4K while publishing smaller: lossless zoom to 2x")
     rs.set_defaults(func=_cmd_resolution)
+
+    bl = sub.add_parser(
+        "blur",
+        help="Background blur",
+        description=(
+            "Person segmentation (bundled MediaPipe model, or your own via "
+            "'daemon --seg-model') masks you out; everything else gets a "
+            "disc blur on the GPU. 'off' or 0 disables it. External mask "
+            "producers can drive the effect through the engine's mask.sock."
+        ),
+    )
+    bl.add_argument("strength", nargs="?", default=None, help="0.0-1.0, or 'off'")
+    bl.set_defaults(func=_cmd_blur)
+
+    bg = sub.add_parser(
+        "background",
+        help="Replace the background with an image",
+        description=(
+            "Uses the same person mask as blur, but composites a PNG behind "
+            "you instead. 'off' goes back to blur (or to nothing)."
+        ),
+    )
+    bg.add_argument("path", nargs="?", default=None,
+                    help="PNG path, or 'off' to clear")
+    bg.set_defaults(func=_cmd_background)
 
     ch = sub.add_parser(
         "clahe",

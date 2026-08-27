@@ -17,6 +17,7 @@ mod gpu;
 mod lut;
 mod overlay;
 mod preview;
+mod seg;
 mod source;
 use source::{FrameSource, StdinSource, V4l2Source};
 
@@ -104,6 +105,28 @@ struct Args {
     /// Unix socket serving a downscaled RGB preview to the control panel
     #[arg(long)]
     preview: Option<String>,
+
+    /// Background blur strength, 0.0 to 1.0 (0 = off)
+    #[arg(long, default_value_t = 0.0)]
+    blur: f32,
+
+    /// PNG to replace the background with (implies segmentation)
+    #[arg(long)]
+    background: Option<String>,
+
+    /// Person-segmentation ONNX model; defaults to the bundled MediaPipe
+    /// model found next to the engine (models/selfie_segmentation.onnx)
+    #[arg(long)]
+    seg_model: Option<String>,
+
+    /// Where to run segmentation: cpu or cuda (cuda falls back to cpu)
+    #[arg(long, default_value = "cpu")]
+    seg_device: String,
+
+    /// Unix socket accepting person masks from an external producer; while
+    /// a client is connected the internal model yields
+    #[arg(long)]
+    mask_sock: Option<String>,
 
     /// Publish only every Nth frame to the preview
     #[arg(long, default_value_t = 2)]
@@ -217,6 +240,9 @@ fn main() -> Result<()> {
         s.pan_x = args.pan_x.clamp(-1.0, 1.0);
         s.pan_y = args.pan_y.clamp(-1.0, 1.0);
         s.clahe = args.clahe.clamp(0.0, 1.0);
+        s.blur = args.blur.clamp(0.0, 1.0);
+        s.bg_path = args.background.clone();
+        s.bg_dirty = s.bg_path.is_some();
         // Force the first pass through the resolver so the initial --look
         // actually loads its LUT instead of silently using a built-in curve.
         s.dirty = true;
@@ -229,6 +255,32 @@ fn main() -> Result<()> {
         Some(path) => Some(preview::Preview::new(path, args.preview_every)?),
         None => None,
     };
+
+    // Segmentation: resolved like the LUT dir - an explicit flag wins, the
+    // vendored model next to the binary is the default. A missing model is
+    // only an error if something actually needs masks.
+    let seg_model = args.seg_model.clone().or_else(|| {
+        std::env::current_exe().ok().and_then(|exe| {
+            exe.ancestors()
+                .map(|a| a.join("models/selfie_segmentation.onnx"))
+                .find(|p| p.is_file())
+                .map(|p| p.display().to_string())
+        })
+    });
+    let seg = match (&seg_model, engine.is_some()) {
+        (Some(path), true) => match seg::Seg::start(path, &args.seg_device) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("seg unavailable: {e:#}");
+                None
+            }
+        },
+        _ => None,
+    };
+    if let (Some(s), Some(path)) = (&seg, args.mask_sock.clone()) {
+        s.serve_mask_socket(path)?;
+    }
+    let mut seg_frame = 0u64;
 
     let mut n: u64 = 0;
     loop {
@@ -246,14 +298,17 @@ fn main() -> Result<()> {
                 s.dirty.then(|| {
                     s.dirty = false;
                     (s.look, s.look_name.clone(), s.strength, s.flip,
-                     s.zoom, s.pan_x, s.pan_y, s.clahe)
+                     s.zoom, s.pan_x, s.pan_y, s.clahe, s.blur)
                 })
             };
-            if let Some((look, name, strength, flip, zoom, pan_x, pan_y, clahe)) = pending {
+            if let Some((look, name, strength, flip, zoom, pan_x, pan_y, clahe, blur)) =
+                pending
+            {
                 g.set_look(look, strength);
                 g.set_flip(flip);
                 g.set_zoom(zoom, pan_x, pan_y);
                 g.set_clahe(clahe);
+                g.set_blur(blur);
                 // Reloading the same LUT every strength tweak would be wasteful,
                 // so only touch it when the name actually changes.
                 if name != applied_look {
@@ -298,6 +353,26 @@ fn main() -> Result<()> {
                     )
                 })
             };
+            let bg_change = {
+                let mut st = look_state.lock().unwrap();
+                st.bg_dirty.then(|| {
+                    st.bg_dirty = false;
+                    st.bg_path.clone()
+                })
+            };
+            if let Some(change) = bg_change {
+                match change {
+                    None => g.set_background(None),
+                    Some(p) => match overlay::load(&p, out_w, out_h) {
+                        Ok(img) => {
+                            eprintln!("background {p} {}x{}", img.width, img.height);
+                            g.set_background(Some(&img));
+                        }
+                        Err(e) => eprintln!("background: {e:#}"),
+                    },
+                }
+            }
+
             if let Some((path, ox, oy, mw, mh, opacity)) = overlay_change {
                 match path {
                     None => g.set_overlay(None, 0, 0, 1.0),
@@ -309,6 +384,22 @@ fn main() -> Result<()> {
                         Err(e) => eprintln!("overlay: {e:#}"),
                     },
                 }
+            }
+        }
+        if let (Some(s), Some(g)) = (&seg, engine.as_mut()) {
+            let (want_blur, want_bg) = {
+                let st = look_state.lock().unwrap();
+                (st.blur > 0.0, st.bg_path.is_some())
+            };
+            s.set_wanted(want_blur || want_bg);
+            seg_frame += 1;
+            // Every other frame is plenty: masks change slower than pixels,
+            // and the EMA smooths the seams.
+            if s.wanted() && seg_frame % 2 == 0 {
+                s.submit(seg::downscale_nv12(frame, w, h, s.in_w, s.in_h));
+            }
+            if let Some(mask) = s.take_mask() {
+                g.set_mask(&mask.data, mask.width, mask.height);
             }
         }
         let out = match engine.as_mut() {

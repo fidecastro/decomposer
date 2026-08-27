@@ -391,6 +391,8 @@ class Panel(Gtk.Box):
         body.append(self._overlay_row())
         body.append(self._zoom_row())
         body.append(self._clahe_row())
+        body.append(self._blur_row())
+        body.append(self._background_row())
         body.append(self._preset_row())
         body.append(self._sep())
         body.append(self._camera_block())
@@ -623,6 +625,79 @@ class Panel(Gtk.Box):
         if self._suppress or not self._ready:
             return
         self._queue({"clahe": round(scale.get_value(), 2)})
+
+    def _blur_row(self) -> Gtk.Widget:
+        row, self.blur_scale, self.blur_value = self._slider_row(
+            "Blur", 0.0, 1.0, 0.05, digits=2
+        )
+        self.blur_scale.set_tooltip_text(
+            "Background blur: person segmentation masks you out, everything "
+            "else gets a disc blur. Swap the model or drive the mask from "
+            "your own process via the engine's mask socket"
+        )
+        self.blur_scale.connect("value-changed", self._on_blur)
+        return row
+
+    def _on_blur(self, scale: Gtk.Scale) -> None:
+        self._set_value_text(self.blur_value, f"{scale.get_value():.2f}")
+        if self._suppress or not self._ready:
+            return
+        self._queue({"blur": round(scale.get_value(), 2)})
+
+    def _background_row(self) -> Gtk.Widget:
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        lbl = Gtk.Label(label="Backdrop", xalign=0)
+        lbl.add_css_class("dc-label")
+        lbl.set_size_request(64, -1)
+        row.append(lbl)
+
+        self.background_button = Gtk.Button(label="choose…")
+        self.background_button.add_css_class("dc-chip")
+        self.background_button.set_hexpand(True)
+        self.background_button.set_tooltip_text(
+            "Replace the background with an image (uses the same person "
+            "mask as blur)"
+        )
+        self.background_button.connect("clicked", self._on_background_choose)
+        row.append(self.background_button)
+
+        self.background_clear = Gtk.Button(label="×")
+        self.background_clear.add_css_class("dc-tiny")
+        self.background_clear.set_valign(Gtk.Align.CENTER)
+        self.background_clear.set_tooltip_text("Back to blur (or nothing)")
+        self.background_clear.connect("clicked", self._on_background_clear)
+        row.append(self.background_clear)
+        return row
+
+    def _on_background_choose(self, _btn) -> None:
+        dialog = Gtk.FileDialog()
+        dialog.set_title("Choose a background image")
+        png = Gtk.FileFilter()
+        png.set_name("PNG images")
+        png.add_mime_type("image/png")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(png)
+        dialog.set_filters(filters)
+        # No transient parent - see _on_overlay_choose.
+        dialog.open(None, None, self._on_background_chosen)
+
+    def _on_background_chosen(self, dialog, result) -> None:
+        try:
+            path = dialog.open_finish(result).get_path()
+        except Exception:
+            return  # cancelled
+        if not path:
+            return
+        _worker(
+            lambda: self.client.request(cmd="set_background", path=path),
+            self._on_result,
+        )
+
+    def _on_background_clear(self, _btn) -> None:
+        _worker(
+            lambda: self.client.request(cmd="set_background", path=None),
+            self._on_result,
+        )
 
     def _preset_row(self) -> Gtk.Widget:
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
@@ -990,6 +1065,12 @@ class Panel(Gtk.Box):
         pending, self._pending = self._pending, {}
         if not pending:
             return False
+        blur = pending.pop("blur", None)
+        if blur is not None:
+            _worker(
+                lambda: self.client.request(cmd="set_blur", strength=blur),
+                self._on_result,
+            )
         clahe = pending.pop("clahe", None)
         if clahe is not None:
             _worker(
@@ -1123,6 +1204,11 @@ class Panel(Gtk.Box):
         self.overlay_button.set_tooltip_text(overlay or "No overlay")
         self.overlay_clear.set_sensitive(bool(overlay))
         self.overlay_opacity.set_sensitive(bool(overlay))
+        background = st.get("background")
+        self.background_button.set_label(
+            Path(background).name if background else "choose\u2026"
+        )
+        self.background_clear.set_sensitive(bool(background))
 
         self._suppress = True
         try:
@@ -1138,6 +1224,7 @@ class Panel(Gtk.Box):
             self.overlay_opacity.set_value(float(st.get("overlay_opacity", 1.0)))
             self.zoom_scale.set_value(float(st.get("zoom", 1.0)))
             self.clahe_scale.set_value(float(st.get("clahe", 0.0)))
+            self.blur_scale.set_value(float(st.get("blur", 0.0)))
             self.strength.set_value(float(st.get("strength", 1.0)))
             controls = st.get("controls") or {}
             now = time.monotonic()

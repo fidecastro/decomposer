@@ -1,0 +1,4 @@
+selfie_segmentation.onnx — MediaPipe Selfie Segmentation (Google),
+Apache License 2.0. ONNX conversion via onnx-community
+(huggingface.co/onnx-community/mediapipe_selfie_segmentation). Preprocessing: 256x256, RGB rescaled by 1/255, no normalization.
+Input/output shapes are autodetected by the engine at load.

@@ -42,9 +42,17 @@ struct Params {
     /// CLAHE strength (0 = off) and clip limit.
     clahe: f32,
     clahe_clip: f32,
+    /// Background blur strength; mask_w == 0 means no mask yet, which
+    /// disables both blur and replacement regardless of the settings.
+    blur: f32,
+    mask_w: u32,
+    mask_h: u32,
+    /// Background image size; bg_w == 0 means blur, not replace.
+    bg_w: u32,
+    bg_h: u32,
     // WGSL rounds uniform structs up to 16 bytes; pad explicitly so the Rust
     // and shader layouts cannot silently disagree.
-    _pad: [u32; 2],
+    _pad: [u32; 1],
 }
 
 pub struct Gpu {
@@ -62,6 +70,8 @@ pub struct Gpu {
     lut_buf: wgpu::Buffer,
     clahe_hist: wgpu::Buffer,
     clahe_lut: wgpu::Buffer,
+    mask_buf: wgpu::Buffer,
+    bg_buf: wgpu::Buffer,
     staging: wgpu::Buffer,
     params: Params,
     size: u64,
@@ -102,7 +112,8 @@ impl Gpu {
             src_w, src_h,
             zoom: 1.0, pan_x: 0.0, pan_y: 0.0,
             clahe: 0.0, clahe_clip: 2.5,
-            _pad: [0; 2],
+            blur: 0.0, mask_w: 0, mask_h: 0, bg_w: 0, bg_h: 0,
+            _pad: [0; 1],
         };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -136,6 +147,18 @@ impl Gpu {
         let lut_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("lut"),
             contents: bytemuck::cast_slice(&[0f32; 4]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        // Placeholders: a storage binding cannot be empty. mask_w/bg_w of 0
+        // keep the shader from ever reading them.
+        let mask_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mask"),
+            contents: bytemuck::cast_slice(&[0u32]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let bg_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("background"),
+            contents: bytemuck::cast_slice(&[0u32]),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         // 8x8 tiles x 256 bins. WebGPU zero-initializes, which is exactly the
@@ -213,12 +236,24 @@ impl Gpu {
                     ty: storage(false),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: storage(true),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: storage(true),
+                    count: None,
+                },
             ],
         });
 
         let bind_group = make_bind_group(
             &device, &layout, &params_buf, &src_buf, &dst_buf, &overlay_buf,
-            &lut_buf, &clahe_hist, &clahe_lut,
+            &lut_buf, &clahe_hist, &clahe_lut, &mask_buf, &bg_buf,
         );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -244,6 +279,7 @@ impl Gpu {
             device, queue, pipeline, hist_pipeline, cdf_pipeline,
             bind_group, layout, params_buf, src_buf, dst_buf,
             overlay_buf, lut_buf, clahe_hist, clahe_lut,
+            mask_buf, bg_buf,
             staging, params, size, src_size,
             out: vec![0u8; size as usize], adapter_name,
         })
@@ -275,6 +311,7 @@ impl Gpu {
                         &self.device, &self.layout, &self.params_buf,
                         &self.src_buf, &self.dst_buf, &self.overlay_buf,
                         &self.lut_buf, &self.clahe_hist, &self.clahe_lut,
+                        &self.mask_buf, &self.bg_buf,
                     );
                 }
                 self.queue.write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(&l.data));
@@ -317,6 +354,7 @@ impl Gpu {
                         &self.device, &self.layout, &self.params_buf,
                         &self.src_buf, &self.dst_buf, &self.overlay_buf,
                         &self.lut_buf, &self.clahe_hist, &self.clahe_lut,
+                        &self.mask_buf, &self.bg_buf,
                     );
                 }
                 self.queue.write_buffer(
@@ -351,6 +389,75 @@ impl Gpu {
         self.params.pan_x = pan_x.clamp(-1.0, 1.0);
         self.params.pan_y = pan_y.clamp(-1.0, 1.0);
         self.upload_params();
+    }
+
+    /// Background blur strength. The heavy work only happens in the shader
+    /// when both blur > 0 and a mask has actually arrived.
+    pub fn set_blur(&mut self, blur: f32) {
+        self.params.blur = blur.clamp(0.0, 1.0);
+        self.upload_params();
+    }
+
+    /// Install a fresh person mask (u8, source-frame space).
+    pub fn set_mask(&mut self, mask: &[u8], w: u32, h: u32) {
+        let needed = (mask.len().div_ceil(4) * 4) as u64;
+        if self.mask_buf.size() < needed {
+            self.mask_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mask"),
+                size: needed,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.rebind();
+        }
+        let mut padded = mask.to_vec();
+        padded.resize(needed as usize, 0);
+        self.queue.write_buffer(&self.mask_buf, 0, &padded);
+        self.params.mask_w = w;
+        self.params.mask_h = h;
+        self.upload_params();
+    }
+
+    /// Replace the background with an image (pre-scaled to the output size),
+    /// or clear it with `None` to go back to blurring.
+    pub fn set_background(&mut self, bg: Option<&crate::overlay::Overlay>) {
+        match bg {
+            None => {
+                self.params.bg_w = 0;
+                self.params.bg_h = 0;
+            }
+            Some(img) if img.is_empty() => {
+                self.params.bg_w = 0;
+                self.params.bg_h = 0;
+            }
+            Some(img) => {
+                let needed = (img.pixels.len() * 4) as u64;
+                if self.bg_buf.size() < needed {
+                    self.bg_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("background"),
+                        size: needed,
+                        usage: wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    self.rebind();
+                }
+                self.queue
+                    .write_buffer(&self.bg_buf, 0, bytemuck::cast_slice(&img.pixels));
+                self.params.bg_w = img.width;
+                self.params.bg_h = img.height;
+            }
+        }
+        self.upload_params();
+    }
+
+    fn rebind(&mut self) {
+        self.bind_group = make_bind_group(
+            &self.device, &self.layout, &self.params_buf,
+            &self.src_buf, &self.dst_buf, &self.overlay_buf,
+            &self.lut_buf, &self.clahe_hist, &self.clahe_lut,
+            &self.mask_buf, &self.bg_buf,
+        );
     }
 
     fn upload_params(&mut self) {
@@ -410,6 +517,7 @@ impl Gpu {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_bind_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -420,6 +528,8 @@ fn make_bind_group(
     lut: &wgpu::Buffer,
     clahe_hist: &wgpu::Buffer,
     clahe_lut: &wgpu::Buffer,
+    mask: &wgpu::Buffer,
+    bg: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("look-bind"),
@@ -432,6 +542,8 @@ fn make_bind_group(
             wgpu::BindGroupEntry { binding: 4, resource: lut.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: clahe_hist.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 6, resource: clahe_lut.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: mask.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: bg.as_entire_binding() },
         ],
     })
 }

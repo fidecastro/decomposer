@@ -32,6 +32,12 @@ pub struct Config {
     pub pan_x: f32,
     pub pan_y: f32,
     pub clahe: f32,
+    /// Background blur strength (0 = off, and segmentation idles).
+    pub blur: f32,
+    /// Background replacement image; like the overlay, loading is a file
+    /// decode and must not run on every uniform tweak.
+    pub bg_path: Option<String>,
+    pub bg_dirty: bool,
 }
 
 pub type Shared = Arc<Mutex<Config>>;
@@ -54,6 +60,9 @@ pub fn shared(look: u32, name: String, strength: f32, flip: u32) -> Shared {
         pan_x: 0.0,
         pan_y: 0.0,
         clahe: 0.0,
+        blur: 0.0,
+        bg_path: None,
+        bg_dirty: false,
     }))
 }
 
@@ -152,6 +161,19 @@ pub fn apply_line(line: &str, state: &Shared) {
                 eprintln!("pan needs: x y");
                 false
             }
+        }
+        "blur" => match rest.parse::<f32>() {
+            Ok(v) => {
+                s.blur = v.clamp(0.0, 1.0);
+                s.dirty = true;
+                true
+            }
+            Err(_) => false,
+        },
+        "background" => {
+            s.bg_path = if rest == "off" { None } else { Some(rest.to_string()) };
+            s.bg_dirty = true;
+            true
         }
         "overlay-opacity" => match rest.parse::<f32>() {
             Ok(v) => {

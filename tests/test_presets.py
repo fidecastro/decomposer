@@ -60,3 +60,11 @@ def test_decode_survives_a_non_object():
     fields, notes = decode(["not", "a", "preset"])
     assert fields == {}
     assert notes
+
+
+def test_blur_and_background_decode():
+    fields, _ = decode({"blur": 1.7, "background": "/tmp/bg.png"})
+    assert fields["blur"] == 1.0
+    assert fields["background"] == "/tmp/bg.png"
+    fields, _ = decode({"blur": "junk", "background": 42})
+    assert "blur" not in fields and "background" not in fields

@@ -32,6 +32,8 @@ READY_TIMEOUT = 8.0
 
 class EngineHandle:
     def __init__(self, binary: str, control_path: Path, preview_path: Path):
+        # The mask socket lives beside the control socket: external mask
+        # producers (any framework) find it at a stable path.
         self._binary = binary
         self._control = control_path
         self._preview = preview_path
@@ -76,6 +78,7 @@ class EngineHandle:
             [self._binary]
             + engine_cli_args(config)
             + ["--control", str(self._control), "--preview", str(self._preview)]
+            + ["--mask-sock", str(self._control.with_name("mask.sock"))]
         )
         self._proc = subprocess.Popen(
             cmd,

@@ -155,11 +155,20 @@ class EngineConfig:
     pan_x: float = 0.0
     pan_y: float = 0.0
     clahe: float = 0.0
+    # Background effect: blur strength (0 = off) and replacement image.
+    blur: float = 0.0
+    background: Optional[str] = None
+    # Person segmentation: model file and device. The ONNX session is built
+    # at engine startup, so changing either restarts the engine; None means
+    # the engine's own default (the vendored MediaPipe model, on cpu).
+    seg_model: Optional[str] = None
+    seg_device: Optional[str] = None
 
     # Fields whose change cannot be applied over the control socket: the
     # engine has to be restarted for them. Everything else is a live update.
     RESTART_FIELDS = (
-        "input", "output", "width", "height", "in_width", "in_height", "lut_dir",
+        "input", "output", "width", "height", "in_width", "in_height",
+        "lut_dir", "seg_model", "seg_device",
     )
 
     def needs_restart_from(self, other: "EngineConfig") -> bool:
@@ -198,6 +207,14 @@ def engine_cli_args(config: EngineConfig) -> list:
         args += ["--clahe", str(config.clahe)]
     if config.pan_x or config.pan_y:
         args += ["--pan-x", str(config.pan_x), "--pan-y", str(config.pan_y)]
+    if config.blur > 0.0:
+        args += ["--blur", str(config.blur)]
+    if config.background:
+        args += ["--background", config.background]
+    if config.seg_model:
+        args += ["--seg-model", config.seg_model]
+    if config.seg_device:
+        args += ["--seg-device", config.seg_device]
     if config.lut_dir:
         args += ["--lut-dir", config.lut_dir]
     if config.overlay:
@@ -231,6 +248,10 @@ def engine_delta_lines(old: EngineConfig, new: EngineConfig) -> list:
         lines.append(f"pan {new.pan_x} {new.pan_y}")
     if new.clahe != old.clahe:
         lines.append(f"clahe {new.clahe}")
+    if new.blur != old.blur:
+        lines.append(f"blur {new.blur}")
+    if new.background != old.background:
+        lines.append(f"background {new.background or 'off'}")
     return lines
 
 

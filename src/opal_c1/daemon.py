@@ -134,6 +134,8 @@ class State:
     height: int = 1080
     output: str = "/dev/video10"
     overlay: Optional[str] = None
+    blur: float = 0.0
+    background: Optional[str] = None
     overlay_x: int = 0
     overlay_y: int = 0
     overlay_w: int = 0
@@ -163,6 +165,7 @@ class Daemon:
         tray_enabled: bool = False,
         default_strength: float = DEFAULT_STRENGTH,
         in_width: int = 0, in_height: int = 0,
+        seg_model: Optional[str] = None, seg_device: Optional[str] = None,
     ):
         self.state = State(
             output=output, width=width, height=height,
@@ -186,6 +189,9 @@ class Daemon:
         # Studio engine restart, silently resetting to defaults otherwise.
         self._backend = None
         self._sticky: dict = {}
+        # Segmentation choices are engine-startup facts, not live state.
+        self.seg_model = seg_model
+        self.seg_device = seg_device
         self._shutdown = threading.Event()
         # Set by the USB hotplug watcher; interrupts supervisor holds so a
         # replug recovers in seconds instead of riding out a blind wait.
@@ -242,6 +248,8 @@ class Daemon:
             in_width=st.in_width, in_height=st.in_height,
             zoom=st.zoom, pan_x=st.pan_x, pan_y=st.pan_y,
             clahe=st.clahe,
+            blur=st.blur, background=st.background,
+            seg_model=self.seg_model, seg_device=self.seg_device,
             lut_dir=str(lut_dir()) if lut_dir() else None,
         )
 
@@ -291,6 +299,7 @@ class Daemon:
                 overlay_opacity=st.overlay_opacity,
                 zoom=st.zoom, pan_x=st.pan_x, pan_y=st.pan_y,
                 clahe=st.clahe,
+                blur=st.blur, background=st.background,
             )
         with suppress(Exception):
             engine.apply_live(**live)
@@ -620,6 +629,28 @@ class Daemon:
         self._sync_engine()
         return self.status()
 
+    def set_blur(self, strength) -> dict:
+        """Background blur. Needs a mask, so the first frames after enabling
+        may pass through unblurred while segmentation warms up."""
+        with self.lock:
+            self.state.blur = max(0.0, min(1.0, float(strength)))
+        self._sync_engine()
+        return self.status()
+
+    def set_background(self, path=None) -> dict:
+        """Replace the background with an image, or None to go back to blur
+        (or to nothing, if blur is 0)."""
+        with self.lock:
+            if path is None:
+                self.state.background = None
+            else:
+                resolved = Path(path).expanduser().resolve()
+                if not resolved.is_file():
+                    raise FileNotFoundError(f"no such background image: {resolved}")
+                self.state.background = str(resolved)
+        self._sync_engine()
+        return self.status()
+
     def set_camera(self, **kw) -> dict:
         """Apply camera controls through the current mode's backend.
 
@@ -678,6 +709,8 @@ class Daemon:
                 "pan_x": st.pan_x,
                 "pan_y": st.pan_y,
                 "clahe": st.clahe,
+                "blur": st.blur,
+                "background": st.background,
                 "overlay": {
                     "path": st.overlay,
                     "x": st.overlay_x, "y": st.overlay_y,
@@ -723,6 +756,12 @@ class Daemon:
         self.set_zoom(data.get("zoom"), data.get("pan_x"), data.get("pan_y"))
         if data.get("clahe") is not None:
             self.set_clahe(data["clahe"])
+        if data.get("blur") is not None:
+            self.set_blur(data["blur"])
+        try:
+            self.set_background(data.get("background"))
+        except FileNotFoundError as e:
+            notes.append(f"background skipped: {e}")
 
         ov = data.get("overlay") or {}
         try:
@@ -1087,6 +1126,10 @@ class Daemon:
                 return {"ok": True, "presets": self.list_presets()}
             if cmd == "preset_delete":
                 return {"ok": True, **self.delete_preset(req["name"])}
+            if cmd == "set_blur":
+                return {"ok": True, **self.set_blur(req.get("strength", 0.0))}
+            if cmd == "set_background":
+                return {"ok": True, **self.set_background(req.get("path"))}
             if cmd == "set_overlay":
                 return {"ok": True, **self.set_overlay(**req.get("values", {}))}
             if cmd == "set_resolution":
