@@ -1279,6 +1279,11 @@ class Panel(Gtk.Box):
                 s.set_sensitive(False)
             return False
         self.footer.remove_css_class("dc-warn")
+        refused = resp.get("refused") or {}
+        if refused:
+            # ok:True with refusals is routing truth ("effect needs Studio
+            # mode"), and silence here is what reads as a dead control.
+            self._flash("; ".join(refused.values()), 6.0)
         self.status = resp
         self._apply(resp)
         return False
@@ -1294,6 +1299,11 @@ class Panel(Gtk.Box):
         self.mode_pill.add_css_class(mode if mode in ("call", "studio") else "off")
         self.mode_hint.set_text("")
         self._update_mic_chip(studio)
+        self.effect_drop.set_sensitive(studio)
+        self.effect_label.set_opacity(1.0 if studio else 0.4)
+        self.effect_drop.set_tooltip_text(
+            None if studio else "Effects are an XLink control: Studio mode only"
+        )
 
         for axis, key in (("horizontal", "mirror_h"), ("vertical", "mirror_v")):
             b = self.mirror_buttons[axis]
@@ -1359,6 +1369,9 @@ class Panel(Gtk.Box):
             self.zoom_scale.set_value(float(st.get("zoom", 1.0)))
             self.clahe_scale.set_value(float(st.get("clahe", 0.0)))
             self.blur_scale.set_value(float(st.get("blur", 0.0)))
+            effect = (st.get("controls") or {}).get("effect", "off")
+            if effect in EFFECTS:
+                self.effect_drop.set_selected(EFFECTS.index(effect))
             self.strength.set_value(float(st.get("strength", 1.0)))
             controls = st.get("controls") or {}
             now = time.monotonic()

@@ -194,6 +194,19 @@ fn main() -> Result<()> {
     }
     let mut applied_look = String::new();
 
+    // File loads (LUT, overlay, background) run off-thread: a slow disk
+    // must be a late look, never a frame hitch. Generations guard against
+    // a stale load overtaking a newer request.
+    enum Loaded {
+        Lut(u64, Option<lut::Lut>),
+        Overlay(u64, Option<overlay::Overlay>),
+        Bg(u64, Option<overlay::Overlay>),
+    }
+    let (load_tx, load_rx) = std::sync::mpsc::channel::<Loaded>();
+    let mut lut_gen = 0u64;
+    let mut ov_gen = 0u64;
+    let mut bg_gen = 0u64;
+
     let mut engine = if args.passthrough {
         eprintln!("look   passthrough");
         None
@@ -272,12 +285,21 @@ fn main() -> Result<()> {
         specs.push(chain::Spec::parse(arg)?);
     }
     let seg_model = args.seg_model.clone().or_else(|| {
-        std::env::current_exe().ok().and_then(|exe| {
-            exe.ancestors()
-                .map(|a| a.join("models/selfie_segmentation.onnx"))
-                .find(|p| p.is_file())
-                .map(|p| p.display().to_string())
-        })
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| {
+                exe.ancestors()
+                    .map(|a| a.join("models/selfie_segmentation.onnx"))
+                    .find(|p| p.is_file())
+            })
+            .or_else(|| {
+                // The packaged install keeps the model in /usr/share.
+                let sys = std::path::PathBuf::from(
+                    "/usr/share/decomposer/models/selfie_segmentation.onnx",
+                );
+                sys.is_file().then_some(sys)
+            })
+            .map(|p| p.display().to_string())
     });
     let mut model_chain = if engine.is_some() {
         match chain::Chain::start(&specs) {
@@ -344,29 +366,35 @@ fn main() -> Result<()> {
                 // so only touch it when the name actually changes.
                 if name != applied_look {
                     applied_look = name.clone();
-                    let loaded = match (&lut_dir, name.as_str()) {
-                        (_, "none") => None,
-                        (Some(dir), n) => lut::find(dir, n).and_then(|p| match lut::load(&p) {
-                            Ok(l) => {
-                                eprintln!("look  {n} from {}", p.display());
-                                Some(l)
+                    lut_gen += 1;
+                    let gen = lut_gen;
+                    let dir = lut_dir.clone();
+                    let tx = load_tx.clone();
+                    std::thread::spawn(move || {
+                        let loaded = match (&dir, name.as_str()) {
+                            (_, "none") => None,
+                            (Some(dir), n) => {
+                                lut::find(dir, n).and_then(|p| match lut::load(&p) {
+                                    Ok(l) => {
+                                        eprintln!("look  {n} from {}", p.display());
+                                        Some(l)
+                                    }
+                                    Err(e) => {
+                                        eprintln!("lut: {e:#}");
+                                        None
+                                    }
+                                })
                             }
-                            Err(e) => {
-                                eprintln!("lut: {e:#}");
-                                None
-                            }
-                        }),
-                        _ => None,
-                    };
-                    match loaded {
-                        Some(l) => g.set_lut(Some(&l)),
-                        None => {
-                            g.set_lut(None);
-                            if name != "none" && gpu::look_index(&name).is_none() {
-                                eprintln!("unknown look {name:?}");
-                            }
+                            _ => None,
+                        };
+                        if loaded.is_none()
+                            && name != "none"
+                            && gpu::look_index(&name).is_none()
+                        {
+                            eprintln!("unknown look {name:?}");
                         }
-                    }
+                        let _ = tx.send(Loaded::Lut(gen, loaded));
+                    });
                 }
             }
 
@@ -392,28 +420,80 @@ fn main() -> Result<()> {
                 })
             };
             if let Some(change) = bg_change {
+                bg_gen += 1;
+                let gen = bg_gen;
                 match change {
+                    // Clearing needs no IO: apply now, and the generation
+                    // bump discards any load still in flight.
                     None => g.set_background(None),
-                    Some(p) => match overlay::load(&p, out_w, out_h) {
-                        Ok(img) => {
-                            eprintln!("background {p} {}x{}", img.width, img.height);
-                            g.set_background(Some(&img));
-                        }
-                        Err(e) => eprintln!("background: {e:#}"),
-                    },
+                    Some(p) => {
+                        let tx = load_tx.clone();
+                        std::thread::spawn(move || {
+                            let img = match overlay::load(&p, out_w, out_h) {
+                                Ok(img) => {
+                                    eprintln!(
+                                        "background {p} {}x{}",
+                                        img.width, img.height
+                                    );
+                                    Some(img)
+                                }
+                                Err(e) => {
+                                    eprintln!("background: {e:#}");
+                                    None
+                                }
+                            };
+                            let _ = tx.send(Loaded::Bg(gen, img));
+                        });
+                    }
                 }
             }
 
             if let Some((path, ox, oy, mw, mh, opacity)) = overlay_change {
+                ov_gen += 1;
+                let gen = ov_gen;
                 match path {
                     None => g.set_overlay(None, 0, 0, 1.0),
-                    Some(p) => match overlay::load(&p, mw, mh) {
-                        Ok(img) => {
-                            eprintln!("overlay {p} {}x{} at {ox},{oy}", img.width, img.height);
-                            g.set_overlay(Some(&img), ox, oy, opacity);
-                        }
-                        Err(e) => eprintln!("overlay: {e:#}"),
-                    },
+                    Some(p) => {
+                        let tx = load_tx.clone();
+                        std::thread::spawn(move || {
+                            let img = match overlay::load(&p, mw, mh) {
+                                Ok(img) => {
+                                    eprintln!(
+                                        "overlay {p} {}x{} at {ox},{oy}",
+                                        img.width, img.height
+                                    );
+                                    Some(img)
+                                }
+                                Err(e) => {
+                                    eprintln!("overlay: {e:#}");
+                                    None
+                                }
+                            };
+                            let _ = tx.send(Loaded::Overlay(gen, img));
+                        });
+                    }
+                }
+                let _ = (opacity,); // placement is re-read at apply time
+            }
+
+            // Finished loads land between frames; a stale generation means a
+            // newer request superseded this one while it was reading disk.
+            while let Ok(done) = load_rx.try_recv() {
+                match done {
+                    Loaded::Lut(gen, loaded) if gen == lut_gen => {
+                        g.set_lut(loaded.as_ref());
+                    }
+                    Loaded::Overlay(gen, img) if gen == ov_gen => {
+                        let (ox, oy, opacity) = {
+                            let st = look_state.lock().unwrap();
+                            (st.overlay_x, st.overlay_y, st.overlay_opacity)
+                        };
+                        g.set_overlay(img.as_ref(), ox, oy, opacity);
+                    }
+                    Loaded::Bg(gen, img) if gen == bg_gen => {
+                        g.set_background(img.as_ref());
+                    }
+                    _ => {}
                 }
             }
         }

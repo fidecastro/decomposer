@@ -52,8 +52,10 @@ CUSTOM_LOOKS = ["G1", "D1", "Q1", "S1", "X1"]
 def lut_dir() -> Optional[Path]:
     """Where the extracted .cube LUTs live, if they are installed."""
     here = Path(__file__).resolve().parents[2]
-    candidate = here / "luts"
-    return candidate if candidate.is_dir() else None
+    for candidate in (here / "luts", Path("/usr/share/decomposer/luts")):
+        if candidate.is_dir():
+            return candidate
+    return None
 
 
 def available_looks() -> list[str]:
@@ -781,13 +783,6 @@ class Daemon:
         # The pure codec normalizes: unknown fields dropped, out-of-range
         # values clamped, and every such repair reported rather than silent.
         data, notes = preset_codec.decode(json.loads(path.read_text()))
-        if with_mode and data.get("mode") and data["mode"] != self.state.mode:
-            self.set_mode(data["mode"])
-        elif data.get("mode") and data["mode"] != self.state.mode:
-            notes.append(
-                f"saved in {data['mode']} mode; still in {self.state.mode}"
-                " (pass with_mode to switch)"
-            )
 
         with self.lock:
             self.state.look_strength.update(data.get("look_strength") or {})
@@ -814,6 +809,26 @@ class Daemon:
             )
         except FileNotFoundError as e:
             notes.append(f"overlay skipped: {e}")
+
+        # The mode switch comes AFTER the engine-side settings and BEFORE
+        # the camera controls: the settings above apply in any mode, so a
+        # switch that fails must not cost them - while the controls below
+        # depend on which firmware ends up running, so they wait until the
+        # mode question is settled either way.
+        if data.get("mode") and data["mode"] != self.state.mode:
+            if with_mode:
+                try:
+                    self.set_mode(data["mode"])
+                except Exception as e:
+                    notes.append(
+                        f"mode switch to {data['mode']} failed ({e}); "
+                        f"settings applied in {self.state.mode}"
+                    )
+            else:
+                notes.append(
+                    f"saved in {data['mode']} mode; still in {self.state.mode}"
+                    " (pass with_mode to switch)"
+                )
 
         controls = data.get("controls") or {}
         if controls:

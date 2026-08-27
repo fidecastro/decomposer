@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from contextlib import suppress
 from pathlib import Path
@@ -702,6 +703,126 @@ def _cmd_resolution(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_doctor(_args: argparse.Namespace) -> int:
+    """Check every piece of the stack and say which one is missing."""
+    import ctypes.util
+    import shutil as _shutil
+    from opal_c1.daemon import find_engine, lut_dir
+
+    problems = 0
+
+    def check(ok, label, detail="", hint=""):
+        nonlocal problems
+        mark = "\u2713" if ok else "\u2717"
+        print(f"  {mark} {label}" + (f"  {detail}" if detail else ""))
+        if not ok:
+            problems += 1
+            if hint:
+                print(f"      \u21b3 {hint}")
+
+    engine = find_engine()
+    check(engine is not None, "engine binary", engine or "",
+          "cargo build --release in engine/, or install the package")
+
+    luts = lut_dir()
+    n_luts = len(list(luts.glob("*.cube"))) if luts else 0
+    check(n_luts > 0, "LUTs", f"{n_luts} in {luts}" if luts else "",
+          "the luts/ directory ships with the repo")
+
+    model = None
+    if engine:
+        for parent in Path(engine).resolve().parents:
+            candidate = parent / "models/selfie_segmentation.onnx"
+            if candidate.is_file():
+                model = candidate
+                break
+    check(model is not None, "person-segmentation model", str(model or ""),
+          "models/selfie_segmentation.onnx ships with the repo")
+
+    loop = Path("/dev/video10")
+    check(loop.exists(), "v4l2loopback node", str(loop),
+          "sudo cp packaging/v4l2loopback*.conf /etc/modprobe.d/ "
+          "&& sudo modprobe v4l2loopback")
+    caps = Path("/sys/module/v4l2loopback/parameters/exclusive_caps")
+    # The parameter prints as a bool array ("Y,N,N,..."), one slot per
+    # possible device; ours is the first.
+    caps_ok = caps.is_file() and caps.read_text().strip().split(",")[0] in ("Y", "1")
+    check(caps_ok, "exclusive_caps",
+          "", "apps only see the camera when the engine publishes; "
+          "set exclusive_caps=1 (packaging/v4l2loopback.conf)")
+
+    rules = Path("/etc/udev/rules.d/60-opal-c1.rules")
+    check(rules.is_file(), "udev rules", str(rules),
+          "sudo cp packaging/60-opal-c1.rules /etc/udev/rules.d/ "
+          "&& sudo udevadm control --reload")
+
+    camera = None
+    for dev in Path("/sys/bus/usb/devices").glob("*"):
+        vid = dev / "idVendor"
+        if vid.is_file() and vid.read_text().strip() == "03e7":
+            camera = (dev / "idProduct").read_text().strip()
+            break
+    labels = {"f63d": "Call firmware", "f63b": "Studio firmware",
+              "f63c": "bootloader (transitional)"}
+    check(camera is not None, "camera on USB",
+          labels.get(camera, camera or ""),
+          "plug the Opal C1 into a USB 3 port")
+
+    quirks = Path("/sys/module/usbcore/parameters/quirks")
+    quirk_ok = quirks.is_file() and "03e7:f63d" in quirks.read_text()
+    check(quirk_ok, "USB NO_LPM quirk", "",
+          "optional but recommended: sudo cp packaging/decomposer-usb.conf "
+          "/etc/tmpfiles.d/ && sudo systemd-tmpfiles --create")
+
+    layer = ctypes.util.find_library("gtk4-layer-shell")
+    check(layer is not None, "gtk4-layer-shell", layer or "",
+          "install gtk4-layer-shell for the panel")
+
+    check(_shutil.which("pactl") is not None, "pactl (mic checks)", "",
+          "optional: libpulse gives the panel its default-mic warning")
+
+    resp = _client_call(cmd="status")
+    if resp.get("ok"):
+        check(True, "daemon", f"{resp.get('mode')} mode, engine "
+              + ("running" if resp.get("engine_alive") else "stopped"))
+    else:
+        check(False, "daemon", "", "start it: decomposer daemon "
+              "(or decomposer install-service)")
+
+    print()
+    if problems:
+        print(f"  {problems} problem(s) found")
+        return 1
+    print("  everything looks healthy")
+    return 0
+
+
+def _cmd_install_service(_args: argparse.Namespace) -> int:
+    """Install a systemd user service, resolved to this executable."""
+    exe = Path(sys.argv[0]).resolve()
+    if not exe.is_file():
+        exe = Path(sys.executable).resolve()
+    unit = f"""[Unit]
+Description=decomposer camera daemon (Opal C1)
+After=graphical-session.target
+
+[Service]
+ExecStart={exe} daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    path = Path(base) / "systemd/user/decomposer.service"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(unit)
+    print(f"  wrote {path}")
+    print("  enable with: systemctl --user enable --now decomposer")
+    return 0
+
+
 def _print_models(models: list) -> None:
     if not models:
         print("  (no models in the chain; the bundled person model still "
@@ -987,6 +1108,18 @@ def build_parser() -> argparse.ArgumentParser:
              "if the CUDA runtime is missing)",
     )
     dm.set_defaults(func=_cmd_daemon)
+
+    dr = sub.add_parser(
+        "doctor",
+        help="Check the whole stack and say what is missing",
+    )
+    dr.set_defaults(func=_cmd_doctor)
+
+    isv = sub.add_parser(
+        "install-service",
+        help="Install a systemd user service for the daemon",
+    )
+    isv.set_defaults(func=_cmd_install_service)
 
     idt = sub.add_parser(
         "install-desktop",

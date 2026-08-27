@@ -314,6 +314,13 @@ Or bypass ONNX entirely — connect to the engine's `mask.sock`, send
 process in any framework; the internal model yields while you're connected.
 See docs/background-blur.md.
 
+**Health check**: `decomposer doctor` walks the whole stack — engine,
+LUTs, model, loopback module, udev rules, USB quirk, camera presence,
+layer-shell, daemon — and says exactly which piece is missing and how to
+fix it. `decomposer install-service` writes a systemd user unit
+(`systemctl --user enable --now decomposer`), and `packaging/PKGBUILD` is
+a starting point for an Arch package.
+
 A **MIC chip** in the mode row tells the audio truth: green when the C1's
 microphone card is actually registered (Call mode), dimmed when it does not
 exist (Studio firmware has no audio at all — a hardware fact, not a setting).

@@ -1,0 +1,52 @@
+# Maintainer: Felipe Infante de Castro
+#
+# Starting point for an AUR package. Build tested from a local checkout;
+# adjust url/source when publishing.
+pkgname=decomposer-git
+pkgver=r1
+pkgrel=1
+pkgdesc="Linux software for the Opal C1 webcam: GPU looks, background blur, virtual camera, Omarchy panel"
+arch=(x86_64)
+url="https://github.com/fidecastro/decomposer"
+license=(MIT)
+depends=(gtk4 libadwaita gtk4-layer-shell python-gobject python v4l2loopback-dkms)
+optdepends=(
+  'libpulse: default-mic warning in the panel'
+  'pipewire: audio stack the mic integrates with'
+)
+makedepends=(cargo git python-build python-installer python-wheel python-setuptools)
+source=("$pkgname::git+$url")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$pkgname"
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd "$pkgname"
+  (cd engine && cargo build --release --locked)
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "$pkgname"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm755 engine/target/release/decomposer-engine \
+    "$pkgdir/usr/bin/decomposer-engine"
+  install -Dm644 models/selfie_segmentation.onnx \
+    "$pkgdir/usr/share/decomposer/models/selfie_segmentation.onnx"
+  install -Dm644 models/NOTICE "$pkgdir/usr/share/decomposer/models/NOTICE"
+  install -dm755 "$pkgdir/usr/share/decomposer/luts"
+  install -m644 luts/*.cube "$pkgdir/usr/share/decomposer/luts/"
+  install -Dm644 packaging/60-opal-c1.rules \
+    "$pkgdir/usr/lib/udev/rules.d/60-opal-c1.rules"
+  install -Dm644 packaging/v4l2loopback.conf \
+    "$pkgdir/usr/lib/modprobe.d/decomposer.conf"
+  install -Dm644 packaging/v4l2loopback-load.conf \
+    "$pkgdir/usr/lib/modules-load.d/decomposer.conf"
+  install -Dm644 packaging/decomposer-usb.conf \
+    "$pkgdir/usr/lib/tmpfiles.d/decomposer-usb.conf"
+  install -Dm644 packaging/decomposer.desktop \
+    "$pkgdir/usr/share/applications/decomposer.desktop"
+}
