@@ -841,6 +841,11 @@ class Daemon:
                     self._preview_frame_len = w * h * 3
                 if self._recv_exact(sock, self._preview_frame_len) is not None:
                     frames += 1
+                    # Frames flowing is the arrival the notice promised, in
+                    # either mode - state.frames only counts in Studio.
+                    if self.state.notice:
+                        with self.lock:
+                            self.state.notice = None
                 else:
                     sock = drop(sock)
             except OSError:

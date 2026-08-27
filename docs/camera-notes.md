@@ -490,3 +490,37 @@ always clear the degraded state; a 2-3 minute powerless rest did.
 Practical guidance until the daemon enforces it: avoid rapid mode switching -
 every switch is a firmware reboot and churn is what gets the device into this
 state. If Call mode keeps dying, Studio mode remains usable.
+
+## 2026-08-27: the Call-mode crash, investigated to ground truth
+
+Symptom: Opal firmware (f63d) dies ~11s into streaming, reboots via
+bootloader, repeats. Believed to be a "degraded state" cured by minutes of
+power-off — until a 15-minute power-off cured nothing, which pointed at the
+host. Controlled experiments that day:
+
+- **WirePlumber exonerated twice.** With `systemctl --user stop wireplumber`
+  and only our engine holding the node (verified via fuser), the crash
+  cadence continued unchanged. Later, a stable session survived
+  WirePlumber's return.
+- **USB3 LPM inconclusive but plausible.** `usbcore.quirks=03e7:f63d:k`
+  (NO_LPM, runtime-writable via /sys/module/usbcore/parameters/quirks,
+  binds only on a genuine plug event — usbfs USBDEVFS_RESET does *not*
+  re-run quirk detection). A quirked boot streamed indefinitely — but so
+  did one unquirked boot, so the quirk proves nothing on its own. Kept
+  anyway (packaging/decomposer-usb.conf, tmpfiles.d): Myriad X is
+  documented to misbehave under U1/U2, and the quirk is harmless.
+- **Ground truth: each f63d boot is a coin toss.** Observed lifetimes in
+  one hour: 1s, 3s, 13s, 32s, 51s — then a boot that streamed 17.5 minutes
+  until manually unplugged, followed by another stable one. A bad boot
+  dies shortly after streaming starts (kernel: `xhci WARN Set TR Deq Ptr
+  cmd failed` then ENODEV, device falls to f63c bootloader on the USB2
+  bus); a good boot stays good. Nothing on the host distinguishes them.
+  The supervisor's retry loop is the correct medicine: keep re-entering
+  Call until the firmware wins its toss (typically under a minute).
+
+Two daemon consequences, both fixed: the crash cycle emits a uevent *add*
+per reboot, indistinguishable from a human replug, so `on_replug` must not
+reset `short_lives` (it would defeat the sick-hold forever); and
+`state.frames` counts only in Studio (the Call engine reads V4L2 itself),
+so anything gated on it — the arrival notice — must key off the preview
+watchdog's frame progress instead.

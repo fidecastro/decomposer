@@ -85,12 +85,17 @@ class EnginePolicy:
         self.failures = 0
 
     def on_replug(self) -> None:
-        """The camera was physically reconnected: everything the counters
-        learned described the old connection. Start clean."""
+        """The camera reappeared on the bus: retry promptly.
+
+        Clears absence and backoff, but NOT short_lives: the crash-reboot
+        cycle produces an add event per reboot, indistinguishable from a
+        human replugging the cable. Resetting short_lives here would let
+        those events defeat the sick-hold forever, churning the hardware.
+        A genuinely cured camera clears the counter the honest way - by
+        streaming longer than SHORT_LIFE_SECONDS."""
         self.backoff = 0.0
         self.failures = 0
         self.vanished = 0
-        self.short_lives = 0
 
     def on_death(self, mode: Mode, uptime: float, camera_on_bus: bool) -> Action:
         """The engine is dead (or never started). What now?"""
