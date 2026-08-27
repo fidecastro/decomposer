@@ -18,7 +18,7 @@ blur, the frame rates the sensor could always do but was never asked to.
 It gives the camera the second life it deserves.
 
 <p align="center">
-  <img src="docs/img/desktop.png" width="900" alt="decomposer on an Omarchy desktop: the panel dropped from the bar, over the tiling">
+  <img src="docs/img/desktop-2.png" width="900" alt="decomposer on an Omarchy desktop: the panel dropped from the bar, over the tiling">
 </p>
 
 It is built for [Omarchy](https://omarchy.org). The panel drops from the
