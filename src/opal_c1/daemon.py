@@ -290,7 +290,13 @@ class Daemon:
             clahe=st.clahe,
             blur=st.blur, blur_style=st.blur_style,
             background=st.background,
-            seg_model=self.seg_model, seg_device=self.seg_device,
+            seg_model=self.seg_model,
+            # "auto"/"camera" are daemon-side placements; the engine's flag
+            # only knows host devices, and its bundled model stays as the
+            # fallback that yields whenever camera masks flow.
+            seg_device=(
+                self.seg_device if self.seg_device in ("cpu", "cuda") else None
+            ),
             models=tuple(
                 (m["path"], m["device"])
                 for m in st.models if not m.get("missing")
@@ -413,6 +419,11 @@ class Daemon:
         source = self._backend
         assert isinstance(source, FrameSource), "pump started without a frame source"
         stdin = self._engine.stdin if self._engine else None
+        # On-VPU masks ride the engine's external-producer port. The engine
+        # then treats the camera exactly like any other mask client: its
+        # bundled host model yields, user models merge.
+        mask_sock: Optional[socket.socket] = None
+        read_mask = getattr(source, "try_read_mask", lambda: None)
         try:
             while not self._pump_stop.is_set() and stdin is not None:
                 frame = source.try_read_frame()
@@ -423,11 +434,37 @@ class Daemon:
                 stdin.write(frame.nv12())
                 with self.lock:
                     self.state.frames += 1
+                mask = read_mask()
+                if mask is not None:
+                    data, w, h = mask
+                    try:
+                        if mask_sock is None:
+                            mask_sock = socket.socket(socket.AF_UNIX)
+                            mask_sock.settimeout(1.0)
+                            mask_sock.connect(
+                                str(runtime_dir() / "mask.sock")
+                            )
+                            mask_sock.sendall(
+                                w.to_bytes(4, "little")
+                                + h.to_bytes(4, "little")
+                            )
+                        mask_sock.sendall(data)
+                    except OSError:
+                        # Engine restarting or socket gone: drop and retry
+                        # on a later frame. Masks are advisory, frames are not.
+                        with suppress(Exception):
+                            if mask_sock is not None:
+                                mask_sock.close()
+                        mask_sock = None
         except (BrokenPipeError, ValueError, OSError):
             pass
         except Exception as e:  # surface, do not die silently
             with self.lock:
                 self.state.error = f"pump: {e}"
+        finally:
+            with suppress(Exception):
+                if mask_sock is not None:
+                    mask_sock.close()
 
     # -- modes ----------------------------------------------------------
 
@@ -525,6 +562,10 @@ class Daemon:
             width=self.state.in_width or self.state.width,
             height=self.state.in_height or self.state.height,
             fps=self.fps,
+            # The camera's own VPU carries the default person mask unless
+            # the user pinned segmentation to the host. User ONNX models
+            # keep running host-side either way and merge with it.
+            mask_model=self.seg_device in (None, "auto", "camera"),
         )
         backend.attach()
         self._backend = backend

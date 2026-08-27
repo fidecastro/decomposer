@@ -120,10 +120,19 @@ class OpalDevice:
     Use as a context manager. While open, /dev/video0 will not exist.
     """
 
-    def __init__(self, width: int = 1920, height: int = 1080, fps: float = 30.0):
+    def __init__(
+        self, width: int = 1920, height: int = 1080, fps: float = 30.0,
+        mask_model: bool = False,
+    ):
         self.width = width
         self.height = height
         self.fps = fps
+        # Person segmentation on the camera's own VPU: the Myriad X is a
+        # neural accelerator, and in Studio mode it can carry the default
+        # mask model so the host does not have to.
+        self.mask_model = mask_model
+        self.mask_size: Optional[tuple] = None
+        self._mask_queue = None
         self._device: Optional[dai.Device] = None
         self._pipeline: Optional[dai.Pipeline] = None
         self._queue = None
@@ -155,6 +164,26 @@ class OpalDevice:
             (self.width, self.height), dai.ImgFrame.Type.NV12, fps=self.fps
         )
         self._queue = out.createOutputQueue(maxSize=4, blocking=False)
+        if self.mask_model:
+            try:
+                desc = dai.NNModelDescription(
+                    "luxonis/mediapipe-selfie-segmentation"
+                )
+                desc.platform = "RVC2"
+                archive = dai.NNArchive(
+                    dai.getModelFromZoo(desc, progressFormat="none")
+                )
+                nn = self._pipeline.create(dai.node.NeuralNetwork).build(
+                    cam, archive
+                )
+                self._mask_queue = nn.out.createOutputQueue(
+                    maxSize=2, blocking=False
+                )
+            except Exception as e:
+                # No network, no cached model, or an RVC2 refusal: the host
+                # fallback takes over, and this is a log line, not a failure.
+                print(f"on-camera mask model unavailable: {e}")
+                self._mask_queue = None
         self._control = cam.inputControl.createInputQueue()
         self._pipeline.start()
         # Anti-banding from the first frame: at rates that do not divide the
@@ -165,6 +194,25 @@ class OpalDevice:
         ctrl.setAntiBandingMode(dai.CameraControl.AntiBandingMode.AUTO)
         self._control.send(ctrl)
         return self
+
+    def try_read_mask(self):
+        """Latest person mask from the on-camera model, as (bytes, w, h).
+
+        The VPU's output is a float plane; values outside [0,1] are treated
+        as logits, the same heuristic the host runner uses."""
+        if self._mask_queue is None:
+            return None
+        msg = self._mask_queue.tryGet()
+        if msg is None:
+            return None
+        arr = np.array(msg.getFirstTensor()).astype(np.float32).reshape(-1)
+        h, w = msg.getFirstTensor().shape[-2], msg.getFirstTensor().shape[-1]
+        arr = arr[: w * h]
+        if arr.size and (arr.min() < -0.001 or arr.max() > 1.001):
+            arr = 1.0 / (1.0 + np.exp(-arr))
+        data = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8).tobytes()
+        self.mask_size = (int(w), int(h))
+        return (data, int(w), int(h))
 
     def close(self) -> None:
         if self._pipeline is not None:

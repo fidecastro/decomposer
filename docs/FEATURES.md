@@ -62,6 +62,12 @@ model loads):
   the image.
 - The chain persists across restarts; a missing model file is flagged
   and bypassed, and returns when the file does.
+- In Studio mode the **default person mask runs on the camera's own
+  Myriad X** — the neural engine Opal shipped and never let you use.
+  The host's bundled model yields to it automatically; your added
+  models keep running host-side and merge with it. `--seg-device`
+  chooses: `auto` (camera in Studio, CPU otherwise), `cpu`, `cuda`, or
+  `camera`.
 - Or skip ONNX entirely: any process can push masks into the engine's
   `mask.sock` (u32 width, u32 height, then raw u8 frames). The internal
   model yields while you're connected.

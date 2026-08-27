@@ -35,6 +35,10 @@ pub struct Spec {
     pub path: String,
     pub device: String,
     pub strength: f32,
+    /// The bundled fallback person model. Only default runners yield to an
+    /// external mask producer (the mask socket, or the camera's own VPU);
+    /// user-added mask models keep contributing and merge with it.
+    pub is_default: bool,
 }
 
 impl Spec {
@@ -60,12 +64,13 @@ impl Spec {
         if path.is_empty() {
             bail!("empty model path in {arg:?}");
         }
-        Ok(Self { path, device, strength })
+        Ok(Self { path, device, strength, is_default: false })
     }
 }
 
 struct Runner {
     kind: Kind,
+    is_default: bool,
     in_w: u32,
     in_h: u32,
     /// f32 bits; live-updatable over the control socket.
@@ -154,7 +159,7 @@ impl Chain {
             Kind::Mask => {
                 strength > 0.0
                     && self.mask_wanted.load(Ordering::Relaxed)
-                    && !self.external.load(Ordering::Relaxed)
+                    && !(r.is_default && self.external.load(Ordering::Relaxed))
             }
             Kind::Filter => strength > 0.0,
         }
@@ -265,6 +270,25 @@ impl Chain {
     }
 }
 
+/// Union of two person masks: resample to the larger grid, take the max.
+pub fn merge_masks(a: Mask, b: Mask) -> Mask {
+    let (w, h) = (a.width.max(b.width), a.height.max(b.height));
+    let px = (w * h) as usize;
+    let mut out = vec![0u8; px];
+    for src in [&a, &b] {
+        for y in 0..h {
+            let sy = y * src.height / h;
+            for x in 0..w {
+                let sx = x * src.width / w;
+                let v = src.data[(sy * src.width + sx) as usize];
+                let slot = &mut out[(y * w + x) as usize];
+                *slot = (*slot).max(v);
+            }
+        }
+    }
+    Mask { data: out, width: w, height: h }
+}
+
 fn start_runner(spec: &Spec) -> Result<Runner> {
     let t0 = std::time::Instant::now();
     let session = crate::seg::build_session(&spec.path, &spec.device)?;
@@ -296,7 +320,16 @@ fn start_runner(spec: &Spec) -> Result<Runner> {
         run_model(session, in_w, in_h, nchw, kind, t_in, t_out, t_cv);
     });
 
-    Ok(Runner { kind, in_w, in_h, strength, input, output, cv })
+    Ok(Runner {
+        kind,
+        is_default: spec.is_default,
+        in_w,
+        in_h,
+        strength,
+        input,
+        output,
+        cv,
+    })
 }
 
 /// Mask or filter? Decided by the model's output channel count.

@@ -1132,9 +1132,11 @@ def build_parser() -> argparse.ArgumentParser:
              "image input and a mask output works",
     )
     dm.add_argument(
-        "--seg-device", choices=("cpu", "cuda"), default=None,
-        help="Where segmentation runs (default cpu; cuda falls back to cpu "
-             "if the CUDA runtime is missing)",
+        "--seg-device", choices=("auto", "cpu", "cuda", "camera"), default=None,
+        help="Where the default person model runs. auto (the default) uses "
+             "the camera's own VPU in Studio mode and the CPU otherwise; "
+             "cpu/cuda pin it to the host; camera forces the VPU where "
+             "possible. User-added models always run on the host and merge",
     )
     dm.set_defaults(func=_cmd_daemon)
 

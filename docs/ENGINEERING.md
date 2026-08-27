@@ -114,6 +114,15 @@ and physics keeps low-res models from pretending to do structure.
 Masks live in source-frame space and ride the same coordinate mapping
 as the video, so zoom, pan and mirror apply to them for free.
 
+The port paid for itself twice: pushing the default model onto the
+camera's own Myriad X (Studio mode, via a Luxonis-zoo RVC2 archive in
+the depthai pipeline) needed zero engine changes — the daemon simply
+forwards the VPU's masks into `mask.sock` as one more external
+producer. An external producer silences only the bundled default;
+user-added mask models keep running on the host and merge in by
+weighted max. The camera Opal sold as an "intelligent webcam" finally
+runs its intelligence.
+
 ## 8. How does the code stay honest?
 
 Hexagonal, with tripwires. `core/` is pure domain fact and policy — an

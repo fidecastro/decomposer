@@ -325,6 +325,7 @@ fn main() -> Result<()> {
                     path: path.clone(),
                     device: args.seg_device.clone(),
                     strength: 1.0,
+                    is_default: true,
                 };
                 if let Err(e) = c.push(&spec) {
                     eprintln!("default person model unavailable: {e:#}");
@@ -519,10 +520,21 @@ fn main() -> Result<()> {
             if c.active() && seg_frame % 2 == 0 {
                 c.submit(frame, w, h);
             }
-            if let Some(mask) = external_mask.lock().unwrap().take() {
-                g.set_mask(&mask.data, mask.width, mask.height);
-            } else if let Some(mask) = c.take_mask() {
-                g.set_mask(&mask.data, mask.width, mask.height);
+            // An external producer (the mask socket - a user process, or the
+            // daemon forwarding the camera's own on-VPU masks) replaces only
+            // the bundled default model; user-added mask models keep running
+            // on the host and merge in.
+            let external = external_mask.lock().unwrap().take();
+            let internal = c.take_mask();
+            match (external, internal) {
+                (Some(a), Some(b)) => {
+                    let m = chain::merge_masks(a, b);
+                    g.set_mask(&m.data, m.width, m.height);
+                }
+                (Some(m), None) | (None, Some(m)) => {
+                    g.set_mask(&m.data, m.width, m.height);
+                }
+                (None, None) => {}
             }
             if let Some((layer, lw, lh)) = c.take_layer(frame, w, h) {
                 g.set_layer(&layer, lw, lh);

@@ -17,7 +17,10 @@ from opal_c1.device import OpalDevice
 class XLinkBackend:
     mode = Mode.STUDIO
 
-    def __init__(self, width: int, height: int, fps: float) -> None:
+    def __init__(
+        self, width: int, height: int, fps: float, mask_model: bool = False
+    ) -> None:
+        self._mask_model = mask_model
         self._width = width
         self._height = height
         self._fps = fps
@@ -26,7 +29,8 @@ class XLinkBackend:
 
     def attach(self) -> None:
         self._dev = OpalDevice(
-            width=self._width, height=self._height, fps=self._fps
+            width=self._width, height=self._height, fps=self._fps,
+            mask_model=self._mask_model,
         ).open()
 
     def release(self) -> None:
@@ -57,6 +61,12 @@ class XLinkBackend:
                 )
             self._last_frame = frame
         return frame
+
+    def try_read_mask(self):
+        """Latest on-VPU person mask, or None (also when disabled)."""
+        if self._dev is None:
+            return None
+        return self._dev.try_read_mask()
 
     # -- controls ---------------------------------------------------------
 
