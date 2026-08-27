@@ -356,6 +356,19 @@ The panel has a dropdown to load and a popover to save. A popover rather than a
 dialog, because a layer surface cannot parent a dialog but `xdg_popup` is part of
 the protocol and works.
 
+### Resolution
+
+```bash
+decomposer resolution 1080p --capture-4k   # publish 1080p, capture 4K
+decomposer resolution 4k
+```
+
+Choices: 720p, 1080p, 1440p, 4k, with `--capture-4k` to capture larger than
+you publish (lossless zoom to the ratio). Applying restarts the engine — and in
+Studio the camera session with it — and v4l2loopback keeps its old format while
+any consumer holds the node, so attached applications must reconnect to see the
+new size. The panel shows the selector in the header next to the mode pill.
+
 ### Clarity (CLAHE)
 
 ```bash

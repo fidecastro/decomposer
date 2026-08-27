@@ -587,6 +587,27 @@ class Daemon:
         self._sync_engine()
         return self.status()
 
+    def set_resolution(
+        self, width, height, in_width=0, in_height=0
+    ) -> dict:
+        """Change the published (and optionally capture) resolution.
+
+        These are restart fields: the engine is re-entered, and in Studio the
+        camera session reboots with it. The loopback keeps its old format
+        while any consumer holds the node, so applications must reconnect to
+        pick up the new size - the engine will say so if one is pinning it.
+        """
+        with self.lock:
+            if self._ledger.in_progress or not self._requests.empty():
+                raise RuntimeError("a mode transition is already in progress")
+            self.state.width = int(width)
+            self.state.height = int(height)
+            self.state.in_width = int(in_width or 0)
+            self.state.in_height = int(in_height or 0)
+            mode = Mode(self.state.mode)
+        self.request_transition(mode, enforce_guard=False)
+        return self.status()
+
     def set_clahe(self, strength) -> dict:
         """Local contrast (CLAHE) on the GPU. 0 disables and skips the passes."""
         with self.lock:
@@ -1025,6 +1046,11 @@ class Daemon:
                 return {"ok": True, **self.delete_preset(req["name"])}
             if cmd == "set_overlay":
                 return {"ok": True, **self.set_overlay(**req.get("values", {}))}
+            if cmd == "set_resolution":
+                return {"ok": True, **self.set_resolution(
+                    req["width"], req["height"],
+                    req.get("in_width", 0), req.get("in_height", 0),
+                )}
             if cmd == "set_clahe":
                 return {"ok": True, **self.set_clahe(req.get("strength", 0.0))}
             if cmd == "set_zoom":

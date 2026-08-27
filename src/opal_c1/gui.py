@@ -77,6 +77,13 @@ LOOK_BLURB = {
 EFFECTS = ["off", "sepia", "mono", "negative", "posterize",
            "solarize", "aqua", "blackboard", "whiteboard"]
 
+RESOLUTION_CHOICES = [
+    ("720p", (1280, 720, 0, 0)),
+    ("1080p", (1920, 1080, 0, 0)),
+    ("1080p · 4K cap", (1920, 1080, 3840, 2160)),
+    ("4K", (3840, 2160, 0, 0)),
+]
+
 AUTO_CAPABLE = ("focus", "wb")
 
 # Which modes can actually drive each control. Call mode reaches the camera
@@ -265,6 +272,17 @@ class Panel(Gtk.Box):
         bar.append(self.subtitle)
 
         bar.append(Gtk.Box(hexpand=True))
+
+        self.res_drop = Gtk.DropDown.new_from_strings(
+            [name for name, _ in RESOLUTION_CHOICES]
+        )
+        self.res_drop.set_valign(Gtk.Align.CENTER)
+        self.res_drop.set_tooltip_text(
+            "Published resolution. Applying restarts the engine (and in "
+            "Studio, the camera); attached apps must reconnect."
+        )
+        self.res_drop.connect("notify::selected", self._on_resolution)
+        bar.append(self.res_drop)
 
         self.mode_pill = Gtk.Label(label="—")
         self.mode_pill.add_css_class("dc-pill")
@@ -620,6 +638,18 @@ class Panel(Gtk.Box):
 
     # -- actions --------------------------------------------------------
 
+    def _on_resolution(self, drop, _param) -> None:
+        if self._suppress or not self._ready or self.busy:
+            return
+        _, (w, h, iw, ih) = RESOLUTION_CHOICES[drop.get_selected()]
+        self._set_busy(True, "changing resolution… the engine restarts")
+        _worker(
+            lambda: self.client.request(
+                cmd="set_resolution", width=w, height=h, in_width=iw, in_height=ih
+            ),
+            self._on_result,
+        )
+
     def _on_preview_tap(self, gesture, _n_press, cx: float, cy: float) -> None:
         """Tap to focus: aim autofocus and exposure metering where clicked."""
         if self.busy or not self._ready:
@@ -819,6 +849,20 @@ class Panel(Gtk.Box):
             b.set_opacity(1.0 if name in offered else 0.4)
             (b.add_css_class if name == look else b.remove_css_class)("selected")
 
+        self._suppress = True
+        try:
+            combo = (
+                st.get("width", 1920), st.get("height", 1080),
+                st.get("in_width", 0), st.get("in_height", 0),
+            )
+            for i, (_, choice) in enumerate(RESOLUTION_CHOICES):
+                if choice == combo:
+                    self.res_drop.set_selected(i)
+                    break
+            self.res_drop.set_sensitive(not transitioning)
+        finally:
+            self._suppress = False
+
         overlay = st.get("overlay")
         self.overlay_button.set_label(
             Path(overlay).name if overlay else "choose\u2026"
@@ -881,7 +925,11 @@ class Panel(Gtk.Box):
                 f"{st.get('width')}×{st.get('height')} → {st.get('output')}"
             )
         else:
-            self.footer.set_text(st.get("error") or "engine not running")
+            message = st.get("error") or "engine not running"
+            # Engine logs can be a wall; the footer is one line of truth.
+            if len(message) > 160:
+                message = message[:157] + "…"
+            self.footer.set_text(message)
 
 
 class App(Adw.Application):

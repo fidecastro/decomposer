@@ -58,9 +58,10 @@ class Action:
 
 SICK_MESSAGE = (
     "the camera streams for a few seconds and then drops off the bus, "
-    "repeatedly. This is the C1 firmware state a short unplug does not always "
-    "clear: power it off for 2-3 minutes (and try a different USB 3 port). "
-    "Holding retries for 2 minutes."
+    "repeatedly. This is the C1's Opal firmware in its degraded state: power "
+    "the camera off for 2-3 minutes to clear it. Studio mode usually still "
+    "streams in this state (decomposer switch studio). Holding retries for "
+    "2 minutes."
 )
 VANISHED_MESSAGE = (
     "the camera keeps dropping off the USB bus. This is the C1's firmware, "

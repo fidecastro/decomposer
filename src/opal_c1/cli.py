@@ -660,6 +660,38 @@ def _cmd_zoom(args: argparse.Namespace) -> int:
     return 0
 
 
+RESOLUTIONS = {
+    "720p": (1280, 720),
+    "1080p": (1920, 1080),
+    "1440p": (2560, 1440),
+    "4k": (3840, 2160),
+}
+
+
+def _cmd_resolution(args: argparse.Namespace) -> int:
+    if args.size is None:
+        resp = _client_call(cmd="status")
+        if not resp.get("ok"):
+            return 1
+    else:
+        w, h = RESOLUTIONS[args.size]
+        in_w, in_h = (3840, 2160) if args.capture_4k and h < 2160 else (0, 0)
+        print(f"  applying {args.size}"
+              + (" with 4K capture" if in_w else "")
+              + " - the engine restarts; in Studio the camera reboots too")
+        resp = _client_call(
+            cmd="set_resolution", width=w, height=h, in_width=in_w, in_height=in_h
+        )
+        if not resp.get("ok"):
+            return 1
+    cap = ""
+    if resp.get("in_width"):
+        cap = f"  (capture {resp['in_width']}x{resp['in_height']})"
+    print(f"  publishing {resp.get('width')}x{resp.get('height')}{cap}")
+    print("  note: attached applications must reconnect to see a new size")
+    return 0
+
+
 def _cmd_clahe(args: argparse.Namespace) -> int:
     if args.strength is None:
         resp = _client_call(cmd="status")
@@ -951,6 +983,21 @@ def build_parser() -> argparse.ArgumentParser:
     zo.add_argument("--x", type=float, default=None, help="pan x, -1..1")
     zo.add_argument("--y", type=float, default=None, help="pan y, -1..1")
     zo.set_defaults(func=_cmd_zoom)
+
+    rs = sub.add_parser(
+        "resolution",
+        help="Published resolution (and optional 4K capture)",
+        description=(
+            "Changes the size published to the virtual camera. The engine "
+            "restarts; in Studio the camera session reboots as well. The "
+            "loopback keeps its old format while a consumer holds it, so "
+            "apps must reconnect."
+        ),
+    )
+    rs.add_argument("size", nargs="?", choices=sorted(RESOLUTIONS), default=None)
+    rs.add_argument("--capture-4k", action="store_true",
+                    help="Capture 4K while publishing smaller: lossless zoom to 2x")
+    rs.set_defaults(func=_cmd_resolution)
 
     ch = sub.add_parser(
         "clahe",
