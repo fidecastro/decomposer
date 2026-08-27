@@ -56,6 +56,10 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     pan_y: f32,
 
+    /// Local contrast (CLAHE) strength, 0.0 to 1.0
+    #[arg(long, default_value_t = 0.0)]
+    clahe: f32,
+
     /// Stop after N frames (0 = run forever). Useful for smoke tests.
     #[arg(long, default_value_t = 0)]
     frames: u64,
@@ -212,6 +216,7 @@ fn main() -> Result<()> {
         s.zoom = args.zoom.clamp(1.0, 8.0);
         s.pan_x = args.pan_x.clamp(-1.0, 1.0);
         s.pan_y = args.pan_y.clamp(-1.0, 1.0);
+        s.clahe = args.clahe.clamp(0.0, 1.0);
         // Force the first pass through the resolver so the initial --look
         // actually loads its LUT instead of silently using a built-in curve.
         s.dirty = true;
@@ -241,13 +246,14 @@ fn main() -> Result<()> {
                 s.dirty.then(|| {
                     s.dirty = false;
                     (s.look, s.look_name.clone(), s.strength, s.flip,
-                     s.zoom, s.pan_x, s.pan_y)
+                     s.zoom, s.pan_x, s.pan_y, s.clahe)
                 })
             };
-            if let Some((look, name, strength, flip, zoom, pan_x, pan_y)) = pending {
+            if let Some((look, name, strength, flip, zoom, pan_x, pan_y, clahe)) = pending {
                 g.set_look(look, strength);
                 g.set_flip(flip);
                 g.set_zoom(zoom, pan_x, pan_y);
+                g.set_clahe(clahe);
                 // Reloading the same LUT every strength tweak would be wasteful,
                 // so only touch it when the name actually changes.
                 if name != applied_look {

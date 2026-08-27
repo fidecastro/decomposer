@@ -660,6 +660,18 @@ def _cmd_zoom(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_clahe(args: argparse.Namespace) -> int:
+    if args.strength is None:
+        resp = _client_call(cmd="status")
+    else:
+        s = 0.0 if args.strength == "off" else float(args.strength)
+        resp = _client_call(cmd="set_clahe", strength=s)
+    if not resp.get("ok"):
+        return 1
+    print(f"  clarity (CLAHE) {resp.get('clahe')}")
+    return 0
+
+
 def _cmd_mirror(args: argparse.Namespace) -> int:
     values = {}
     if args.horizontal is not None:
@@ -939,6 +951,18 @@ def build_parser() -> argparse.ArgumentParser:
     zo.add_argument("--x", type=float, default=None, help="pan x, -1..1")
     zo.add_argument("--y", type=float, default=None, help="pan y, -1..1")
     zo.set_defaults(func=_cmd_zoom)
+
+    ch = sub.add_parser(
+        "clahe",
+        help="Local contrast (CLAHE)",
+        description=(
+            "Adaptive local contrast on the GPU: per-tile histogram "
+            "equalization, clip-limited, blended by strength. 'off' or 0 "
+            "disables it and skips the extra passes entirely."
+        ),
+    )
+    ch.add_argument("strength", nargs="?", default=None, help="0.0-1.0, or 'off'")
+    ch.set_defaults(func=_cmd_clahe)
 
     mi = sub.add_parser(
         "mirror",

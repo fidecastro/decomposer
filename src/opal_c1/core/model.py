@@ -154,6 +154,7 @@ class EngineConfig:
     zoom: float = 1.0
     pan_x: float = 0.0
     pan_y: float = 0.0
+    clahe: float = 0.0
 
     # Fields whose change cannot be applied over the control socket: the
     # engine has to be restarted for them. Everything else is a live update.
@@ -193,6 +194,8 @@ def engine_cli_args(config: EngineConfig) -> list:
                  "--in-height", str(config.in_height)]
     if config.zoom != 1.0:
         args += ["--zoom", str(config.zoom)]
+    if config.clahe > 0.0:
+        args += ["--clahe", str(config.clahe)]
     if config.pan_x or config.pan_y:
         args += ["--pan-x", str(config.pan_x), "--pan-y", str(config.pan_y)]
     if config.lut_dir:
@@ -226,6 +229,8 @@ def engine_delta_lines(old: EngineConfig, new: EngineConfig) -> list:
         lines.append(f"zoom {new.zoom}")
     if (new.pan_x, new.pan_y) != (old.pan_x, old.pan_y):
         lines.append(f"pan {new.pan_x} {new.pan_y}")
+    if new.clahe != old.clahe:
+        lines.append(f"clahe {new.clahe}")
     return lines
 
 

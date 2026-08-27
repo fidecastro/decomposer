@@ -82,6 +82,9 @@ def decode(raw: dict) -> Tuple[dict, list]:
     zoom = _clamp(raw.get("zoom"), 1.0, 8.0)
     if zoom is not None:
         out["zoom"] = zoom
+    clahe = _clamp(raw.get("clahe"), 0.0, 1.0)
+    if clahe is not None:
+        out["clahe"] = clahe
     for key in ("pan_x", "pan_y"):
         v = _clamp(raw.get(key), -1.0, 1.0)
         if v is not None:

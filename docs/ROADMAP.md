@@ -124,7 +124,8 @@ sanitizing and async LUT loading (P2), plus the features below.
 
 - ~~**Digital zoom / crop**~~ — done: shader sampler, `zoom`/`pan` protocol,
   panel scroll+drag, lossless to 2x with `--in-width 3840 --in-height 2160`.
-- **CLAHE** — local contrast, a real GPU pass (Composer shipped it).
+- ~~**CLAHE**~~ — done: three-dispatch GPU implementation, `decomposer clahe`,
+  Clarity slider, part of presets.
 - **Background blur / replacement** — segmentation on the idle 4090. The
   largest remaining Composer gap. Model choice + licensing needs its own
   research pass.

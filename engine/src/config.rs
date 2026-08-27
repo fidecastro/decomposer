@@ -31,6 +31,7 @@ pub struct Config {
     pub zoom: f32,
     pub pan_x: f32,
     pub pan_y: f32,
+    pub clahe: f32,
 }
 
 pub type Shared = Arc<Mutex<Config>>;
@@ -52,6 +53,7 @@ pub fn shared(look: u32, name: String, strength: f32, flip: u32) -> Shared {
         zoom: 1.0,
         pan_x: 0.0,
         pan_y: 0.0,
+        clahe: 0.0,
     }))
 }
 
@@ -120,6 +122,14 @@ pub fn apply_line(line: &str, state: &Shared) {
                 false
             }
         }
+        "clahe" => match rest.parse::<f32>() {
+            Ok(v) => {
+                s.clahe = v.clamp(0.0, 1.0);
+                s.dirty = true;
+                true
+            }
+            Err(_) => false,
+        },
         "zoom" => match rest.parse::<f32>() {
             Ok(v) => {
                 s.zoom = v.clamp(1.0, 8.0);

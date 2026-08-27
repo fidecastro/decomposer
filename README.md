@@ -356,6 +356,23 @@ The panel has a dropdown to load and a popover to save. A popover rather than a
 dialog, because a layer surface cannot parent a dialog but `xdg_popup` is part of
 the protocol and works.
 
+### Clarity (CLAHE)
+
+```bash
+decomposer clahe 0.6
+decomposer clahe off
+```
+
+Contrast Limited Adaptive Histogram Equalization on the GPU: three dispatches —
+per-tile luma histograms (8×8 grid over the *visible* view, so a zoomed crop
+gets its own contrast), clip-limited CDFs, then bilinear interpolation between
+the four surrounding tiles' curves. Verified on synthetic frames: strength 0 is
+exact identity, full strength expands a low-contrast texture 3.1×, and a
+two-region frame has both regions stretched independently while their means
+stay apart — local, not global. Costs ~5% GPU, invisible at camera rates.
+Composer shipped CLAHE in its VideoService; this closes that gap. Part of
+presets; the panel exposes it as the Clarity slider.
+
 ### Digital zoom
 
 ```bash

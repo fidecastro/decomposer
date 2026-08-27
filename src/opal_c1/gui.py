@@ -232,6 +232,7 @@ class Panel(Gtk.Box):
         body.append(self._look_block())
         body.append(self._overlay_row())
         body.append(self._zoom_row())
+        body.append(self._clahe_row())
         body.append(self._preset_row())
         body.append(self._sep())
         body.append(self._camera_block())
@@ -432,6 +433,23 @@ class Panel(Gtk.Box):
         px = max(-1.0, min(1.0, self._pan_base[0] - dx / w * span))
         py = max(-1.0, min(1.0, self._pan_base[1] - dy / h * span))
         self._queue({"pan_x": round(px, 3), "pan_y": round(py, 3)})
+
+    def _clahe_row(self) -> Gtk.Widget:
+        row, self.clahe_scale, self.clahe_value = self._slider_row(
+            "Clarity", 0.0, 1.0, 0.05, digits=2
+        )
+        self.clahe_scale.set_tooltip_text(
+            "Local contrast (CLAHE): brightens shadows and recovers detail "
+            "region by region rather than globally"
+        )
+        self.clahe_scale.connect("value-changed", self._on_clahe)
+        return row
+
+    def _on_clahe(self, scale: Gtk.Scale) -> None:
+        self.clahe_value.set_text(f"{scale.get_value():.2f}")
+        if self._suppress or not self._ready:
+            return
+        self._queue({"clahe": round(scale.get_value(), 2)})
 
     def _preset_row(self) -> Gtk.Widget:
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
@@ -690,6 +708,12 @@ class Panel(Gtk.Box):
         pending, self._pending = self._pending, {}
         if not pending:
             return False
+        clahe = pending.pop("clahe", None)
+        if clahe is not None:
+            _worker(
+                lambda: self.client.request(cmd="set_clahe", strength=clahe),
+                self._on_result,
+            )
         zoomish = {
             k: pending.pop(k)
             for k in ("zoom", "pan_x", "pan_y")
@@ -816,6 +840,7 @@ class Panel(Gtk.Box):
             self.preset_drop.set_sensitive(bool(names))
             self.overlay_opacity.set_value(float(st.get("overlay_opacity", 1.0)))
             self.zoom_scale.set_value(float(st.get("zoom", 1.0)))
+            self.clahe_scale.set_value(float(st.get("clahe", 0.0)))
             self.strength.set_value(float(st.get("strength", 1.0)))
             controls = st.get("controls") or {}
             for key, scale in self.sliders.items():

@@ -31,10 +31,11 @@ struct Params {
     zoom: f32,
     pan_x: f32,
     pan_y: f32,
+    // CLAHE: strength 0 disables; clip limits how far a tile may equalize.
+    clahe: f32,
+    clahe_clip: f32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
-    _pad3: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -44,6 +45,14 @@ struct Params {
 @group(0) @binding(3) var<storage, read> overlay: array<u32>;
 // Red varies fastest: index = r + g*size + b*size*size.
 @group(0) @binding(4) var<storage, read> lut: array<vec4<f32>>;
+// CLAHE working buffers: per-tile luma histograms and the mapping curves
+// built from them. The histogram is cleared by the CDF pass after use, so no
+// separate clear is needed between frames.
+@group(0) @binding(5) var<storage, read_write> clahe_hist: array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read_write> clahe_lut: array<f32>;
+
+const CLAHE_TX: u32 = 8u;
+const CLAHE_TY: u32 = 8u;
 
 fn unpack4(word: u32) -> vec4<f32> {
     return vec4<f32>(
@@ -260,9 +269,96 @@ fn source_coord(px: u32, py: u32) -> vec2<f32> {
     return vec2<f32>(x0 + u * crop_w - 0.5, y0 + v * crop_h - 0.5);
 }
 
-fn graded(px: u32, py: u32) -> vec3<f32> {
+// -- CLAHE --------------------------------------------------------------
+// Contrast Limited Adaptive Histogram Equalization on the output-view luma:
+// the histogram is built over exactly what will be shown (post zoom and
+// mirror), so a zoomed crop gets its own contrast rather than the frame's.
+
+@compute @workgroup_size(16, 16)
+fn clahe_hist_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let px = gid.x;
+    let py = gid.y;
+    if (px >= params.width || py >= params.height) {
+        return;
+    }
     let sc = source_coord(px, py);
     let y = sample_y(sc.x, sc.y);
+    let bin = min(u32(y * 255.0 + 0.5), 255u);
+    let tx = min(px * CLAHE_TX / params.width, CLAHE_TX - 1u);
+    let ty = min(py * CLAHE_TY / params.height, CLAHE_TY - 1u);
+    atomicAdd(&clahe_hist[(ty * CLAHE_TX + tx) * 256u + bin], 1u);
+}
+
+var<workgroup> tile_bins: array<u32, 256>;
+var<workgroup> tile_curve: array<f32, 256>;
+
+// One workgroup per tile. The serial thread-0 section is ~1300 trivial ops
+// per tile - not worth a parallel scan at this size.
+@compute @workgroup_size(256)
+fn clahe_cdf_main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let tile = wid.x;
+    let i = lid.x;
+    tile_bins[i] = atomicLoad(&clahe_hist[tile * 256u + i]);
+    // Consumed: clear for the next frame's histogram pass.
+    atomicStore(&clahe_hist[tile * 256u + i], 0u);
+    workgroupBarrier();
+    if (i == 0u) {
+        var total: u32 = 0u;
+        for (var k = 0u; k < 256u; k++) { total += tile_bins[k]; }
+        let mean = f32(max(total, 1u)) / 256.0;
+        let clip = max(u32(params.clahe_clip * mean), 1u);
+        var excess: u32 = 0u;
+        for (var k = 0u; k < 256u; k++) {
+            if (tile_bins[k] > clip) {
+                excess += tile_bins[k] - clip;
+                tile_bins[k] = clip;
+            }
+        }
+        let add = excess / 256u;
+        var cum: u32 = 0u;
+        for (var k = 0u; k < 256u; k++) {
+            cum += tile_bins[k] + add;
+            tile_curve[k] = f32(cum);
+        }
+        let denom = max(tile_curve[255], 1.0);
+        for (var k = 0u; k < 256u; k++) {
+            tile_curve[k] = tile_curve[k] / denom;
+        }
+    }
+    workgroupBarrier();
+    clahe_lut[tile * 256u + i] = tile_curve[i];
+}
+
+// Bilinear interpolation between the four surrounding tiles' curves - the
+// standard CLAHE trick that hides the tile grid.
+fn clahe_remap(px: u32, py: u32, y: f32) -> f32 {
+    if (params.clahe <= 0.0) {
+        return y;
+    }
+    let fx = (f32(px) + 0.5) / f32(params.width) * f32(CLAHE_TX) - 0.5;
+    let fy = (f32(py) + 0.5) / f32(params.height) * f32(CLAHE_TY) - 0.5;
+    let x0i = i32(floor(fx));
+    let y0i = i32(floor(fy));
+    let tx = fract(fx);
+    let ty = fract(fy);
+    let x0 = u32(clamp(x0i, 0, i32(CLAHE_TX) - 1));
+    let x1 = u32(clamp(x0i + 1, 0, i32(CLAHE_TX) - 1));
+    let y0 = u32(clamp(y0i, 0, i32(CLAHE_TY) - 1));
+    let y1 = u32(clamp(y0i + 1, 0, i32(CLAHE_TY) - 1));
+    let bin = min(u32(y * 255.0 + 0.5), 255u);
+    let a = mix(clahe_lut[(y0 * CLAHE_TX + x0) * 256u + bin],
+                clahe_lut[(y0 * CLAHE_TX + x1) * 256u + bin], tx);
+    let b = mix(clahe_lut[(y1 * CLAHE_TX + x0) * 256u + bin],
+                clahe_lut[(y1 * CLAHE_TX + x1) * 256u + bin], tx);
+    return mix(y, mix(a, b, ty), params.clahe);
+}
+
+fn graded(px: u32, py: u32) -> vec3<f32> {
+    let sc = source_coord(px, py);
+    let y = clahe_remap(px, py, sample_y(sc.x, sc.y));
     let uv = sample_uv(sc.x, sc.y);
     let rgb = apply_look(ycbcr_to_rgb(y, uv.x, uv.y));
     return composite(px, py, rgb);

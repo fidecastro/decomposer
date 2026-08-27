@@ -39,15 +39,20 @@ struct Params {
     zoom: f32,
     pan_x: f32,
     pan_y: f32,
+    /// CLAHE strength (0 = off) and clip limit.
+    clahe: f32,
+    clahe_clip: f32,
     // WGSL rounds uniform structs up to 16 bytes; pad explicitly so the Rust
     // and shader layouts cannot silently disagree.
-    _pad: [u32; 4],
+    _pad: [u32; 2],
 }
 
 pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    hist_pipeline: wgpu::ComputePipeline,
+    cdf_pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
     layout: wgpu::BindGroupLayout,
     params_buf: wgpu::Buffer,
@@ -55,6 +60,8 @@ pub struct Gpu {
     dst_buf: wgpu::Buffer,
     overlay_buf: wgpu::Buffer,
     lut_buf: wgpu::Buffer,
+    clahe_hist: wgpu::Buffer,
+    clahe_lut: wgpu::Buffer,
     staging: wgpu::Buffer,
     params: Params,
     size: u64,
@@ -94,7 +101,8 @@ impl Gpu {
             lut_size: 0,
             src_w, src_h,
             zoom: 1.0, pan_x: 0.0, pan_y: 0.0,
-            _pad: [0; 4],
+            clahe: 0.0, clahe_clip: 2.5,
+            _pad: [0; 2],
         };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -129,6 +137,21 @@ impl Gpu {
             label: Some("lut"),
             contents: bytemuck::cast_slice(&[0f32; 4]),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        // 8x8 tiles x 256 bins. WebGPU zero-initializes, which is exactly the
+        // state the histogram pass wants to start from.
+        let clahe_size = (8 * 8 * 256 * 4) as u64;
+        let clahe_hist = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("clahe-hist"),
+            size: clahe_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let clahe_lut = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("clahe-lut"),
+            size: clahe_size,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -178,11 +201,24 @@ impl Gpu {
                     ty: storage(true),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: storage(false),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: storage(false),
+                    count: None,
+                },
             ],
         });
 
         let bind_group = make_bind_group(
-            &device, &layout, &params_buf, &src_buf, &dst_buf, &overlay_buf, &lut_buf,
+            &device, &layout, &params_buf, &src_buf, &dst_buf, &overlay_buf,
+            &lut_buf, &clahe_hist, &clahe_lut,
         );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -190,18 +226,25 @@ impl Gpu {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("look-pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let mk_pipeline = |label: &str, entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let pipeline = mk_pipeline("look-pipeline", "main");
+        let hist_pipeline = mk_pipeline("clahe-hist", "clahe_hist_main");
+        let cdf_pipeline = mk_pipeline("clahe-cdf", "clahe_cdf_main");
 
         Ok(Self {
-            device, queue, pipeline, bind_group, layout, params_buf, src_buf, dst_buf,
-            overlay_buf, lut_buf, staging, params, size, src_size,
+            device, queue, pipeline, hist_pipeline, cdf_pipeline,
+            bind_group, layout, params_buf, src_buf, dst_buf,
+            overlay_buf, lut_buf, clahe_hist, clahe_lut,
+            staging, params, size, src_size,
             out: vec![0u8; size as usize], adapter_name,
         })
     }
@@ -230,7 +273,8 @@ impl Gpu {
                     });
                     self.bind_group = make_bind_group(
                         &self.device, &self.layout, &self.params_buf,
-                        &self.src_buf, &self.dst_buf, &self.overlay_buf, &self.lut_buf,
+                        &self.src_buf, &self.dst_buf, &self.overlay_buf,
+                        &self.lut_buf, &self.clahe_hist, &self.clahe_lut,
                     );
                 }
                 self.queue.write_buffer(&self.lut_buf, 0, bytemuck::cast_slice(&l.data));
@@ -271,7 +315,8 @@ impl Gpu {
                     });
                     self.bind_group = make_bind_group(
                         &self.device, &self.layout, &self.params_buf,
-                        &self.src_buf, &self.dst_buf, &self.overlay_buf, &self.lut_buf,
+                        &self.src_buf, &self.dst_buf, &self.overlay_buf,
+                        &self.lut_buf, &self.clahe_hist, &self.clahe_lut,
                     );
                 }
                 self.queue.write_buffer(
@@ -290,6 +335,12 @@ impl Gpu {
     /// Mirror the image. Costs nothing: it only changes where the shader reads.
     pub fn set_flip(&mut self, flip: u32) {
         self.params.flip = flip;
+        self.upload_params();
+    }
+
+    /// Local contrast (CLAHE). 0 disables and skips the extra passes.
+    pub fn set_clahe(&mut self, strength: f32) {
+        self.params.clahe = strength.clamp(0.0, 1.0);
         self.upload_params();
     }
 
@@ -320,8 +371,20 @@ impl Gpu {
                 label: Some("look-pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
+            if self.params.clahe > 0.0 {
+                // Dispatches within one pass are ordered with visibility, so
+                // hist -> cdf -> main needs no explicit barriers.
+                pass.set_pipeline(&self.hist_pipeline);
+                pass.dispatch_workgroups(
+                    self.params.width.div_ceil(16),
+                    self.params.height.div_ceil(16),
+                    1,
+                );
+                pass.set_pipeline(&self.cdf_pipeline);
+                pass.dispatch_workgroups(64, 1, 1);
+            }
+            pass.set_pipeline(&self.pipeline);
             // One invocation per 4x2 pixel block.
             let gx = self.params.width.div_ceil(4).div_ceil(8);
             let gy = self.params.height.div_ceil(2).div_ceil(8);
@@ -355,6 +418,8 @@ fn make_bind_group(
     dst: &wgpu::Buffer,
     overlay: &wgpu::Buffer,
     lut: &wgpu::Buffer,
+    clahe_hist: &wgpu::Buffer,
+    clahe_lut: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("look-bind"),
@@ -365,6 +430,8 @@ fn make_bind_group(
             wgpu::BindGroupEntry { binding: 2, resource: dst.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: overlay.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: lut.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: clahe_hist.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: clahe_lut.as_entire_binding() },
         ],
     })
 }

@@ -144,6 +144,7 @@ class State:
     zoom: float = 1.0
     pan_x: float = 0.0
     pan_y: float = 0.0
+    clahe: float = 0.0
     in_width: int = 0
     in_height: int = 0
     running: bool = False
@@ -235,6 +236,7 @@ class Daemon:
             overlay_opacity=st.overlay_opacity,
             in_width=st.in_width, in_height=st.in_height,
             zoom=st.zoom, pan_x=st.pan_x, pan_y=st.pan_y,
+            clahe=st.clahe,
             lut_dir=str(lut_dir()) if lut_dir() else None,
         )
 
@@ -283,6 +285,7 @@ class Daemon:
                 overlay_w=st.overlay_w, overlay_h=st.overlay_h,
                 overlay_opacity=st.overlay_opacity,
                 zoom=st.zoom, pan_x=st.pan_x, pan_y=st.pan_y,
+                clahe=st.clahe,
             )
         with suppress(Exception):
             engine.apply_live(**live)
@@ -584,6 +587,13 @@ class Daemon:
         self._sync_engine()
         return self.status()
 
+    def set_clahe(self, strength) -> dict:
+        """Local contrast (CLAHE) on the GPU. 0 disables and skips the passes."""
+        with self.lock:
+            self.state.clahe = max(0.0, min(1.0, float(strength)))
+        self._sync_engine()
+        return self.status()
+
     def set_camera(self, **kw) -> dict:
         """Apply camera controls through the current mode's backend.
 
@@ -641,6 +651,7 @@ class Daemon:
                 "zoom": st.zoom,
                 "pan_x": st.pan_x,
                 "pan_y": st.pan_y,
+                "clahe": st.clahe,
                 "overlay": {
                     "path": st.overlay,
                     "x": st.overlay_x, "y": st.overlay_y,
@@ -684,6 +695,8 @@ class Daemon:
             self.set_look(data["look"], data.get("strength"))
         self.set_mirror(data.get("mirror_h"), data.get("mirror_v"))
         self.set_zoom(data.get("zoom"), data.get("pan_x"), data.get("pan_y"))
+        if data.get("clahe") is not None:
+            self.set_clahe(data["clahe"])
 
         ov = data.get("overlay") or {}
         try:
@@ -1012,6 +1025,8 @@ class Daemon:
                 return {"ok": True, **self.delete_preset(req["name"])}
             if cmd == "set_overlay":
                 return {"ok": True, **self.set_overlay(**req.get("values", {}))}
+            if cmd == "set_clahe":
+                return {"ok": True, **self.set_clahe(req.get("strength", 0.0))}
             if cmd == "set_zoom":
                 return {"ok": True, **self.set_zoom(
                     req.get("zoom"), req.get("pan_x"), req.get("pan_y")
