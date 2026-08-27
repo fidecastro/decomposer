@@ -323,7 +323,10 @@ backdrop, models, presets — live on the right. While the feed is down the
 camera controls dim until it returns. **Presets are per-mode**: a Studio
 preset never shows up in Call's list. Click the **Blur** label to switch it
 to **Bokeh**, which blooms background highlights into the classic lens
-balls (a kernel change, not another model). Model-chain entries persist in
+balls (a kernel change, not another model). Adding a model asks **where to run it before anything loads** — a heavy
+model launched on the wrong compute can choke a smaller machine, and no
+after-the-fact toggle can undo a load that already happened. Model-chain
+entries persist in
 `~/.config/decomposer/models.json`; an entry whose file has gone missing is
 shown dimmed and bypassed until the file returns. The panel also stays out
 of the way of fullscreen surfaces (screensaver included) by living on the

@@ -757,6 +757,7 @@ class Panel(Gtk.Box):
         add.set_hexpand(True)
         add.connect("clicked", self._on_model_add)
         head.append(add)
+        self.model_add_btn = add
         box.append(head)
         self.models_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         box.append(self.models_box)
@@ -829,10 +830,44 @@ class Panel(Gtk.Box):
             return  # cancelled
         if not path:
             return
+        # The device is chosen BEFORE anything loads: a heavy model launched
+        # on the wrong compute can choke the machine, and by the time a
+        # toggle-after-the-fact could fix it, the bad load already happened.
+        # A popover, not a dialog - the panel is a layer surface and a
+        # parented dialog is a protocol error that kills the client.
+        pop = Gtk.Popover()
+        pop.set_parent(self.model_add_btn)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(8); box.set_margin_bottom(8)
+        box.set_margin_start(10); box.set_margin_end(10)
+        title = Gtk.Label(label=f"Run {Path(path).name} on:", xalign=0)
+        title.add_css_class("dc-label")
+        box.append(title)
+        hint = Gtk.Label(
+            label="CPU is the safe default. Pick GPU (CUDA) for heavy\n"
+                  "models on a machine with the CUDA runtime installed.",
+            xalign=0,
+        )
+        hint.add_css_class("dc-hint")
+        box.append(hint)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        for label, device in (("CPU", "cpu"), ("GPU (CUDA)", "cuda")):
+            b = Gtk.Button(label=label)
+            b.add_css_class("dc-chip")
+            b.set_hexpand(True)
+            b.connect("clicked", self._on_model_device_picked, path, device, pop)
+            row.append(b)
+        box.append(row)
+        pop.set_child(box)
+        self._model_pop = pop  # keep alive while open
+        pop.popup()
+
+    def _on_model_device_picked(self, _btn, path: str, device: str, pop) -> None:
+        pop.popdown()
         models = list(self._models_cache) + [
-            {"path": path, "device": "cpu", "strength": 1.0}
+            {"path": path, "device": device, "strength": 1.0}
         ]
-        self._set_busy(True, "adding model… the engine restarts")
+        self._set_busy(True, f"adding model on {device}… the engine restarts")
         _worker(
             lambda: self.client.request(cmd="set_models", models=models),
             self._on_result,

@@ -266,13 +266,15 @@ impl Chain {
 }
 
 fn start_runner(spec: &Spec) -> Result<Runner> {
+    let t0 = std::time::Instant::now();
     let session = crate::seg::build_session(&spec.path, &spec.device)?;
+    let load_ms = t0.elapsed().as_millis();
     let (in_w, in_h, nchw) = crate::seg::input_shape(&session)
         .with_context(|| format!("reading input shape of {}", spec.path))?;
     let kind = output_kind(&session)
         .with_context(|| format!("reading output shape of {}", spec.path))?;
     eprintln!(
-        "model  {} {:?} {}x{} {} on {} strength {:.2}",
+        "model  {} {:?} {}x{} {} on {} strength {:.2} (loaded in {}ms)",
         spec.path,
         kind,
         in_w,
@@ -280,6 +282,7 @@ fn start_runner(spec: &Spec) -> Result<Runner> {
         if nchw { "NCHW" } else { "NHWC" },
         spec.device,
         spec.strength,
+        load_ms,
     );
     let strength = Arc::new(AtomicU32::new(spec.strength.to_bits()));
     let input: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
