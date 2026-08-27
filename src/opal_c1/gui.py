@@ -53,7 +53,12 @@ from gi.repository import Pango, PangoCairo  # noqa: E402
 
 from opal_c1 import theme as omtheme  # noqa: E402
 from opal_c1.daemon import Client, runtime_dir  # noqa: E402
-from opal_c1.core.model import Mode as _Mode, controls_for as _controls_for  # noqa: E402
+from opal_c1.core.model import (  # noqa: E402
+    Mode as _Mode,
+    controls_for as _controls_for,
+    fps_limits as _fps_limits,
+    resolutions_for as _resolutions_for,
+)
 
 
 def model_controls_for(mode: str) -> frozenset:
@@ -94,13 +99,6 @@ LOOK_BLURB = {
 
 EFFECTS = ["off", "sepia", "mono", "negative", "posterize",
            "solarize", "aqua", "blackboard", "whiteboard"]
-
-RESOLUTION_CHOICES = [
-    ("720p", (1280, 720, 0, 0)),
-    ("1080p", (1920, 1080, 0, 0)),
-    ("1080p · 4K cap", (1920, 1080, 3840, 2160)),
-    ("4K", (3840, 2160, 0, 0)),
-]
 
 AUTO_CAPABLE = ("focus", "wb")
 
@@ -455,9 +453,12 @@ class Panel(Gtk.Box):
 
         bar.append(Gtk.Box(hexpand=True))
 
-        self.res_drop = Gtk.DropDown.new_from_strings(
-            [name for name, _ in RESOLUTION_CHOICES]
-        )
+        # Both selectors are mode-specific: the lists and limits come from
+        # the core routing facts, and both dim while a switch is running.
+        self._res_choices: list = []
+        self._res_mode: str = ""
+        self._res_applied: int = 0
+        self.res_drop = Gtk.DropDown.new_from_strings(["—"])
         self.res_drop.set_valign(Gtk.Align.CENTER)
         self.res_drop.set_tooltip_text(
             "Published resolution. Applying restarts the engine (and in "
@@ -465,6 +466,23 @@ class Panel(Gtk.Box):
         )
         self.res_drop.connect("notify::selected", self._on_resolution)
         bar.append(self.res_drop)
+
+        self.fps_entry = Gtk.Entry()
+        self.fps_entry.add_css_class("dc-entry")
+        self.fps_entry.set_has_frame(False)
+        self.fps_entry.set_width_chars(4)
+        self.fps_entry.set_max_width_chars(5)
+        self.fps_entry.set_alignment(1.0)
+        self.fps_entry.set_valign(Gtk.Align.CENTER)
+        self.fps_entry.connect("activate", self._on_fps_commit)
+        focus = Gtk.EventControllerFocus()
+        focus.connect("leave", lambda *_: self._on_fps_commit(self.fps_entry))
+        self.fps_entry.add_controller(focus)
+        bar.append(self.fps_entry)
+        fps_lbl = Gtk.Label(label="fps")
+        fps_lbl.add_css_class("dc-hint")
+        fps_lbl.set_valign(Gtk.Align.CENTER)
+        bar.append(fps_lbl)
 
         self.mode_pill = Gtk.Label(label="—")
         self.mode_pill.add_css_class("dc-pill")
@@ -857,6 +875,10 @@ class Panel(Gtk.Box):
             b.set_hexpand(True)
             b.connect("clicked", self._on_model_device_picked, path, device, pop)
             row.append(b)
+        cancel = Gtk.Button(label="Cancel")
+        cancel.add_css_class("dc-chip")
+        cancel.connect("clicked", lambda _b: pop.popdown())
+        row.append(cancel)
         box.append(row)
         pop.set_child(box)
         self._model_pop = pop  # keep alive while open
@@ -873,26 +895,48 @@ class Panel(Gtk.Box):
             self._on_result,
         )
 
-    def _on_model_rm(self, _btn, index: int) -> None:
-        models = [m for i, m in enumerate(self._models_cache) if i != index]
-        self._set_busy(True, "removing model… the engine restarts")
-        _worker(
-            lambda: self.client.request(cmd="set_models", models=models),
-            self._on_result,
-        )
+    def _maybe_confirm_restart(self, anchor, what: str, proceed) -> None:
+        """An engine restart is a firmware reboot only under Studio (the
+        depthai session owns the camera); in Call it just reopens a V4L2
+        node and needs no ceremony."""
+        if self._current_res_mode() == "studio":
+            self._confirm(
+                anchor,
+                f"{what} restarts the engine, which in Studio mode reboots "
+                "the camera's firmware (~15 s).",
+                proceed,
+            )
+        else:
+            proceed()
 
-    def _on_model_device(self, _btn, index: int) -> None:
+    def _on_model_rm(self, btn, index: int) -> None:
+        models = [m for i, m in enumerate(self._models_cache) if i != index]
+
+        def proceed():
+            self._set_busy(True, "removing model… the engine restarts")
+            _worker(
+                lambda: self.client.request(cmd="set_models", models=models),
+                self._on_result,
+            )
+
+        self._maybe_confirm_restart(btn, "Removing this model", proceed)
+
+    def _on_model_device(self, btn, index: int) -> None:
         models = [dict(m) for m in self._models_cache]
         if not 0 <= index < len(models):
             return
         models[index]["device"] = (
             "cuda" if models[index]["device"] == "cpu" else "cpu"
         )
-        self._set_busy(True, "switching device… the engine restarts")
-        _worker(
-            lambda: self.client.request(cmd="set_models", models=models),
-            self._on_result,
-        )
+
+        def proceed():
+            self._set_busy(True, "switching device… the engine restarts")
+            _worker(
+                lambda: self.client.request(cmd="set_models", models=models),
+                self._on_result,
+            )
+
+        self._maybe_confirm_restart(btn, "Switching this model's device", proceed)
 
     def _on_model_strength(self, scale: Gtk.Scale, index: int) -> None:
         if self._suppress or not self._ready:
@@ -1114,17 +1158,156 @@ class Panel(Gtk.Box):
 
     # -- actions --------------------------------------------------------
 
+    def _confirm(self, anchor, text: str, on_proceed) -> None:
+        """Firmware reboots are never free: every action that costs one
+        goes through this popover. Same shape as the model-device chooser -
+        a popover, because the panel is a layer surface and a parented
+        dialog is a protocol error."""
+        pop = Gtk.Popover()
+        pop.set_parent(anchor)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(8); box.set_margin_bottom(8)
+        box.set_margin_start(10); box.set_margin_end(10)
+        lbl = Gtk.Label(label=text, xalign=0, wrap=True)
+        lbl.add_css_class("dc-hint")
+        lbl.set_max_width_chars(38)
+        box.append(lbl)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        go = Gtk.Button(label="Proceed")
+        go.add_css_class("dc-chip")
+        go.set_hexpand(True)
+        cancel = Gtk.Button(label="Cancel")
+        cancel.add_css_class("dc-chip")
+        cancel.set_hexpand(True)
+
+        def proceed(_b):
+            pop.popdown()
+            on_proceed()
+
+        go.connect("clicked", proceed)
+        cancel.connect("clicked", lambda _b: pop.popdown())
+        row.append(go)
+        row.append(cancel)
+        box.append(row)
+        pop.set_child(box)
+        self._confirm_pop = pop  # keep alive while open
+        pop.popup()
+
+    def _current_res_mode(self) -> str:
+        return self.status.get("mode", "call")
+
     def _on_resolution(self, drop, _param) -> None:
         if self._suppress or not self._ready or self.busy:
             return
-        _, (w, h, iw, ih) = RESOLUTION_CHOICES[drop.get_selected()]
-        self._set_busy(True, "changing resolution… the engine restarts")
-        _worker(
-            lambda: self.client.request(
-                cmd="set_resolution", width=w, height=h, in_width=iw, in_height=ih
-            ),
-            self._on_result,
+        index = drop.get_selected()
+        if index >= len(self._res_choices):
+            return
+        label, w, h, iw, ih = self._res_choices[index]
+        mode = self._current_res_mode()
+
+        def proceed():
+            self._res_applied = index
+            self._set_busy(True, "changing resolution… the engine restarts")
+            _worker(
+                lambda: self.client.request(
+                    cmd="set_resolution",
+                    width=w, height=h, in_width=iw, in_height=ih,
+                ),
+                self._on_result,
+            )
+
+        def cancel_revert():
+            self._suppress = True
+            try:
+                self.res_drop.set_selected(self._res_applied)
+            finally:
+                self._suppress = False
+
+        if mode == "studio":
+            self._confirm_with_revert(
+                self.res_drop,
+                f"{label} re-enters Studio mode, which reboots the "
+                "camera's firmware (~15 s).",
+                proceed, cancel_revert,
+            )
+        else:
+            proceed()
+
+    def _confirm_with_revert(self, anchor, text, on_proceed, on_cancel) -> None:
+        pop = Gtk.Popover()
+        pop.set_parent(anchor)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(8); box.set_margin_bottom(8)
+        box.set_margin_start(10); box.set_margin_end(10)
+        lbl = Gtk.Label(label=text, xalign=0, wrap=True)
+        lbl.add_css_class("dc-hint")
+        lbl.set_max_width_chars(38)
+        box.append(lbl)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        done = {"handled": False}
+
+        def proceed(_b):
+            done["handled"] = True
+            pop.popdown()
+            on_proceed()
+
+        def cancel(_b=None):
+            if not done["handled"]:
+                done["handled"] = True
+                on_cancel()
+            pop.popdown()
+
+        go = Gtk.Button(label="Proceed")
+        go.add_css_class("dc-chip")
+        go.set_hexpand(True)
+        go.connect("clicked", proceed)
+        cxl = Gtk.Button(label="Cancel")
+        cxl.add_css_class("dc-chip")
+        cxl.set_hexpand(True)
+        cxl.connect("clicked", cancel)
+        # Dismissing by clicking elsewhere is a cancel too.
+        pop.connect("closed", lambda *_: cancel())
+        row.append(go)
+        row.append(cxl)
+        box.append(row)
+        pop.set_child(box)
+        self._confirm_pop = pop
+        pop.popup()
+
+    def _on_fps_commit(self, entry) -> None:
+        if self._suppress or not self._ready or self.busy:
+            return
+        mode = self._current_res_mode()
+        try:
+            wanted = float(entry.get_text().strip())
+        except ValueError:
+            self._sync_fps_entry()
+            return
+        lo, hi = self.status.get("fps_range") or (30.0, 30.0)
+        clamped = max(lo, min(hi, wanted))
+        current = float(self.status.get("fps") or 30.0)
+        if mode != "studio" or abs(clamped - current) < 0.01:
+            self._sync_fps_entry()
+            return
+        entry.set_text(f"{clamped:g}")
+
+        def proceed():
+            self._set_busy(True, f"setting {clamped:g} fps… the camera reboots")
+            _worker(
+                lambda: self.client.request(cmd="set_fps", fps=clamped),
+                self._on_result,
+            )
+
+        self._confirm_with_revert(
+            entry,
+            f"{clamped:g} fps re-enters Studio mode, which reboots the "
+            "camera's firmware (~15 s).",
+            proceed, self._sync_fps_entry,
         )
+
+    def _sync_fps_entry(self) -> None:
+        if not self.fps_entry.has_focus():
+            self.fps_entry.set_text(f"{float(self.status.get('fps') or 30.0):g}")
 
     def _on_preview_menu(self, *_args) -> None:
         style = self.preview.cycle_placeholder()
@@ -1197,19 +1380,37 @@ class Panel(Gtk.Box):
             tip = "The C1's mic card is not registered (camera rebooting?)."
         self.mic_chip.set_tooltip_text(tip)
 
-    def _on_mode(self, _btn, mode: str) -> None:
+    def _on_mode(self, btn, mode: str) -> None:
         if self.busy or self.status.get("mode") == mode:
             return
-        if mode == "studio":
-            self._warn_if_default_mic()
-        # Dim right now, not at the next status tick: the click is the
-        # moment the controls stop being real.
-        self.camera_stack.set_sensitive(False)
-        self.camera_stack.set_opacity(0.45)
-        for b in self.mode_buttons.values():
-            b.set_sensitive(False)
-        self._set_busy(True, f"switching to {mode}, the camera reboots…")
-        _worker(lambda: self.client.request(cmd="set_mode", mode=mode), self._on_result)
+
+        def proceed():
+            if mode == "studio":
+                self._warn_if_default_mic()
+            # Dim right now, not at the next status tick: the click is the
+            # moment the controls stop being real.
+            self.camera_stack.set_sensitive(False)
+            self.camera_stack.set_opacity(0.45)
+            for widget in (
+                list(self.mode_buttons.values())
+                + [self.res_drop, self.fps_entry,
+                   self.preset_drop, self.preset_save]
+            ):
+                widget.set_sensitive(False)
+            self._set_busy(True, f"switching to {mode}, the camera reboots…")
+            _worker(
+                lambda: self.client.request(cmd="set_mode", mode=mode),
+                self._on_result,
+            )
+
+        self._confirm(
+            btn,
+            f"Switching to {mode.capitalize()} reboots the camera's "
+            "firmware (~15 s)"
+            + (" and turns the microphone off." if mode == "studio"
+               else " and brings the microphone back."),
+            proceed,
+        )
 
     def _warn_if_default_mic(self) -> None:
         """If the system's default mic is the C1, say what Studio costs.
@@ -1431,15 +1632,37 @@ class Panel(Gtk.Box):
 
         self._suppress = True
         try:
+            if mode != self._res_mode and mode in ("call", "studio"):
+                # The menu itself is mode-specific: Studio adds the 4:3 and
+                # near-full-res sensor geometries Call's firmware lacks.
+                self._res_mode = mode
+                self._res_choices = [
+                    tuple(r) for r in _resolutions_for(_Mode(mode))
+                ]
+                self.res_drop.set_model(
+                    Gtk.StringList.new([r[0] for r in self._res_choices])
+                )
             combo = (
                 st.get("width", 1920), st.get("height", 1080),
                 st.get("in_width", 0), st.get("in_height", 0),
             )
-            for i, (_, choice) in enumerate(RESOLUTION_CHOICES):
-                if choice == combo:
+            for i, (_, w, h, iw, ih) in enumerate(self._res_choices):
+                if (w, h, iw, ih) == combo:
                     self.res_drop.set_selected(i)
+                    self._res_applied = i
                     break
             self.res_drop.set_sensitive(not transitioning)
+            self._sync_fps_entry()
+            lo, hi = st.get("fps_range") or (30.0, 30.0)
+            fps_editable = studio and not transitioning
+            self.fps_entry.set_sensitive(fps_editable)
+            self.fps_entry.set_opacity(1.0 if fps_editable else 0.5)
+            self.fps_entry.set_tooltip_text(
+                f"Capture frame rate: {lo:g}\u2013{hi:g} for this mode and "
+                "resolution. Applying reboots the camera"
+                if studio else
+                "Call mode is fixed at 30 fps by the Opal firmware"
+            )
         finally:
             self._suppress = False
 
@@ -1472,7 +1695,8 @@ class Panel(Gtk.Box):
                 self.preset_drop.set_model(
                     Gtk.StringList.new(["\u2014"] + names)
                 )
-            self.preset_drop.set_sensitive(bool(names))
+            self.preset_drop.set_sensitive(bool(names) and not transitioning)
+            self.preset_save.set_sensitive(not transitioning)
             self.overlay_opacity.set_value(float(st.get("overlay_opacity", 1.0)))
             self.zoom_scale.set_value(float(st.get("zoom", 1.0)))
             self.clahe_scale.set_value(float(st.get("clahe", 0.0)))

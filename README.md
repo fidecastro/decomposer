@@ -314,6 +314,16 @@ Or bypass ONNX entirely — connect to the engine's `mask.sock`, send
 process in any framework; the internal model yields while you're connected.
 See docs/background-blur.md.
 
+The header carries **mode-aware capture selectors**: the resolution menu
+offers each mode what its firmware can do (Studio adds the 12 MP 4:3 and
+32 MP sensor geometries), and the **fps box** is a typed entry clamped to
+the sensor's real range — 1.67–42 for 16:9 in Studio, 30 at 12 MP, 10 at
+32 MP; Call is fixed at 30 by its UVC firmware, so the box locks there.
+`decomposer fps 24` from the CLI. Every action that costs a firmware
+reboot — mode switches, and Studio-side resolution/fps/model changes —
+asks first via a Proceed/Cancel popover; cancelling a resolution change
+puts the menu back where it was.
+
 The panel mirrors Composer's shape: the live preview sits on the left with
 the mode switch and **only the current mode's camera controls** beneath it
 (colour controls in Call; focus, white balance and effects in Studio — the

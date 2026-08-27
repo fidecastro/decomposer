@@ -62,6 +62,65 @@ STUDIO_ONLY_CONTROLS = frozenset({
 })
 
 
+# The LCM48/IMX582's three sensor configurations, read from the device
+# itself (getConnectedCameraFeatures). These are the only frame geometries
+# and rate ranges the Studio firmware can drive; Call mode's UVC firmware
+# advertises its four 16:9 modes at a fixed 30 fps and nothing else.
+SENSOR_CONFIGS = (
+    # (width, height, min_fps, max_fps)
+    (3840, 2160, 1.67, 42.0),   # 16:9 binned: feeds 720p through 4K
+    (4000, 3000, 1.67, 30.0),   # 4:3, 12 MP
+    (5312, 6000, 0.93, 10.0),   # near-full-res; the bus caps real delivery
+)
+CALL_FPS = 30.0
+
+# What each mode can publish: (label, out_w, out_h, in_w, in_h). in 0 means
+# capture at the output size; capturing 4K while publishing 1080p is what
+# makes zoom lossless to 2x.
+RESOLUTIONS_CALL = (
+    ("720p", 1280, 720, 0, 0),
+    ("1080p", 1920, 1080, 0, 0),
+    ("1080p \u00b7 4K cap", 1920, 1080, 3840, 2160),
+    ("1440p", 2560, 1440, 0, 0),
+    ("4K", 3840, 2160, 0, 0),
+)
+RESOLUTIONS_STUDIO = RESOLUTIONS_CALL + (
+    ("12 MP 4:3", 4000, 3000, 0, 0),
+    ("32 MP", 5312, 6000, 0, 0),
+)
+
+
+def resolutions_for(mode: Mode) -> tuple:
+    return RESOLUTIONS_CALL if mode is Mode.CALL else RESOLUTIONS_STUDIO
+
+
+def _sensor_config_for(width: int, height: int):
+    """Which sensor configuration serves a capture geometry."""
+    for cw, ch, lo, hi in SENSOR_CONFIGS:
+        if (width, height) == (cw, ch):
+            return (cw, ch, lo, hi)
+    # Everything 16:9 (and smaller) derives from the binned 4K config.
+    return SENSOR_CONFIGS[0]
+
+
+def fps_limits(mode: Mode, width: int, height: int) -> tuple:
+    """(min_fps, max_fps) for a mode and capture geometry.
+
+    Call mode's UVC descriptors advertise exactly 30 fps: the range
+    collapses to a point. Studio follows the sensor configuration that
+    serves the geometry.
+    """
+    if mode is Mode.CALL:
+        return (CALL_FPS, CALL_FPS)
+    _, _, lo, hi = _sensor_config_for(width, height)
+    return (lo, hi)
+
+
+def clamp_fps(mode: Mode, width: int, height: int, fps: float) -> float:
+    lo, hi = fps_limits(mode, width, height)
+    return max(lo, min(hi, float(fps)))
+
+
 def controls_for(mode: Mode) -> frozenset:
     if mode is Mode.CALL:
         return CALL_ONLY_CONTROLS | SHARED_CONTROLS

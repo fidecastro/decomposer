@@ -671,15 +671,64 @@ class Daemon:
         pick up the new size - the engine will say so if one is pinning it.
         """
         with self.lock:
+            mode = Mode(self.state.mode)
+            allowed = {
+                (r[1], r[2]) for r in model.resolutions_for(mode)
+            }
+            if (int(width), int(height)) not in allowed:
+                raise ValueError(
+                    f"{width}x{height} is not a {mode.value}-mode resolution"
+                )
             if self._ledger.in_progress or not self._requests.empty():
                 raise RuntimeError("a mode transition is already in progress")
             self.state.width = int(width)
             self.state.height = int(height)
             self.state.in_width = int(in_width or 0)
             self.state.in_height = int(in_height or 0)
-            mode = Mode(self.state.mode)
+            # The frame rate rides the geometry: entering a config whose
+            # range excludes the current fps silently failing the camera
+            # is worse than clamping and saying so.
+            self.fps = model.clamp_fps(
+                mode, self.state.width, self.state.height, self.fps
+            )
         self.request_transition(mode, enforce_guard=False)
         return self.status()
+
+    def set_fps(self, fps) -> dict:
+        """Change the capture frame rate. Studio only: Call mode's UVC
+        firmware advertises exactly 30 fps. A Studio change re-enters the
+        mode, which reboots the camera's firmware."""
+        with self.lock:
+            mode = Mode(self.state.mode)
+            if mode is Mode.CALL:
+                raise RuntimeError(
+                    "call mode is fixed at 30 fps by the Opal firmware; "
+                    "frame rate is adjustable in Studio mode"
+                )
+            lo, hi = model.fps_limits(mode, self.state.width, self.state.height)
+            wanted = float(fps)
+            clamped = model.clamp_fps(
+                mode, self.state.width, self.state.height, wanted
+            )
+            if clamped == self.fps:
+                # Already there (possibly after clamping): a reboot would
+                # buy nothing.
+                out = self.status()
+                if clamped != wanted:
+                    out["notes"] = [f"already at {clamped} (range {lo}-{hi})"]
+                return out
+            if self._ledger.in_progress or not self._requests.empty():
+                raise RuntimeError("a mode transition is already in progress")
+            self.fps = clamped
+        out_note = (
+            None if clamped == wanted
+            else f"clamped to {clamped} (range {lo}-{hi})"
+        )
+        self.request_transition(mode, enforce_guard=False)
+        out = self.status()
+        if out_note:
+            out["notes"] = [out_note]
+        return out
 
     def set_clahe(self, strength) -> dict:
         """Local contrast (CLAHE) on the GPU. 0 disables and skips the passes."""
@@ -1089,6 +1138,11 @@ class Daemon:
         with self.lock:
             s["looks"] = list(self._looks_cache)
         s["restarts"] = self.restarts
+        s["fps"] = self.fps
+        with self.lock:
+            s["fps_range"] = model.fps_limits(
+                Mode(self.state.mode), self.state.width, self.state.height
+            )
         with self.lock:
             s["transitioning"] = self._ledger.in_progress
         with self.lock:
@@ -1286,6 +1340,8 @@ class Daemon:
             if cmd == "set_model_strength":
                 return {"ok": True, **self.set_model_strength(
                     req.get("index"), req.get("strength"))}
+            if cmd == "set_fps":
+                return {"ok": True, **self.set_fps(req.get("fps"))}
             if cmd == "set_blur":
                 return {"ok": True, **self.set_blur(
                     req.get("strength"), req.get("style"))}

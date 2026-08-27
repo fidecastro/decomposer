@@ -92,3 +92,23 @@ def test_fake_camera_refusals_flow_through():
     applied, refused = fake.apply_controls({"focus": 10, "wb": 3000})
     assert applied == {"focus": 10}
     assert refused == {"wb": "hardware said no"}
+
+
+def test_fps_limits_follow_the_firmware():
+    from opal_c1.core.model import clamp_fps, fps_limits, resolutions_for
+
+    # Call mode: the UVC menu has one number on it.
+    assert fps_limits(Mode.CALL, 1920, 1080) == (30.0, 30.0)
+    assert clamp_fps(Mode.CALL, 3840, 2160, 60) == 30.0
+    # Studio 16:9 rides the binned-4K sensor config.
+    assert fps_limits(Mode.STUDIO, 1920, 1080) == (1.67, 42.0)
+    assert clamp_fps(Mode.STUDIO, 1920, 1080, 60) == 42.0
+    assert clamp_fps(Mode.STUDIO, 1920, 1080, 0.5) == 1.67
+    # The big sensor configs carry their own ceilings.
+    assert fps_limits(Mode.STUDIO, 4000, 3000)[1] == 30.0
+    assert fps_limits(Mode.STUDIO, 5312, 6000) == (0.93, 10.0)
+    # And only Studio offers the non-16:9 geometries.
+    call_sizes = {(r[1], r[2]) for r in resolutions_for(Mode.CALL)}
+    studio_sizes = {(r[1], r[2]) for r in resolutions_for(Mode.STUDIO)}
+    assert (5312, 6000) in studio_sizes - call_sizes
+    assert (4000, 3000) in studio_sizes - call_sizes

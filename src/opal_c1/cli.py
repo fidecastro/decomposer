@@ -676,6 +676,8 @@ RESOLUTIONS = {
     "1080p": (1920, 1080),
     "1440p": (2560, 1440),
     "4k": (3840, 2160),
+    "12mp": (4000, 3000),    # Studio only: the 4:3 sensor config
+    "32mp": (5312, 6000),    # Studio only: near-full-res, fps <= 10
 }
 
 
@@ -871,6 +873,21 @@ def _cmd_model(args: argparse.Namespace) -> int:
         return 1
     print("  chain updated; the engine restarts")
     _print_models(resp.get("models") or [])
+    return 0
+
+
+def _cmd_fps(args: argparse.Namespace) -> int:
+    if args.value is None:
+        resp = _client_call(cmd="status")
+    else:
+        resp = _client_call(cmd="set_fps", fps=float(args.value))
+    if not resp.get("ok"):
+        return 1
+    lo, hi = resp.get("fps_range") or (None, None)
+    print(f"  fps       {resp.get('fps')}  (range {lo}-{hi} for "
+          f"{resp.get('mode')} at {resp.get('width')}x{resp.get('height')})")
+    for note in resp.get("notes") or []:
+        print(f"    note: {note}")
     return 0
 
 
@@ -1252,6 +1269,19 @@ def build_parser() -> argparse.ArgumentParser:
     md.add_argument("--device", choices=("cpu", "cuda"), default="cpu",
                     help="Where the model runs (add only)")
     md.set_defaults(func=_cmd_model)
+
+    fp = sub.add_parser(
+        "fps",
+        help="Capture frame rate (Studio only; Call is fixed at 30)",
+        description=(
+            "Studio mode drives the sensor directly: 1.67-42 fps for the "
+            "16:9 resolutions, up to 30 at 4000x3000, up to 10 at "
+            "5312x6000. Changing it re-enters Studio, which reboots the "
+            "camera's firmware. Call mode's UVC firmware is fixed at 30."
+        ),
+    )
+    fp.add_argument("value", nargs="?", default=None, help="frames per second")
+    fp.set_defaults(func=_cmd_fps)
 
     bl = sub.add_parser(
         "blur",
