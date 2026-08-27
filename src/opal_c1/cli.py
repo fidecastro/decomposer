@@ -509,6 +509,8 @@ def _print_status(st: dict) -> None:
         print(f"  controls  {st['controls']}")
     for line in st.get("engine_log") or []:
         print(f"  engine    {line}")
+    if st.get("notice"):
+        print(f"  notice    {st['notice']}")
     if st.get("last_event"):
         print(f"  last      {st['last_event']}")
     if st.get("error"):

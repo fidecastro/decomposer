@@ -84,6 +84,14 @@ class EnginePolicy:
         self.backoff = 0.0
         self.failures = 0
 
+    def on_replug(self) -> None:
+        """The camera was physically reconnected: everything the counters
+        learned described the old connection. Start clean."""
+        self.backoff = 0.0
+        self.failures = 0
+        self.vanished = 0
+        self.short_lives = 0
+
     def on_death(self, mode: Mode, uptime: float, camera_on_bus: bool) -> Action:
         """The engine is dead (or never started). What now?"""
         if 0 < uptime < SHORT_LIFE_SECONDS:

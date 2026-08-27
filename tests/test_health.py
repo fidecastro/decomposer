@@ -129,3 +129,16 @@ def test_stall_recovers_when_frames_resume():
     detector.update(frames=7, now=0.0)
     assert detector.update(frames=7, now=12.0)
     assert not detector.update(frames=8, now=13.0)
+
+
+def test_replug_resets_every_counter():
+    # A reconnected camera is new hardware state: holding it to the old
+    # connection's sins would delay recovery for no reason.
+    policy = EnginePolicy()
+    for _ in range(SHORT_LIVES_LIMIT - 1):
+        policy.on_death(Mode.CALL, uptime=11.0, camera_on_bus=True)
+    for _ in range(VANISHED_LIMIT - 1):
+        policy.on_death(Mode.CALL, uptime=0.0, camera_on_bus=False)
+    policy.on_replug()
+    action = policy.on_death(Mode.CALL, uptime=11.0, camera_on_bus=True)
+    assert action.kind is Kind.RETRY

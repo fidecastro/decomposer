@@ -152,6 +152,8 @@ class State:
     error: Optional[str] = None
     # History, not a live fault: the last notable recovery or incident.
     last_event: Optional[str] = None
+    # Transient user-facing announcement ("camera connected...").
+    notice: Optional[str] = None
     controls: dict = field(default_factory=dict)
 
 
@@ -185,6 +187,9 @@ class Daemon:
         self._backend = None
         self._sticky: dict = {}
         self._shutdown = threading.Event()
+        # Set by the USB hotplug watcher; interrupts supervisor holds so a
+        # replug recovers in seconds instead of riding out a blind wait.
+        self._camera_event = threading.Event()
         self.restarts = 0
         # Transitions are executed by exactly one worker thread, in order.
         # Clients and the supervisor submit requests; the ledger (pure core)
@@ -914,6 +919,27 @@ class Daemon:
 
     # -- supervision ----------------------------------------------------
 
+    def _on_camera_plug(self) -> None:
+        print("camera connected: waking recovery")
+        with self.lock:
+            self.state.notice = "camera connected — starting the feed…"
+        self._camera_event.set()
+
+    def _hold(self, seconds: float) -> str:
+        """Wait, but wake early for shutdown or a camera replug.
+
+        Returns "shutdown", "replug" or "elapsed".
+        """
+        waited = 0.0
+        while waited < seconds:
+            if self._shutdown.wait(0.5):
+                return "shutdown"
+            waited += 0.5
+            if self._camera_event.is_set():
+                self._camera_event.clear()
+                return "replug"
+        return "elapsed"
+
     def _supervise(self) -> None:
         """Restart the engine when it dies. Decisions come from core.health.
 
@@ -932,6 +958,8 @@ class Daemon:
                 engine = self._engine
                 if engine is not None and engine.alive():
                     policy.note_alive()
+                    if self.state.notice and self.state.frames > 0:
+                        self.state.notice = None
                     continue
                 # Covers both an engine that died and one that never started
                 # (a mode switch that failed mid-camera-reboot).
@@ -950,8 +978,11 @@ class Daemon:
                 with self.lock:
                     self.state.error = action.message
                 print(action.message)
-                if self._shutdown.wait(action.delay):
+                outcome = self._hold(action.delay)
+                if outcome == "shutdown":
                     return
+                if outcome == "replug":
+                    policy.on_replug()
                 continue
 
             if action.kind is health.Kind.HOLD_VANISHED:
@@ -962,16 +993,23 @@ class Daemon:
                 # replug recovers in seconds rather than a minute.
                 waited = 0.0
                 while waited < action.delay:
-                    if self._shutdown.wait(health.VANISHED_POLL_SECONDS):
+                    outcome = self._hold(health.VANISHED_POLL_SECONDS)
+                    if outcome == "shutdown":
                         return
+                    if outcome == "replug":
+                        policy.on_replug()
+                        break
                     waited += health.VANISHED_POLL_SECONDS
                     if current_mode() is not None:
                         break
                 continue
 
             print(f"engine died ({reason}); retrying {mode.value} in {action.delay:.0f}s")
-            if self._shutdown.wait(action.delay):
+            outcome = self._hold(action.delay)
+            if outcome == "shutdown":
                 return
+            if outcome == "replug":
+                policy.on_replug()
 
             if not self._camera_settled():
                 # Mid-reboot. Say nothing and come back; attempting now would
@@ -1171,6 +1209,13 @@ class Daemon:
         threading.Thread(target=self._supervise, daemon=True).start()
         threading.Thread(target=self._status_poller, daemon=True).start()
         threading.Thread(target=self._watchdog, daemon=True).start()
+        try:
+            from opal_c1.adapters.bus_events import watch
+            from opal_c1.core.model import USB_VID
+
+            watch(USB_VID, self._on_camera_plug, stop_event=self._shutdown)
+        except Exception as e:
+            print(f"usb hotplug watcher not started: {e}")
         self._start_tray()
 
         # Entering the initial mode takes seconds to minutes when the camera

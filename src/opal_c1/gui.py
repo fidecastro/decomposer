@@ -1117,7 +1117,7 @@ class Panel(Gtk.Box):
             )
         else:
             self.preview.show_placeholder()
-            message = st.get("error") or "engine not running"
+            message = st.get("notice") or st.get("error") or "engine not running"
             # Engine logs can be a wall; the footer is one line of truth.
             if len(message) > 160:
                 message = message[:157] + "…"
