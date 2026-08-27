@@ -33,9 +33,15 @@ struct Params {
     ov_opacity: f32,
     /// Edge length of the loaded LUT; 0 means fall back to the built-in look.
     lut_size: u32,
+    /// Source dimensions; may exceed the output (that headroom is the zoom).
+    src_w: u32,
+    src_h: u32,
+    zoom: f32,
+    pan_x: f32,
+    pan_y: f32,
     // WGSL rounds uniform structs up to 16 bytes; pad explicitly so the Rust
     // and shader layouts cannot silently disagree.
-    _pad: [u32; 1],
+    _pad: [u32; 4],
 }
 
 pub struct Gpu {
@@ -52,12 +58,17 @@ pub struct Gpu {
     staging: wgpu::Buffer,
     params: Params,
     size: u64,
+    src_size: u64,
     out: Vec<u8>,
     pub adapter_name: String,
 }
 
 impl Gpu {
-    pub fn new(width: u32, height: u32, look: u32, strength: f32, flip: u32) -> Result<Self> {
+    pub fn new(
+        src_w: u32, src_h: u32,
+        width: u32, height: u32,
+        look: u32, strength: f32, flip: u32,
+    ) -> Result<Self> {
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(
             instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -75,12 +86,15 @@ impl Gpu {
             }))
             .map_err(|e| anyhow!("could not create GPU device: {e}"))?;
 
+        let src_size = super::source::nv12_len(src_w, src_h) as u64;
         let size = super::source::nv12_len(width, height) as u64;
         let params = Params {
             width, height, look, strength, flip,
             ov_x: 0, ov_y: 0, ov_w: 0, ov_h: 0, ov_opacity: 1.0,
             lut_size: 0,
-            _pad: [0; 1],
+            src_w, src_h,
+            zoom: 1.0, pan_x: 0.0, pan_y: 0.0,
+            _pad: [0; 4],
         };
 
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -96,7 +110,12 @@ impl Gpu {
                 mapped_at_creation: false,
             })
         };
-        let src_buf = mk("src", wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+        let src_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("src"),
+            size: src_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let dst_buf = mk("dst", wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
         let staging = mk("staging", wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
         // A storage binding cannot be empty, so an absent overlay is a single
@@ -182,7 +201,7 @@ impl Gpu {
 
         Ok(Self {
             device, queue, pipeline, bind_group, layout, params_buf, src_buf, dst_buf,
-            overlay_buf, lut_buf, staging, params, size,
+            overlay_buf, lut_buf, staging, params, size, src_size,
             out: vec![0u8; size as usize], adapter_name,
         })
     }
@@ -274,6 +293,15 @@ impl Gpu {
         self.upload_params();
     }
 
+    /// Digital zoom and pan, applied in the same coordinate mapping as the
+    /// mirror. Lossless up to src/out ratio; upscaling beyond.
+    pub fn set_zoom(&mut self, zoom: f32, pan_x: f32, pan_y: f32) {
+        self.params.zoom = zoom.clamp(1.0, 8.0);
+        self.params.pan_x = pan_x.clamp(-1.0, 1.0);
+        self.params.pan_y = pan_y.clamp(-1.0, 1.0);
+        self.upload_params();
+    }
+
     fn upload_params(&mut self) {
         self.queue
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
@@ -281,7 +309,7 @@ impl Gpu {
 
     /// Grade one NV12 frame. The returned slice is valid until the next call.
     pub fn process(&mut self, frame: &[u8]) -> Result<&[u8]> {
-        let n = (frame.len() as u64).min(self.size);
+        let n = (frame.len() as u64).min(self.src_size);
         self.queue.write_buffer(&self.src_buf, 0, &frame[..n as usize]);
 
         let mut enc = self

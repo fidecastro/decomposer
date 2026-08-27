@@ -216,11 +216,22 @@ class Panel(Gtk.Box):
         tap = Gtk.GestureClick()
         tap.connect("released", self._on_preview_tap)
         self.preview.add_controller(tap)
+        scroll = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL
+        )
+        scroll.connect("scroll", self._on_preview_scroll)
+        self.preview.add_controller(scroll)
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self._on_pan_begin)
+        drag.connect("drag-update", self._on_pan_update)
+        self.preview.add_controller(drag)
+        self._pan_base = (0.0, 0.0)
         body.append(self.preview)
         body.append(self._mode_row())
         body.append(self._sep())
         body.append(self._look_block())
         body.append(self._overlay_row())
+        body.append(self._zoom_row())
         body.append(self._preset_row())
         body.append(self._sep())
         body.append(self._camera_block())
@@ -376,6 +387,51 @@ class Panel(Gtk.Box):
         self.overlay_opacity.connect("value-changed", self._on_overlay_opacity)
         row.append(self.overlay_opacity)
         return row
+
+    def _zoom_row(self) -> Gtk.Widget:
+        row, self.zoom_scale, self.zoom_value = self._slider_row(
+            "Zoom", 1.0, 4.0, 0.1, digits=1
+        )
+        self.zoom_scale.connect("value-changed", self._on_zoom)
+        self.zoom_scale.set_tooltip_text(
+            "Digital zoom. Scroll on the preview to zoom, drag to pan."
+        )
+        return row
+
+    def _on_zoom(self, scale: Gtk.Scale) -> None:
+        self.zoom_value.set_text(f"{scale.get_value():.1f}x")
+        if self._suppress or not self._ready:
+            return
+        self._queue({"zoom": round(scale.get_value(), 2)})
+
+    def _on_preview_scroll(self, _ctrl, _dx, dy: float) -> bool:
+        if not self._ready:
+            return True
+        current = float(self.status.get("zoom") or 1.0)
+        target = max(1.0, min(4.0, current - dy * 0.25))
+        self._queue({"zoom": round(target, 2)})
+        return True
+
+    def _on_pan_begin(self, _gesture, _x, _y) -> None:
+        self._pan_base = (
+            float(self.status.get("pan_x") or 0.0),
+            float(self.status.get("pan_y") or 0.0),
+        )
+
+    def _on_pan_update(self, _gesture, dx: float, dy: float) -> None:
+        if not self._ready:
+            return
+        zoom = float(self.status.get("zoom") or 1.0)
+        if zoom <= 1.001:
+            return
+        # Dragging moves the content with the pointer: pan spans [-1, 1]
+        # across the crop margin, so scale pixels through the visible span.
+        w = max(1, self.preview.get_width())
+        h = max(1, self.preview.get_height())
+        span = 2.0 * zoom / (zoom - 1.0)
+        px = max(-1.0, min(1.0, self._pan_base[0] - dx / w * span))
+        py = max(-1.0, min(1.0, self._pan_base[1] - dy / h * span))
+        self._queue({"pan_x": round(px, 3), "pan_y": round(py, 3)})
 
     def _preset_row(self) -> Gtk.Widget:
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
@@ -634,6 +690,16 @@ class Panel(Gtk.Box):
         pending, self._pending = self._pending, {}
         if not pending:
             return False
+        zoomish = {
+            k: pending.pop(k)
+            for k in ("zoom", "pan_x", "pan_y")
+            if k in pending
+        }
+        if zoomish:
+            _worker(
+                lambda: self.client.request(cmd="set_zoom", **zoomish),
+                self._on_result,
+            )
         opacity = pending.pop("overlay_opacity", None)
         if opacity is not None:
             _worker(
@@ -749,6 +815,7 @@ class Panel(Gtk.Box):
                 )
             self.preset_drop.set_sensitive(bool(names))
             self.overlay_opacity.set_value(float(st.get("overlay_opacity", 1.0)))
+            self.zoom_scale.set_value(float(st.get("zoom", 1.0)))
             self.strength.set_value(float(st.get("strength", 1.0)))
             controls = st.get("controls") or {}
             for key, scale in self.sliders.items():

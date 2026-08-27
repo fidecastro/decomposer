@@ -356,6 +356,24 @@ The panel has a dropdown to load and a popover to save. A popover rather than a
 dialog, because a layer surface cannot parent a dialog but `xdg_popup` is part of
 the protocol and works.
 
+### Digital zoom
+
+```bash
+decomposer zoom 2 --x 0.3 --y -0.1    # 2x, window right-of-centre and up
+decomposer zoom off
+```
+
+Zoom crops and scales in the shader — the read side is a bilinear sampler, so
+mirroring, zooming and capture-to-output scaling are all one coordinate
+mapping. On the panel: a slider, scroll-wheel over the preview to zoom, drag to
+pan. Zoom and pan are part of presets.
+
+By default the capture equals the output and zoom upscales. Run the daemon with
+`--in-width 3840 --in-height 2160` and it captures 4K while publishing 1080p:
+zoom is then **lossless to 2x** — verified against a synthetic frame, the 2x
+output matches the exact centre crop with zero error — at the cost of a few fps
+(the camera delivers 4K at ~22-27 rather than 30).
+
 ### Overlays
 
 Composer called these stickers. A PNG is composited over the frame — a logo, a

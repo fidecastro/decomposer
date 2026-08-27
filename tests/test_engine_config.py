@@ -38,6 +38,19 @@ def test_each_live_field_produces_its_line():
     ) == ["overlay /tmp/x.png"]
 
 
+def test_zoom_and_pan_lines():
+    base = cfg()
+    assert engine_delta_lines(base, replace(base, zoom=2.0)) == ["zoom 2.0"]
+    assert engine_delta_lines(
+        base, replace(base, pan_x=0.5, pan_y=-0.25)
+    ) == ["pan 0.5 -0.25"]
+
+
+def test_capture_size_is_a_restart_field():
+    assert cfg(in_width=3840, in_height=2160).needs_restart_from(cfg())
+    assert not cfg(zoom=3.0, pan_x=1.0).needs_restart_from(cfg())
+
+
 def test_clearing_the_overlay_sends_off():
     with_overlay = cfg(overlay="/tmp/x.png")
     assert engine_delta_lines(with_overlay, cfg()) == ["overlay off"]

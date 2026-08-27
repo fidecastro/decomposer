@@ -6,7 +6,7 @@
 // invocations ever touch the same word and no atomics are needed.
 
 struct Params {
-    width: u32,
+    width: u32,          // output dimensions
     height: u32,
     look: u32,
     strength: f32,
@@ -22,7 +22,19 @@ struct Params {
     ov_opacity: f32,
     /// Edge length of the loaded 3D LUT; 0 means use the built-in look.
     lut_size: u32,
+    // Source dimensions: the capture may be larger than the output (4K in,
+    // 1080p out), which is what makes zoom lossless up to their ratio.
+    src_w: u32,
+    src_h: u32,
+    // Digital zoom: the crop window is src/zoom, positioned by pan in
+    // [-1, 1] across the available margin. zoom 1 + pan 0 = identity.
+    zoom: f32,
+    pan_x: f32,
+    pan_y: f32,
     _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -178,6 +190,84 @@ fn composite(px: u32, py: u32, rgb: vec3<f32>) -> vec3<f32> {
     return mix(rgb, src, clamp(alpha, 0.0, 1.0));
 }
 
+// -- source sampling ---------------------------------------------------
+// The input is NV12 at src_w x src_h; reads are byte fetches out of u32
+// words. Bilinear taps: at zoom 1 with equal sizes the coordinates are
+// integral and this degenerates to exact reads.
+
+fn y_byte(x: u32, y: u32) -> f32 {
+    let idx = y * params.src_w + x;
+    let word = src[idx >> 2u];
+    return f32((word >> ((idx & 3u) * 8u)) & 0xffu) / 255.0;
+}
+
+fn uv_bytes(cx: u32, cy: u32) -> vec2<f32> {
+    // Chroma plane: src_h/2 rows of src_w bytes, U and V interleaved.
+    let base = params.src_w * params.src_h;
+    let idx = base + cy * params.src_w + cx * 2u;
+    let w0 = src[idx >> 2u];
+    let u = f32((w0 >> ((idx & 3u) * 8u)) & 0xffu);
+    let idx_v = idx + 1u;
+    let w1 = src[idx_v >> 2u];
+    let v = f32((w1 >> ((idx_v & 3u) * 8u)) & 0xffu);
+    return vec2<f32>(u, v) / 255.0;
+}
+
+fn sample_y(fx: f32, fy: f32) -> f32 {
+    let mx = f32(params.src_w - 1u);
+    let my = f32(params.src_h - 1u);
+    let cx = clamp(fx, 0.0, mx);
+    let cy = clamp(fy, 0.0, my);
+    let x0 = u32(floor(cx)); let y0 = u32(floor(cy));
+    let x1 = min(x0 + 1u, params.src_w - 1u);
+    let y1 = min(y0 + 1u, params.src_h - 1u);
+    let tx = fract(cx); let ty = fract(cy);
+    let a = mix(y_byte(x0, y0), y_byte(x1, y0), tx);
+    let b = mix(y_byte(x0, y1), y_byte(x1, y1), tx);
+    return mix(a, b, ty);
+}
+
+fn sample_uv(fx: f32, fy: f32) -> vec2<f32> {
+    let hw = params.src_w / 2u;
+    let hh = params.src_h / 2u;
+    let cxf = clamp(fx * 0.5, 0.0, f32(hw - 1u));
+    let cyf = clamp(fy * 0.5, 0.0, f32(hh - 1u));
+    let x0 = u32(floor(cxf)); let y0 = u32(floor(cyf));
+    let x1 = min(x0 + 1u, hw - 1u);
+    let y1 = min(y0 + 1u, hh - 1u);
+    let tx = fract(cxf); let ty = fract(cyf);
+    let a = mix(uv_bytes(x0, y0), uv_bytes(x1, y0), tx);
+    let b = mix(uv_bytes(x0, y1), uv_bytes(x1, y1), tx);
+    return mix(a, b, ty);
+}
+
+// Output pixel -> source coordinate: normalized position, mirrored if asked,
+// then mapped into the zoomed crop window.
+fn source_coord(px: u32, py: u32) -> vec2<f32> {
+    var u = (f32(px) + 0.5) / f32(params.width);
+    var v = (f32(py) + 0.5) / f32(params.height);
+    if ((params.flip & 1u) != 0u) { u = 1.0 - u; }
+    if ((params.flip & 2u) != 0u) { v = 1.0 - v; }
+    let z = max(params.zoom, 1.0);
+    let sw = f32(params.src_w);
+    let sh = f32(params.src_h);
+    let crop_w = sw / z;
+    let crop_h = sh / z;
+    let margin_x = (sw - crop_w) * 0.5;
+    let margin_y = (sh - crop_h) * 0.5;
+    let x0 = margin_x + clamp(params.pan_x, -1.0, 1.0) * margin_x;
+    let y0 = margin_y + clamp(params.pan_y, -1.0, 1.0) * margin_y;
+    return vec2<f32>(x0 + u * crop_w - 0.5, y0 + v * crop_h - 0.5);
+}
+
+fn graded(px: u32, py: u32) -> vec3<f32> {
+    let sc = source_coord(px, py);
+    let y = sample_y(sc.x, sc.y);
+    let uv = sample_uv(sc.x, sc.y);
+    let rgb = apply_look(ycbcr_to_rgb(y, uv.x, uv.y));
+    return composite(px, py, rgb);
+}
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = gid.x * 4u;
@@ -189,38 +279,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w = params.width;
     let uv_base = w * params.height;
 
-    let flip_h = (params.flip & 1u) != 0u;
-    let flip_v = (params.flip & 2u) != 0u;
-
-    // Read from the mirrored block. Both axes stay block-aligned: widths are a
-    // multiple of four and the block is two rows tall, so every read is still
-    // one aligned u32 and the write side is untouched.
-    var sx = x;
-    var sy = y;
-    if (flip_h) { sx = w - 4u - x; }
-    if (flip_v) { sy = params.height - 2u - y; }
-
-    let s0_word = (sy * w + sx) >> 2u;
-    let s1_word = ((sy + 1u) * w + sx) >> 2u;
-    let suv_word = (uv_base + (sy >> 1u) * w + sx) >> 2u;
-
-    var y0 = unpack4(src[s0_word]);
-    var y1 = unpack4(src[s1_word]);
-    var uv = unpack4(src[suv_word]);  // U0 V0 U1 V1
-
-    if (flip_v) {
-        // The block's two rows swap; chroma is shared between them.
-        let t = y0;
-        y0 = y1;
-        y1 = t;
-    }
-    if (flip_h) {
-        y0 = vec4<f32>(y0.w, y0.z, y0.y, y0.x);
-        y1 = vec4<f32>(y1.w, y1.z, y1.y, y1.x);
-        // Columns 0,1 now come from the source's right-hand pair.
-        uv = vec4<f32>(uv.z, uv.w, uv.x, uv.y);
-    }
-
     var out0: vec4<f32>;
     var out1: vec4<f32>;
     var cb_sum = vec2<f32>(0.0);
@@ -228,13 +286,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     for (var i = 0u; i < 4u; i = i + 1u) {
         let pair = i >> 1u;
-        let cb = select(uv.x, uv.z, pair == 1u);
-        let cr = select(uv.y, uv.w, pair == 1u);
-
-        // Overlay coordinates are output-space, so a mirrored image does not
-        // drag the logo along with it.
-        let top = composite(x + i, y, apply_look(ycbcr_to_rgb(y0[i], cb, cr)));
-        let bot = composite(x + i, y + 1u, apply_look(ycbcr_to_rgb(y1[i], cb, cr)));
+        let top = graded(x + i, y);
+        let bot = graded(x + i, y + 1u);
 
         out0[i] = rgb_to_y(top);
         out1[i] = rgb_to_y(bot);
@@ -245,7 +298,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         cr_sum[pair] = cr_sum[pair] + ct.y + cbm.y;
     }
 
-    // Writes stay at the invocation's own block, so no two threads collide.
+    // Writes stay at the invocation's own aligned block: no collisions.
     let d0_word = (y * w + x) >> 2u;
     let d1_word = ((y + 1u) * w + x) >> 2u;
     let duv_word = (uv_base + (y >> 1u) * w + x) >> 2u;

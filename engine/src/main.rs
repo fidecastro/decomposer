@@ -37,6 +37,25 @@ struct Args {
     #[arg(long, default_value_t = 1080)]
     height: u32,
 
+    /// Capture size; 0 means same as the output. Capturing larger than the
+    /// output (4K in, 1080p out) is what makes zoom lossless.
+    #[arg(long, default_value_t = 0)]
+    in_width: u32,
+
+    #[arg(long, default_value_t = 0)]
+    in_height: u32,
+
+    /// Digital zoom, 1.0 to 8.0
+    #[arg(long, default_value_t = 1.0)]
+    zoom: f32,
+
+    /// Crop position across the available margin, -1.0 to 1.0
+    #[arg(long, default_value_t = 0.0)]
+    pan_x: f32,
+
+    #[arg(long, default_value_t = 0.0)]
+    pan_y: f32,
+
     /// Stop after N frames (0 = run forever). Useful for smoke tests.
     #[arg(long, default_value_t = 0)]
     frames: u64,
@@ -90,17 +109,23 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    let in_w = if args.in_width == 0 { args.width } else { args.in_width };
+    let in_h = if args.in_height == 0 { args.height } else { args.in_height };
     let mut source: Box<dyn FrameSource> = if args.input == "-" {
-        Box::new(StdinSource::new(args.width, args.height))
+        Box::new(StdinSource::new(in_w, in_h))
     } else {
         Box::new(
-            V4l2Source::new(&args.input, args.width, args.height)
+            V4l2Source::new(&args.input, in_w, in_h)
                 .with_context(|| format!("opening capture device {}", args.input))?,
         )
     };
 
     let (w, h) = source.dimensions();
     eprintln!("input  {} {}x{} NV12", args.input, w, h);
+    let (out_w, out_h) = (args.width, args.height);
+    if args.passthrough && (w, h) != (out_w, out_h) {
+        anyhow::bail!("passthrough cannot scale: input {w}x{h}, output {out_w}x{out_h}");
+    }
 
     // "null" discards frames (benchmarking); "-" writes raw NV12 to stdout,
     // which pipes straight into ffmpeg for inspection.
@@ -113,9 +138,9 @@ fn main() -> Result<()> {
         stdout_sink = Some(std::io::stdout().lock());
         None
     } else {
-        let s = source::V4l2Sink::new(&args.output, w, h)
+        let s = source::V4l2Sink::new(&args.output, out_w, out_h)
             .with_context(|| format!("opening output device {}", args.output))?;
-        eprintln!("output {} {}x{}", args.output, w, h);
+        eprintln!("output {} {}x{}", args.output, out_w, out_h);
         Some(s)
     };
 
@@ -156,7 +181,7 @@ fn main() -> Result<()> {
                     .unwrap_or_default()
             ),
         };
-        let g = gpu::Gpu::new(w, h, idx, args.strength, args.flip & 3)?;
+        let g = gpu::Gpu::new(w, h, out_w, out_h, idx, args.strength, args.flip & 3)?;
         eprintln!("look   {} @ {:.2} on {}", args.look, args.strength, g.adapter_name);
         Some(g)
     };
@@ -184,6 +209,9 @@ fn main() -> Result<()> {
             s.overlay_max_h = rect[3];
         }
         s.overlay_dirty = s.overlay_path.is_some();
+        s.zoom = args.zoom.clamp(1.0, 8.0);
+        s.pan_x = args.pan_x.clamp(-1.0, 1.0);
+        s.pan_y = args.pan_y.clamp(-1.0, 1.0);
         // Force the first pass through the resolver so the initial --look
         // actually loads its LUT instead of silently using a built-in curve.
         s.dirty = true;
@@ -212,12 +240,14 @@ fn main() -> Result<()> {
                 let mut s = look_state.lock().unwrap();
                 s.dirty.then(|| {
                     s.dirty = false;
-                    (s.look, s.look_name.clone(), s.strength, s.flip)
+                    (s.look, s.look_name.clone(), s.strength, s.flip,
+                     s.zoom, s.pan_x, s.pan_y)
                 })
             };
-            if let Some((look, name, strength, flip)) = pending {
+            if let Some((look, name, strength, flip, zoom, pan_x, pan_y)) = pending {
                 g.set_look(look, strength);
                 g.set_flip(flip);
+                g.set_zoom(zoom, pan_x, pan_y);
                 // Reloading the same LUT every strength tweak would be wasteful,
                 // so only touch it when the name actually changes.
                 if name != applied_look {
@@ -283,7 +313,7 @@ fn main() -> Result<()> {
             sink.write(out)?;
         }
         if let Some(p) = preview.as_mut() {
-            p.publish(out, w, h);
+            p.publish(out, out_w, out_h);
         }
         if let Some(w) = stdout_sink.as_mut() {
             use std::io::Write;

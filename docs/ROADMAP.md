@@ -122,8 +122,8 @@ sanitizing and async LUT loading (P2), plus the features below.
 
 ## Features (deferred until P0 is done)
 
-- **Digital zoom / crop** — the sensor is 8000x6000 and we publish at most 4K;
-  crop+pan with no quality loss. Studio mode via ISP; Call mode via shader crop.
+- ~~**Digital zoom / crop**~~ — done: shader sampler, `zoom`/`pan` protocol,
+  panel scroll+drag, lossless to 2x with `--in-width 3840 --in-height 2160`.
 - **CLAHE** — local contrast, a real GPU pass (Composer shipped it).
 - **Background blur / replacement** — segmentation on the idle 4090. The
   largest remaining Composer gap. Model choice + licensing needs its own

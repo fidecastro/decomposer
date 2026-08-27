@@ -137,6 +137,10 @@ class EngineConfig:
     output: str = "/dev/video10"
     width: int = 1920
     height: int = 1080
+    # Capture size; 0 means same as the output. Capturing 4K while publishing
+    # 1080p is what makes zoom lossless up to 2x.
+    in_width: int = 0
+    in_height: int = 0
     look: str = "none"
     strength: float = 0.5
     flip: int = 0                        # bit 0 mirror-h, bit 1 mirror-v
@@ -147,10 +151,15 @@ class EngineConfig:
     overlay_h: int = 0
     overlay_opacity: float = 1.0
     lut_dir: Optional[str] = None
+    zoom: float = 1.0
+    pan_x: float = 0.0
+    pan_y: float = 0.0
 
     # Fields whose change cannot be applied over the control socket: the
     # engine has to be restarted for them. Everything else is a live update.
-    RESTART_FIELDS = ("input", "output", "width", "height", "lut_dir")
+    RESTART_FIELDS = (
+        "input", "output", "width", "height", "in_width", "in_height", "lut_dir",
+    )
 
     def needs_restart_from(self, other: "EngineConfig") -> bool:
         return any(
@@ -179,6 +188,13 @@ def engine_cli_args(config: EngineConfig) -> list:
         f"{config.overlay_w},{config.overlay_h}",
         "--overlay-opacity", str(config.overlay_opacity),
     ]
+    if config.in_width and config.in_height:
+        args += ["--in-width", str(config.in_width),
+                 "--in-height", str(config.in_height)]
+    if config.zoom != 1.0:
+        args += ["--zoom", str(config.zoom)]
+    if config.pan_x or config.pan_y:
+        args += ["--pan-x", str(config.pan_x), "--pan-y", str(config.pan_y)]
     if config.lut_dir:
         args += ["--lut-dir", config.lut_dir]
     if config.overlay:
@@ -206,6 +222,10 @@ def engine_delta_lines(old: EngineConfig, new: EngineConfig) -> list:
         lines.append(f"overlay-opacity {new.overlay_opacity}")
     if new.overlay != old.overlay:
         lines.append(f"overlay {new.overlay or 'off'}")
+    if new.zoom != old.zoom:
+        lines.append(f"zoom {new.zoom}")
+    if (new.pan_x, new.pan_y) != (old.pan_x, old.pan_y):
+        lines.append(f"pan {new.pan_x} {new.pan_y}")
     return lines
 
 

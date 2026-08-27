@@ -141,9 +141,16 @@ class State:
     overlay_opacity: float = 1.0
     mirror_h: bool = False
     mirror_v: bool = False
+    zoom: float = 1.0
+    pan_x: float = 0.0
+    pan_y: float = 0.0
+    in_width: int = 0
+    in_height: int = 0
     running: bool = False
     frames: int = 0
     error: Optional[str] = None
+    # History, not a live fault: the last notable recovery or incident.
+    last_event: Optional[str] = None
     controls: dict = field(default_factory=dict)
 
 
@@ -152,8 +159,12 @@ class Daemon:
         self, output="/dev/video10", width=1920, height=1080, fps=30.0,
         tray_enabled: bool = False,
         default_strength: float = DEFAULT_STRENGTH,
+        in_width: int = 0, in_height: int = 0,
     ):
-        self.state = State(output=output, width=width, height=height)
+        self.state = State(
+            output=output, width=width, height=height,
+            in_width=in_width, in_height=in_height,
+        )
         self.tray_enabled = tray_enabled
         self.default_strength = max(0.0, min(1.0, float(default_strength)))
         self.state.strength = self.default_strength
@@ -222,6 +233,8 @@ class Daemon:
             overlay_x=st.overlay_x, overlay_y=st.overlay_y,
             overlay_w=st.overlay_w, overlay_h=st.overlay_h,
             overlay_opacity=st.overlay_opacity,
+            in_width=st.in_width, in_height=st.in_height,
+            zoom=st.zoom, pan_x=st.pan_x, pan_y=st.pan_y,
             lut_dir=str(lut_dir()) if lut_dir() else None,
         )
 
@@ -269,6 +282,7 @@ class Daemon:
                 overlay_x=st.overlay_x, overlay_y=st.overlay_y,
                 overlay_w=st.overlay_w, overlay_h=st.overlay_h,
                 overlay_opacity=st.overlay_opacity,
+                zoom=st.zoom, pan_x=st.pan_x, pan_y=st.pan_y,
             )
         with suppress(Exception):
             engine.apply_live(**live)
@@ -437,8 +451,11 @@ class Daemon:
         with self.lock:
             self.state.mode = Mode.STUDIO.value
             self.state.error = None
+        # The device delivers the capture size, which may exceed the output.
         backend = XLinkBackend(
-            width=self.state.width, height=self.state.height, fps=self.fps
+            width=self.state.in_width or self.state.width,
+            height=self.state.in_height or self.state.height,
+            fps=self.fps,
         )
         backend.attach()
         self._backend = backend
@@ -551,6 +568,22 @@ class Daemon:
         self._sync_engine()
         return self.status()
 
+    def set_zoom(self, zoom=None, pan_x=None, pan_y=None) -> dict:
+        """Digital zoom and pan, applied in the shader at no cost.
+
+        Lossless up to the capture/output ratio (run the daemon with
+        --in-width 3840 --in-height 2160 for true 2x); upscaling beyond.
+        """
+        with self.lock:
+            if zoom is not None:
+                self.state.zoom = max(1.0, min(8.0, float(zoom)))
+            if pan_x is not None:
+                self.state.pan_x = max(-1.0, min(1.0, float(pan_x)))
+            if pan_y is not None:
+                self.state.pan_y = max(-1.0, min(1.0, float(pan_y)))
+        self._sync_engine()
+        return self.status()
+
     def set_camera(self, **kw) -> dict:
         """Apply camera controls through the current mode's backend.
 
@@ -605,6 +638,9 @@ class Daemon:
                 "look_strength": dict(st.look_strength),
                 "mirror_h": st.mirror_h,
                 "mirror_v": st.mirror_v,
+                "zoom": st.zoom,
+                "pan_x": st.pan_x,
+                "pan_y": st.pan_y,
                 "overlay": {
                     "path": st.overlay,
                     "x": st.overlay_x, "y": st.overlay_y,
@@ -647,6 +683,7 @@ class Daemon:
         if data.get("look"):
             self.set_look(data["look"], data.get("strength"))
         self.set_mirror(data.get("mirror_h"), data.get("mirror_v"))
+        self.set_zoom(data.get("zoom"), data.get("pan_x"), data.get("pan_y"))
 
         ov = data.get("overlay") or {}
         try:
@@ -932,7 +969,8 @@ class Daemon:
             policy.on_reentry_ok()
             with self.lock:
                 self.restarts += 1
-                self.state.error = f"engine restarted after: {reason}"
+                self.state.error = None
+                self.state.last_event = f"engine restarted after: {reason}"
             print(f"engine restarted (total restarts: {self.restarts})")
 
     def _camera_settled(self, dwell: float = 3.0) -> bool:
@@ -974,6 +1012,10 @@ class Daemon:
                 return {"ok": True, **self.delete_preset(req["name"])}
             if cmd == "set_overlay":
                 return {"ok": True, **self.set_overlay(**req.get("values", {}))}
+            if cmd == "set_zoom":
+                return {"ok": True, **self.set_zoom(
+                    req.get("zoom"), req.get("pan_x"), req.get("pan_y")
+                )}
             if cmd == "set_mirror":
                 return {"ok": True, **self.set_mirror(
                     req.get("horizontal"), req.get("vertical")

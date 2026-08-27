@@ -490,6 +490,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     return Daemon(
         output=args.output, width=args.width, height=args.height, fps=args.fps,
         tray_enabled=args.tray,
+        in_width=args.in_width, in_height=args.in_height,
         **({} if args.default_strength is None
            else {'default_strength': args.default_strength}),
     ).run(initial_mode=args.mode)
@@ -508,6 +509,8 @@ def _print_status(st: dict) -> None:
         print(f"  controls  {st['controls']}")
     for line in st.get("engine_log") or []:
         print(f"  engine    {line}")
+    if st.get("last_event"):
+        print(f"  last      {st['last_event']}")
     if st.get("error"):
         print(f"  error     {st['error']}", file=sys.stderr)
 
@@ -630,6 +633,30 @@ def _cmd_overlay(args: argparse.Namespace) -> int:
               f"(0 = unconstrained), opacity {resp['overlay_opacity']}")
     else:
         print("  no overlay")
+    return 0
+
+
+def _cmd_zoom(args: argparse.Namespace) -> int:
+    values = {}
+    if args.factor is not None:
+        values["zoom"] = 1.0 if args.factor in ("off", "1") else float(args.factor)
+    if args.x is not None:
+        values["pan_x"] = args.x
+    if args.y is not None:
+        values["pan_y"] = args.y
+    resp = _client_call(cmd="status") if not values else _client_call(
+        cmd="set_zoom", **values
+    )
+    if not resp.get("ok"):
+        return 1
+    print(f"  zoom {resp.get('zoom')}x  pan {resp.get('pan_x')},{resp.get('pan_y')}")
+    if resp.get("in_width"):
+        print(f"  capture {resp['in_width']}x{resp['in_height']} -> "
+              f"{resp.get('width')}x{resp.get('height')}: lossless to "
+              f"{resp['in_width'] / resp.get('width', 1):.1f}x")
+    else:
+        print("  capture equals output: zoom upscales. Run the daemon with "
+              "--in-width 3840 --in-height 2160 for lossless 2x.")
     return 0
 
 
@@ -799,6 +826,12 @@ def build_parser() -> argparse.ArgumentParser:
     dm.add_argument("--width", type=int, default=1920)
     dm.add_argument("--height", type=int, default=1080)
     dm.add_argument("--fps", type=float, default=30.0)
+    dm.add_argument(
+        "--in-width", type=int, default=0,
+        help="Capture width; 0 = same as output. 3840 with --in-height 2160 "
+             "makes zoom lossless to 2x (costs ~3fps in Call mode)",
+    )
+    dm.add_argument("--in-height", type=int, default=0)
     dm.add_argument("--mode", choices=("call", "studio"), default="call")
     dm.add_argument(
         "--default-strength", type=float, default=None,
@@ -892,6 +925,20 @@ def build_parser() -> argparse.ArgumentParser:
     ov.add_argument("--height", type=int, default=None, help="Max height, 0 = unconstrained")
     ov.add_argument("--opacity", type=float, default=None, help="0.0 to 1.0")
     ov.set_defaults(func=_cmd_overlay)
+
+    zo = sub.add_parser(
+        "zoom",
+        help="Digital zoom and pan",
+        description=(
+            "Crops and scales in the shader at no cost. Lossless up to the "
+            "capture/output ratio; upscaling beyond it. 'off' or 1 resets. "
+            "Pan positions the crop window, -1..1 across the available margin."
+        ),
+    )
+    zo.add_argument("factor", nargs="?", default=None, help="1.0-8.0, or 'off'")
+    zo.add_argument("--x", type=float, default=None, help="pan x, -1..1")
+    zo.add_argument("--y", type=float, default=None, help="pan y, -1..1")
+    zo.set_defaults(func=_cmd_zoom)
 
     mi = sub.add_parser(
         "mirror",

@@ -79,6 +79,14 @@ def decode(raw: dict) -> Tuple[dict, list]:
         if key in raw:
             out[key] = bool(raw[key])
 
+    zoom = _clamp(raw.get("zoom"), 1.0, 8.0)
+    if zoom is not None:
+        out["zoom"] = zoom
+    for key in ("pan_x", "pan_y"):
+        v = _clamp(raw.get(key), -1.0, 1.0)
+        if v is not None:
+            out[key] = v
+
     overlay = raw.get("overlay")
     if isinstance(overlay, dict):
         ov: dict = {}

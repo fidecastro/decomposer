@@ -75,6 +75,12 @@ pub fn load(path: &Path) -> Result<Lut> {
 
 /// Look for `<dir>/<name>.cube`, case-sensitively first so D1 and d1 both work.
 pub fn find(dir: &Path, name: &str) -> Option<std::path::PathBuf> {
+    // Names arrive over the control socket; anything path-like would join
+    // straight into the filesystem. Same-user surface, but defence in depth
+    // costs one line.
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return None;
+    }
     for candidate in [name.to_string(), name.to_uppercase(), name.to_lowercase()] {
         let p = dir.join(format!("{candidate}.cube"));
         if p.is_file() {
