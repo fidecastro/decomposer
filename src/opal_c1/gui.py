@@ -1548,10 +1548,24 @@ class Panel(Gtk.Box):
         )
         cmd = ["ffmpeg", "-y",
                "-f", "v4l2", "-i", self.status.get("output") or "/dev/video10"]
+        # Record the default microphone if one truly exists. With no real
+        # mic (Studio mode kills the C1's), PipeWire's "default source"
+        # falls back to a monitor of the speakers - and a recording that
+        # silently contains your system audio is a nasty surprise.
+        source = None
         if shutil.which("pactl"):
-            # Whatever the system's default microphone is - in Call mode
-            # that may well be the C1 itself.
-            cmd += ["-f", "pulse", "-i", "default", "-c:a", "aac"]
+            with suppress(Exception):
+                found = subprocess.run(
+                    ["pactl", "get-default-source"],
+                    capture_output=True, text=True, timeout=3,
+                ).stdout.strip()
+                if found and not found.endswith(".monitor"):
+                    source = found
+        if source:
+            cmd += ["-f", "pulse", "-i", source, "-c:a", "aac"]
+            self._flash("recording\u2026 audio from the default microphone", 4.0)
+        else:
+            self._flash("recording\u2026 no microphone available: video only", 4.0)
         cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                 str(out)]
         try:
