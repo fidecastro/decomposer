@@ -504,10 +504,19 @@ class Panel(Gtk.Box):
         self.capture_btn.set_tooltip_text(
             "Click: photo (3 s timer). Hold 1 s: record; click again to stop"
         )
+        # The button's own internal gesture CLAIMS the click sequence, so a
+        # bubble-phase gesture sees the press but never the release - which
+        # turned every click into a "hold" once the timer ran out. The
+        # gesture rides the CAPTURE phase purely for press timing; the
+        # actions hang off the button's ordinary clicked signal, which
+        # always fires.
         cap = Gtk.GestureClick()
+        cap.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         cap.connect("pressed", self._on_capture_pressed)
-        cap.connect("released", self._on_capture_released)
+        cap.connect("released", self._on_capture_timer_off)
+        cap.connect("cancel", self._on_capture_timer_off)
         self.capture_btn.add_controller(cap)
+        self.capture_btn.connect("clicked", self._on_capture_clicked)
         bar.append(self.capture_btn)
         self._hold_timer: Optional[int] = None
         self._hold_fired = False
@@ -1446,9 +1455,9 @@ class Panel(Gtk.Box):
         return out
 
     def _on_capture_pressed(self, _g, _n, _x, _y) -> None:
-        if self._recorder is not None:
-            return  # the release handles stop
         self._hold_fired = False
+        if self._recorder is not None:
+            return  # the clicked signal handles stop
         self._hold_timer = GLib.timeout_add(1000, self._hold_elapsed)
 
     def _hold_elapsed(self) -> bool:
@@ -1457,12 +1466,20 @@ class Panel(Gtk.Box):
         self._start_recording()
         return False
 
-    def _on_capture_released(self, _g, _n, _x, _y) -> None:
+    def _on_capture_timer_off(self, *_args) -> None:
+        # Release or cancel: the press is over either way; a photo must
+        # not become a recording because a timer outlived the finger.
         if self._hold_timer is not None:
             GLib.source_remove(self._hold_timer)
             self._hold_timer = None
+
+    def _on_capture_clicked(self, _btn) -> None:
+        self._on_capture_timer_off()
         if self._hold_fired:
-            return  # the hold already started the recording
+            # This click's release ended the hold that started a recording;
+            # it is not a request to stop it.
+            self._hold_fired = False
+            return
         if self._recorder is not None:
             self._stop_recording()
         elif self._countdown is None:
