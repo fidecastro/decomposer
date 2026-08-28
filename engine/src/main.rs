@@ -52,10 +52,10 @@ struct Args {
     zoom: f32,
 
     /// Crop position across the available margin, -1.0 to 1.0
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     pan_x: f32,
 
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
     pan_y: f32,
 
     /// Local contrast (CLAHE) strength, 0.0 to 1.0

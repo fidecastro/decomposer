@@ -1718,7 +1718,20 @@ class Panel(Gtk.Box):
         except OSError:
             return False
 
-    def _update_mic_chip(self, studio: bool) -> None:
+    def _update_mic_chip(self, studio: bool, transitioning: bool = False) -> None:
+        if transitioning:
+            # Mid-switch the camera boots through its Opal personality, so
+            # the mic hardware genuinely flickers into existence for a few
+            # seconds. True, but alarming - say "in flux" instead.
+            self.mic_chip.set_text("MIC ~")
+            for cls in ("live", "dead"):
+                self.mic_chip.remove_css_class(cls)
+            self.mic_chip.add_css_class("dead")
+            self.mic_chip.set_tooltip_text(
+                "Firmware rebooting: the mic may exist transiently while "
+                "the camera passes through its Opal personality"
+            )
+            return
         live = self._c1_mic_present()
         self.mic_chip.set_text("MIC \u25cf" if live else "MIC \u2013")
         for cls in ("live", "dead"):
@@ -1966,7 +1979,7 @@ class Panel(Gtk.Box):
             self.mode_pill.remove_css_class(cls)
         self.mode_pill.add_css_class(mode if mode in ("call", "studio") else "off")
         self.mode_hint.set_text("")
-        self._update_mic_chip(studio)
+        self._update_mic_chip(studio, transitioning)
 
         for axis, key in (("horizontal", "mirror_h"), ("vertical", "mirror_v")):
             b = self.mirror_buttons[axis]

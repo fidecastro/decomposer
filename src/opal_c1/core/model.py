@@ -274,7 +274,10 @@ def engine_cli_args(config: EngineConfig) -> list:
     if config.clahe > 0.0:
         args += ["--clahe", str(config.clahe)]
     if config.pan_x or config.pan_y:
-        args += ["--pan-x", str(config.pan_x), "--pan-y", str(config.pan_y)]
+        # Equals form: a negative pan as a separate token ("--pan-x -0.8")
+        # reads to the argv parser as an unknown flag, and the engine dies
+        # at spawn - measured in the field, not imagined.
+        args += [f"--pan-x={config.pan_x}", f"--pan-y={config.pan_y}"]
     if config.blur > 0.0:
         args += ["--blur", str(config.blur)]
     if config.blur_style:

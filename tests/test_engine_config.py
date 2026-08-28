@@ -143,3 +143,12 @@ def test_blur_style_is_live():
     assert not styled.needs_restart_from(base)
     assert engine_delta_lines(base, styled) == ["blur-style 1"]
     assert "--blur-style 1" in " ".join(engine_cli_args(styled))
+
+
+def test_negative_pan_survives_argv():
+    # "--pan-x -0.8" as two tokens reads as an unknown flag and kills the
+    # engine at spawn; the equals form is parser-proof.
+    args = engine_cli_args(cfg(pan_x=0.144, pan_y=-0.796))
+    assert "--pan-x=0.144" in args
+    assert "--pan-y=-0.796" in args
+    assert not any(a == "--pan-x" or a.startswith("-0") for a in args)
