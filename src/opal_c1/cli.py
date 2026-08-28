@@ -77,16 +77,119 @@ def _cmd_probe_xlink(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_probe_dev(dev: str) -> str:
+    """Prefer an explicit path; discover the C1 when the usual node is gone."""
+    if os.path.exists(dev):
+        return dev
+    if dev == "/dev/video0":
+        from opal_c1.modes import camera_video_node
+
+        found = camera_video_node()
+        if found:
+            print(f"using {found} (no capture node at {dev})", file=sys.stderr)
+            return found
+    return dev
+
+
 def _cmd_probe_xu(args: argparse.Namespace) -> int:
     from opal_c1 import probe
 
-    selectors = range(args.first, args.last + 1)
-    report = probe.run(args.dev, args.unit, selectors, quiet=args.json_only)
+    dev = _resolve_probe_dev(args.dev)
+    # Write sweeps default to the eight selectors that actually have length;
+    # a bare read still walks the full advertised bank.
+    first = args.first
+    if args.last is not None:
+        last = args.last
+    else:
+        last = 8 if args.write else 80
+    selectors = range(first, last + 1)
+
+    if args.write:
+        if not args.yes_write and not args.dry_run:
+            print(
+                "probe-xu --write SET_CURs vendor registers on live firmware.\n"
+                "That can wedge Call mode until a power-cycle. Re-run with\n"
+                "  --yes-write   to proceed, or --dry-run to print the plan.",
+                file=sys.stderr,
+            )
+            return 2
+        extras = None
+        if args.values:
+            try:
+                extras = [int(x, 0) for x in args.values.split(",")]
+            except ValueError:
+                print("--values must be a comma-separated list of integers", file=sys.stderr)
+                return 2
+        print(
+            f"XU write sweep on {dev} selectors {first}-{last}"
+            + (" (dry-run)" if args.dry_run else "")
+        )
+        print("Watch the live preview for focus / white-balance / exposure shifts.")
+        if not args.dry_run:
+            print("Each selector is restored to its original CUR before the next one.")
+
+        def on_step(p, step, original, restoring=False):
+            if restoring:
+                if step.restore_error is not None:
+                    print(
+                        f"  sel {p.selector}: restore FAILED errno {step.restore_error}",
+                        flush=True,
+                    )
+                elif step.restored:
+                    print(
+                        f"  sel {p.selector}: restored {_fmt_xu_bytes(original)}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"  sel {p.selector}: restore wrote {_fmt_xu_bytes(original)} "
+                        f"(readback {_fmt_xu_bytes(step.readback)})",
+                        flush=True,
+                    )
+                return
+            err = ""
+            if step.error is not None:
+                err = f"  ERROR errno {step.error}"
+            elif step.readback is not None and step.readback != step.written:
+                err = "  readback mismatch"
+            print(
+                f"  sel {p.selector}: set {_fmt_xu_bytes(step.written)} "
+                f"read {_fmt_xu_bytes(step.readback)} "
+                f"(was {_fmt_xu_bytes(original)}){err}",
+                flush=True,
+            )
+
+        report = probe.run_write_sweep(
+            dev,
+            args.unit,
+            selectors,
+            values=extras,
+            dwell=0.0 if args.prompt else args.dwell,
+            prompt=args.prompt,
+            dry_run=args.dry_run,
+            on_step=None if args.json_only else on_step,
+        )
+        print()
+        print(probe.format_write_report(report))
+        if args.json:
+            probe.write_json(report, args.json)
+            print(f"\nWrote {args.json}")
+        return 0
+
+    report = probe.run(dev, args.unit, selectors, quiet=args.json_only)
     print(probe.format_report(report))
     if args.json:
         probe.write_json(report, args.json)
         print(f"\nWrote {args.json}")
     return 0
+
+
+def _fmt_xu_bytes(raw: bytes | None) -> str:
+    if raw is None:
+        return "-"
+    if len(raw) <= 8:
+        return str(int.from_bytes(raw, "little"))
+    return raw.hex()
 
 
 def _cmd_camera_info(args: argparse.Namespace) -> int:
@@ -1029,18 +1132,56 @@ def build_parser() -> argparse.ArgumentParser:
 
     x = sub.add_parser(
         "probe-xu",
-        help="Map the vendor UVC Extension Unit (read-only)",
+        help="Map the vendor UVC Extension Unit (GET, or SET_CUR with --write)",
         description=(
-            "Interrogate the camera's UVC Extension Unit with GET requests only. "
-            "This never writes to the device."
+            "Interrogate the camera's UVC Extension Unit. Default path is GET "
+            "requests only. With --write --yes-write, walks writable selectors "
+            "via SET_CUR (restoring each CUR afterwards) so you can watch the "
+            "live Call-mode preview for focus or white-balance motion."
         ),
     )
-    x.add_argument("--dev", default="/dev/video0", help="V4L2 node (default: /dev/video0)")
+    x.add_argument("--dev", default="/dev/video0", help="V4L2 node (default: discover C1)")
     x.add_argument("--unit", type=int, default=None, help="Extension unit ID (default: first found)")
     x.add_argument("--first", type=int, default=1, help="First selector to probe")
-    x.add_argument("--last", type=int, default=80, help="Last selector to probe")
+    x.add_argument(
+        "--last",
+        type=int,
+        default=None,
+        help="Last selector to probe (default: 80 read / 8 write)",
+    )
     x.add_argument("--json", default=None, help="Also write the full result to this JSON path")
     x.add_argument("--json-only", action="store_true", help="Suppress the progress ticker")
+    x.add_argument(
+        "--write",
+        action="store_true",
+        help="SET_CUR sweep of writable selectors (requires --yes-write or --dry-run)",
+    )
+    x.add_argument(
+        "--yes-write",
+        action="store_true",
+        help="Acknowledge that SET_CUR can wedge Call-mode firmware",
+    )
+    x.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --write, print the planned SET_CUR values without touching the device",
+    )
+    x.add_argument(
+        "--dwell",
+        type=float,
+        default=1.5,
+        help="Seconds to wait after each SET_CUR so you can watch the preview (default: 1.5)",
+    )
+    x.add_argument(
+        "--prompt",
+        action="store_true",
+        help="Wait for Enter after each SET_CUR instead of using --dwell",
+    )
+    x.add_argument(
+        "--values",
+        default=None,
+        help="Extra comma-separated integers to try on every writable selector",
+    )
     x.set_defaults(func=_cmd_probe_xu)
 
     ci = sub.add_parser("camera-info", help="Attach over XLink and report device facts")

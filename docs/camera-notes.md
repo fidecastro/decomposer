@@ -157,8 +157,39 @@ control, the LED, HDR, the on-device neural nets — has to be behind the vendor
 bulk interface (IF 0), not the XU.**
 
 Determining what selector 1 *means*, and whether 2-8 do anything on write,
-requires `SET_CUR` — the first operation in this project that writes to the
-camera. Not done yet.
+requires `SET_CUR`. That path exists as an explicit diagnostic:
+
+```bash
+# Plan only — no writes:
+decomposer probe-xu --write --dry-run
+
+# Live Call-mode sweep (daemon preview open). Restores each CUR.
+# Can wedge firmware; a power-cycle is the recovery.
+decomposer probe-xu --write --yes-write --prompt
+```
+
+Default write range is selectors 1-8. Watch the preview for focus / white
+balance / exposure shifts while it walks.
+
+### Write sweep result (2026-08-28, fw 4.10, Call mode, live preview)
+
+`decomposer probe-xu --write --yes-write` walked selectors 1-8 (six values
+each: min/def/max/mid/quarters). Every `SET_CUR` returned success at the
+ioctl layer — **zero stalls** — and every `GET_CUR` afterward mismatched the
+value just written (48/48).
+
+- **Selector 1** kept drifting on its own (213→182→154→… while we wrote
+  0/1/255/…). Writes do not stick; the byte looks like live status, not a
+  control register.
+- **Selectors 2-8** mostly echoed a stale shared buffer (often `128`,
+  occasionally `1`/`16`/`64`/`244`), same pattern as the read-only probe.
+  No value we wrote ever came back as CUR.
+
+Firmware stayed up for the whole ~72 s sweep; Call mode and the mic
+survived. **Still no evidence that any XU selector moves focus, white
+balance, or exposure.** The hollow-XU conclusion stands; the remaining
+hope for "manual focus with the mic" is still the live XLink server on
+`f63d`, which this project does not sniff.
 
 ---
 

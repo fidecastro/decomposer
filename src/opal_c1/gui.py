@@ -143,6 +143,33 @@ SLIDERS = [
 ]
 
 
+def _run_bounded(cmd: list, timeout: float, cap: int = 8192) -> dict:
+    """Run a producer, keeping only the tail of its stderr in memory.
+
+    A capture subprocess left running for its whole timeout could spew an
+    unbounded stderr straight into the panel's memory; drain it fully (so
+    the pipe never blocks) but retain only the last `cap` bytes.
+    """
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+    )
+    tail = b""
+    try:
+        assert proc.stderr is not None
+        for chunk in iter(lambda: proc.stderr.read(4096), b""):
+            tail = (tail + chunk)[-cap:]
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        with suppress(Exception):
+            proc.wait(timeout=5)
+        return {"code": -1, "stderr": tail.decode("utf-8", "replace")}
+    finally:
+        with suppress(Exception):
+            proc.stderr.close()
+    return {"code": proc.returncode, "stderr": tail.decode("utf-8", "replace")}
+
+
 def _worker(fn: Callable[[], dict], done: Callable[[dict], None]) -> None:
     def run() -> None:
         try:
@@ -1451,8 +1478,37 @@ class Panel(Gtk.Box):
             Path.home() / ("Pictures" if kind == "photo" else "Videos")
         )
         out = base / "decomposer"
+        # A symlinked output directory could redirect writes outside the
+        # tree the user thinks they are saving to; refuse it rather than
+        # follow it. mkdir(exist_ok=True) happily accepts a pre-existing
+        # symlink-to-dir, so the check is explicit, before and after.
+        if out.is_symlink():
+            raise RuntimeError(f"{out} is a symlink; refusing to capture there")
         out.mkdir(parents=True, exist_ok=True)
+        if out.is_symlink() or not out.is_dir():
+            raise RuntimeError(f"{out} is not a real directory")
         return out
+
+    def _secure_target(self, kind: str, suffix: str):
+        """A pair (tmp_path, final_path) for a capture.
+
+        The temporary is created by mkstemp - exclusively (O_EXCL) and under
+        an unguessable name - so no pre-planted file or symlink can occupy
+        it, and ffmpeg writing there cannot be redirected. On success the
+        caller atomically os.replace()s it onto the final, predictable name;
+        replace swaps out any symlink sitting there rather than following it,
+        so a planted link is destroyed, never written through.
+        """
+        import tempfile
+
+        directory = self._capture_dir(kind)
+        final = directory / (
+            time.strftime("photo-%Y%m%d-%H%M%S") + suffix if kind == "photo"
+            else time.strftime("rec-%Y%m%d-%H%M%S") + suffix
+        )
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".part-", suffix=suffix)
+        os.close(fd)
+        return tmp, final
 
     def _on_capture_pressed(self, _g, _n, _x, _y) -> None:
         self._hold_fired = False
@@ -1508,22 +1564,32 @@ class Panel(Gtk.Box):
         # The shutter flash fires at the moment of capture.
         self.flash_box.set_opacity(0.85)
         GLib.timeout_add(60, self._flash_decay)
-        out = self._capture_dir("photo") / time.strftime(
-            "photo-%Y%m%d-%H%M%S.png"
-        )
+        try:
+            tmp, final = self._secure_target("photo", ".png")
+        except (OSError, RuntimeError) as e:
+            self._flash(f"photo failed: {e}", 6.0)
+            return
+        node = self.status.get("output") or "/dev/video10"
 
         def snap() -> dict:
-            r = subprocess.run(
-                ["ffmpeg", "-y", "-f", "v4l2",
-                 "-i", self.status.get("output") or "/dev/video10",
-                 "-frames:v", "1", str(out)],
-                capture_output=True, text=True, timeout=15,
+            err = _run_bounded(
+                ["ffmpeg", "-y", "-nostats", "-loglevel", "error",
+                 "-f", "v4l2", "-i", node, "-frames:v", "1", tmp],
+                timeout=15,
             )
-            if r.returncode != 0 or not out.is_file():
-                tail = (r.stderr or "").strip().splitlines()
+            if err.get("code") != 0 or not os.path.isfile(tmp):
+                with suppress(OSError):
+                    os.unlink(tmp)
+                tail = (err.get("stderr") or "").strip().splitlines()
                 return {"ok": False,
                         "error": tail[-1] if tail else "ffmpeg failed"}
-            return {"ok": True, "saved": str(out)}
+            try:
+                os.replace(tmp, final)
+            except OSError as e:
+                with suppress(OSError):
+                    os.unlink(tmp)
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "saved": str(final)}
 
         def done(resp: dict) -> bool:
             self._flash(
@@ -1543,10 +1609,12 @@ class Panel(Gtk.Box):
     def _start_recording(self) -> None:
         if self._recorder is not None or not self.status.get("engine_alive"):
             return
-        out = self._capture_dir("video") / time.strftime(
-            "rec-%Y%m%d-%H%M%S.mkv"
-        )
-        cmd = ["ffmpeg", "-y",
+        try:
+            tmp, final = self._secure_target("video", ".mkv")
+        except (OSError, RuntimeError) as e:
+            self._flash(f"recording failed to start: {e}", 6.0)
+            return
+        cmd = ["ffmpeg", "-y", "-nostats", "-loglevel", "error",
                "-f", "v4l2", "-i", self.status.get("output") or "/dev/video10"]
         # Record the default microphone if one truly exists. With no real
         # mic (Studio mode kills the C1's), PipeWire's "default source"
@@ -1566,17 +1634,19 @@ class Panel(Gtk.Box):
             self._flash("recording\u2026 audio from the default microphone", 4.0)
         else:
             self._flash("recording\u2026 no microphone available: video only", 4.0)
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                str(out)]
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", tmp]
         try:
             self._recorder = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         except OSError as e:
+            with suppress(OSError):
+                os.unlink(tmp)
             self._flash(f"recording failed to start: {e}", 6.0)
             return
-        self._rec_path = out
+        self._rec_tmp = tmp
+        self._rec_path = final
         self.capture_btn.set_label("\u25a0")
         self.capture_btn.set_tooltip_text("Click to stop recording")
         self.rec_badge.set_visible(True)
@@ -1599,6 +1669,7 @@ class Panel(Gtk.Box):
             "Click: photo (3 s timer). Hold 1 s: record; click again to stop"
         )
         path = getattr(self, "_rec_path", None)
+        tmp = getattr(self, "_rec_tmp", None)
 
         def finish() -> dict:
             with suppress(Exception):
@@ -1610,10 +1681,21 @@ class Panel(Gtk.Box):
                 rec.terminate()
                 with suppress(Exception):
                     rec.wait(timeout=5)
+            if tmp and os.path.isfile(tmp):
+                try:
+                    os.replace(tmp, path)
+                except OSError as e:
+                    with suppress(OSError):
+                        os.unlink(tmp)
+                    return {"ok": False, "error": str(e)}
             return {"ok": True, "saved": str(path)}
 
         def done(resp: dict) -> bool:
-            self._flash(f"saved {resp['saved']}", 6.0)
+            self._flash(
+                f"saved {resp['saved']}" if resp.get("ok")
+                else f"recording failed: {resp.get('error')}",
+                6.0,
+            )
             return False
 
         _worker(finish, done)

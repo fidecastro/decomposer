@@ -1,7 +1,8 @@
 """Raw UVC Extension Unit access through uvcvideo's UVCIOC_CTRL_QUERY ioctl.
 
-Read-only by design. Only the GET_* request codes are exposed; nothing in this
-module writes to the camera. Stdlib only, so probing never needs numpy/OpenCV.
+GET_* helpers are the default path and never write. The single write entry
+point is `set_cur`; call it only from an explicit diagnostic that restores
+what it changed.
 
 Reference: USB Device Class Definition for Video Devices 1.5, section 4.2.2.2
 (Extension Unit control requests) and A.8 (request codes).
@@ -79,13 +80,25 @@ def decode_info(info: int) -> list[str]:
 def query(fd: int, unit: int, selector: int, code: int, size: int) -> bytes:
     """Issue one UVC class-specific GET request. Raises OSError on stall."""
     if code == UVC_SET_CUR:
-        raise ValueError("uvcxu is read-only; SET_CUR is not permitted here")
+        raise ValueError("use set_cur() for writes; query() is GET-only")
     buf = ctypes.create_string_buffer(max(size, 1))
     arg = struct.pack(
         _QUERY_STRUCT, unit, selector, code, size, ctypes.addressof(buf)
     )
     fcntl.ioctl(fd, UVCIOC_CTRL_QUERY, arg)
     return buf.raw[:size]
+
+
+def set_cur(fd: int, unit: int, selector: int, data: bytes) -> None:
+    """Issue one UVC SET_CUR. The only write path in this module."""
+    if not data:
+        raise ValueError("SET_CUR payload must be non-empty")
+    size = len(data)
+    buf = ctypes.create_string_buffer(data, max(size, 1))
+    arg = struct.pack(
+        _QUERY_STRUCT, unit, selector, UVC_SET_CUR, size, ctypes.addressof(buf)
+    )
+    fcntl.ioctl(fd, UVCIOC_CTRL_QUERY, arg)
 
 
 def get_len(fd: int, unit: int, selector: int) -> int:
@@ -95,6 +108,10 @@ def get_len(fd: int, unit: int, selector: int) -> int:
 
 def get_info(fd: int, unit: int, selector: int) -> int:
     return query(fd, unit, selector, UVC_GET_INFO, 1)[0]
+
+
+def get_cur(fd: int, unit: int, selector: int, size: int) -> bytes:
+    return query(fd, unit, selector, UVC_GET_CUR, size)
 
 
 @dataclass
@@ -110,6 +127,10 @@ class ControlProbe:
     @property
     def supported(self) -> bool:
         return self.length is not None and self.length > 0
+
+    @property
+    def writable(self) -> bool:
+        return self.supported and self.info is not None and bool(self.info & INFO_SET)
 
     @property
     def caps(self) -> list[str]:
