@@ -184,6 +184,21 @@ def css(t: Theme) -> str:
     .dc-clickable:hover {{ color: {accent}; }}
 
     /* Capture: countdown numeral, REC badge, and the shutter flash. */
+    /* The capture button earns its size: it is the one that acts. */
+    button.dc-cap {{
+        font-size: {small + 4.0:.1f}pt;
+        padding: 0px 10px;
+        min-height: 26px;
+        border-radius: 6px;
+        color: {fg_dim};
+        background: alpha({fg_dim}, 0.08);
+        border: 1px solid alpha({muted}, 0.4);
+    }}
+    button.dc-cap:hover {{ color: {red}; border-color: alpha({red}, 0.6); }}
+
+    switch {{ min-height: 20px; min-width: 40px; }}
+    switch:checked {{ background: {green}; }}
+
     .dc-count {{
         color: {fg_bright}; font-weight: 800; font-size: 34pt;
         text-shadow: 0 0 8px alpha(black, 0.8);

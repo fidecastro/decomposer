@@ -549,6 +549,31 @@ class Daemon:
             self.state.frames = 0
         self._replay_sticky(backend)
 
+    def enter_parked(self) -> None:
+        """Feed off, honestly: hold the camera in its Studio personality.
+
+        The hardware cannot power down, and the Opal firmware keeps the
+        MICROPHONE alive on the bus whether or not anyone streams video -
+        so "off" must not rest there. An idle XLink session pins the
+        DepthAI firmware instead: no UVC, no UAC, no frames. Only the
+        transition worker calls this."""
+        from opal_c1.adapters.depthai_cam import XLinkBackend
+
+        self._teardown()
+        with self.lock:
+            self.state.running = False
+            self.state.error = None
+        # A minimal session: tiny output nobody reads (the device drops
+        # frames itself once the queue fills), no mask model.
+        backend = XLinkBackend(width=640, height=360, fps=5.0, mask_model=False)
+        backend.attach()
+        self._backend = backend
+        with self.lock:
+            self.state.notice = (
+                "camera off - parked on Studio firmware so the microphone "
+                "is off too"
+            )
+
     def enter_studio(self) -> None:
         """Only the transition worker calls this; see enter_call on locking."""
         from opal_c1.adapters.depthai_cam import XLinkBackend
@@ -602,10 +627,11 @@ class Daemon:
             if enforce_guard:
                 if busy:
                     raise RuntimeError("a mode transition is already in progress")
-                decision = transitions.evaluate_switch(self._ledger, want, now)
-                if not decision.allowed:
-                    raise RuntimeError(decision.reason)
-            if want is not self._ledger.current:
+                if want is not None:
+                    decision = transitions.evaluate_switch(self._ledger, want, now)
+                    if not decision.allowed:
+                        raise RuntimeError(decision.reason)
+            if want is not None and want is not self._ledger.current:
                 self._ledger.last_switch_at = now
             request = self._Request(want)
             self._requests.put(request)
@@ -630,7 +656,9 @@ class Daemon:
             with self.lock:
                 self._ledger.in_progress = True
             try:
-                if request.want is Mode.CALL:
+                if request.want is None:
+                    self.enter_parked()
+                elif request.want is Mode.CALL:
                     self.enter_call()
                 else:
                     self.enter_studio()
@@ -638,9 +666,10 @@ class Daemon:
                 request.error = e
                 # The mode is still what was asked for: leave `running` set so
                 # the supervisor keeps working toward it instead of going
-                # dormant after a switch that failed mid-camera-reboot.
+                # dormant after a switch that failed mid-camera-reboot. A
+                # failed PARK is the opposite: stay dormant, report why.
                 with self.lock:
-                    self.state.running = True
+                    self.state.running = request.want is not None
                     self.state.error = f"{type(e).__name__}: {e}"
             finally:
                 with self.lock:
@@ -866,10 +895,10 @@ class Daemon:
     def set_power(self, on: bool) -> dict:
         """Feed on/off without stopping the daemon.
 
-        Off tears the engine and the camera session down and parks the
-        supervisor (running=False is its dormancy flag); on re-enters the
-        current mode. In Studio both directions reboot the firmware - the
-        panel says so before asking."""
+        Off PARKS the camera on Studio firmware - the only resting state
+        where the microphone is genuinely off - and sets running=False,
+        the supervisor's dormancy flag. On re-enters the remembered mode.
+        Parking from Call reboots the firmware; the panel says so first."""
         with self.lock:
             if self._ledger.in_progress or not self._requests.empty():
                 raise RuntimeError("a mode transition is already in progress")
@@ -878,12 +907,7 @@ class Daemon:
         if on and not currently:
             self.request_transition(mode, enforce_guard=False)
         elif not on and currently:
-            with self.lock:
-                self.state.running = False
-            self._teardown()
-            with self.lock:
-                self.state.error = None
-                self.state.notice = "camera off — the power button brings it back"
+            self.request_transition(None, enforce_guard=False)
         return self.status()
 
     def set_camera(self, **kw) -> dict:

@@ -482,21 +482,24 @@ class Panel(Gtk.Box):
 
         bar.append(Gtk.Box(hexpand=True))
 
-        self.power_btn = Gtk.Button(label="\u23fb")
-        self.power_btn.add_css_class("dc-tiny")
-        self.power_btn.set_valign(Gtk.Align.CENTER)
-        self.power_btn.set_tooltip_text(
-            "Feed on/off. Off releases the camera; in Studio, either "
-            "direction reboots its firmware"
+        # A sliding switch, both positions visible. OFF parks the camera
+        # on Studio firmware - the only resting state where the microphone
+        # is genuinely dead, since Opal's firmware keeps the mic on the bus
+        # whether or not video streams.
+        self.power_switch = Gtk.Switch()
+        self.power_switch.set_valign(Gtk.Align.CENTER)
+        self.power_switch.set_tooltip_text(
+            "Camera on/off. Off parks it on Studio firmware so the "
+            "MICROPHONE turns off too (from Call, that is a firmware reboot)"
         )
-        self.power_btn.connect("clicked", self._on_power)
-        bar.append(self.power_btn)
+        self.power_switch.connect("state-set", self._on_power_state)
+        bar.append(self.power_switch)
 
         # Click: photo after a 3 s count. Hold for a second: recording,
         # click again to stop. A Button's "clicked" cannot see hold
         # duration, so a raw click gesture does the timing.
         self.capture_btn = Gtk.Button(label="\u25c9")
-        self.capture_btn.add_css_class("dc-tiny")
+        self.capture_btn.add_css_class("dc-cap")
         self.capture_btn.set_valign(Gtk.Align.CENTER)
         self.capture_btn.set_tooltip_text(
             "Click: photo (3 s timer). Hold 1 s: record; click again to stop"
@@ -1388,33 +1391,41 @@ class Panel(Gtk.Box):
 
     # -- power ----------------------------------------------------------
 
-    def _on_power(self, btn) -> None:
-        if self.busy:
-            return
+    def _on_power_state(self, switch, want: bool) -> bool:
+        if self._suppress:
+            return False  # status sync: let the switch follow reality
+        if self.busy or not self._ready:
+            return True  # swallow the flip
         running = bool(self.status.get("running"))
+        if want == running:
+            return False
 
         def proceed():
             self._set_busy(
                 True,
-                "stopping the camera\u2026" if running
-                else "starting the camera\u2026",
+                "starting the camera\u2026" if want
+                else "parking the camera\u2026 the firmware reboots to Studio",
             )
             _worker(
-                lambda: self.client.request(cmd="set_power", on=not running),
+                lambda: self.client.request(cmd="set_power", on=want),
                 self._on_result,
             )
 
-        if self._current_res_mode() == "studio":
+        if want:
             text = (
-                "Turning the camera off releases it; the firmware reboots "
-                "back to its Call personality."
-                if running else
-                "Turning the camera on re-enters Studio, rebooting the "
-                "firmware (~15 s)."
+                f"Turning the camera on re-enters "
+                f"{self._current_res_mode().capitalize()} mode, rebooting "
+                "the firmware (~15 s)."
             )
-            self._confirm(btn, text, proceed)
         else:
-            proceed()
+            text = (
+                "Off parks the camera on Studio firmware - the only resting "
+                "state where the MICROPHONE is off too. From Call mode this "
+                "reboots the firmware (~15 s)."
+            )
+        self._confirm(switch, text, proceed)
+        # Handled: the switch only slides once status confirms the change.
+        return True
 
     # -- capture --------------------------------------------------------
     #
@@ -1706,7 +1717,7 @@ class Panel(Gtk.Box):
             self.camera_stack.set_opacity(0.45)
             for widget in (
                 list(self.mode_buttons.values())
-                + [self.res_drop, self.fps_entry, self.power_btn,
+                + [self.res_drop, self.fps_entry, self.power_switch,
                    self.preset_drop, self.preset_save]
             ):
                 widget.set_sensitive(False)
@@ -1966,9 +1977,9 @@ class Panel(Gtk.Box):
                     break
             self.res_drop.set_sensitive(not transitioning)
             running = bool(st.get("running"))
-            (self.power_btn.add_css_class if running
-             else self.power_btn.remove_css_class)("selected")
-            self.power_btn.set_sensitive(not transitioning)
+            self.power_switch.set_active(running)
+            self.power_switch.set_state(running)
+            self.power_switch.set_sensitive(not transitioning)
             self.capture_btn.set_sensitive(
                 bool(st.get("engine_alive")) or self._recorder is not None
             )

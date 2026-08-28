@@ -85,8 +85,13 @@ model loads):
 
 ## Capture
 
-- A **power toggle** in the header: feed off releases the camera
-  entirely (and parks the supervisor); on re-enters the current mode.
+- A **power switch** in the header (a real sliding toggle). Off does
+  the only honest thing this hardware allows: it **parks the camera on
+  Studio firmware**, where the microphone genuinely ceases to exist on
+  the bus - Opal's firmware keeps the mic alive whether or not video
+  streams, so resting there was never actually "off". Verified in
+  ALSA: the C1 audio card vanishes when parked, returns when powered
+  on. On re-enters your remembered mode.
 - A **capture button**: click for a photo behind a 3-second on-preview
   countdown and a shutter flash; hold it for a second to start a
   recording (h264 + your default microphone, saved under
