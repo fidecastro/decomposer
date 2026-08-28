@@ -863,6 +863,29 @@ class Daemon:
         self._sync_engine()
         return self.status()
 
+    def set_power(self, on: bool) -> dict:
+        """Feed on/off without stopping the daemon.
+
+        Off tears the engine and the camera session down and parks the
+        supervisor (running=False is its dormancy flag); on re-enters the
+        current mode. In Studio both directions reboot the firmware - the
+        panel says so before asking."""
+        with self.lock:
+            if self._ledger.in_progress or not self._requests.empty():
+                raise RuntimeError("a mode transition is already in progress")
+            mode = Mode(self.state.mode)
+            currently = self.state.running
+        if on and not currently:
+            self.request_transition(mode, enforce_guard=False)
+        elif not on and currently:
+            with self.lock:
+                self.state.running = False
+            self._teardown()
+            with self.lock:
+                self.state.error = None
+                self.state.notice = "camera off — the power button brings it back"
+        return self.status()
+
     def set_camera(self, **kw) -> dict:
         """Apply camera controls through the current mode's backend.
 
@@ -1191,7 +1214,10 @@ class Daemon:
         s["presets"] = [p["name"] for p in (cached or [])]
         s["preview"] = str(self.preview_sock) if self.preview_sock.exists() else None
         s["engine_log"] = engine.log_lines() if engine is not None else []
-        if engine is not None and not engine.alive() and engine.config is not None:
+        with self.lock:
+            powered = self.state.running
+        if (powered and engine is not None and not engine.alive()
+                and engine.config is not None):
             s["error"] = (
                 f"engine exited with code {engine.returncode()}: "
                 + (engine.log_text() or "no output")
@@ -1201,6 +1227,11 @@ class Daemon:
     # -- supervision ----------------------------------------------------
 
     def _on_camera_plug(self) -> None:
+        with self.lock:
+            if not self.state.running:
+                # Powered off on purpose: the enumeration is our own
+                # teardown echo (or a replug that must not auto-start).
+                return
         print("camera connected: waking recovery")
         with self.lock:
             self.state.notice = "camera connected — starting the feed…"
@@ -1305,6 +1336,9 @@ class Daemon:
                 if self._ledger.in_progress or not self._requests.empty():
                     # A client transition is underway; it owns the camera now.
                     continue
+                if not self.state.running:
+                    # Powered off while we were holding: dormant means dormant.
+                    continue
                 current = self._engine
                 if current is not None and current.alive():
                     # The engine came back while we were holding - a client
@@ -1381,6 +1415,8 @@ class Daemon:
             if cmd == "set_model_strength":
                 return {"ok": True, **self.set_model_strength(
                     req.get("index"), req.get("strength"))}
+            if cmd == "set_power":
+                return {"ok": True, **self.set_power(bool(req.get("on")))}
             if cmd == "set_fps":
                 return {"ok": True, **self.set_fps(req.get("fps"))}
             if cmd == "set_blur":

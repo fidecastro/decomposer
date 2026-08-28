@@ -884,6 +884,14 @@ def _cmd_model(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_power(args: argparse.Namespace) -> int:
+    resp = _client_call(cmd="set_power", on=args.state == "on")
+    if not resp.get("ok"):
+        return 1
+    print(f"  camera {'running' if resp.get('running') else 'off'}")
+    return 0
+
+
 def _cmd_fps(args: argparse.Namespace) -> int:
     if args.value is None:
         resp = _client_call(cmd="status")
@@ -1279,6 +1287,18 @@ def build_parser() -> argparse.ArgumentParser:
     md.add_argument("--device", choices=("cpu", "cuda"), default="cpu",
                     help="Where the model runs (add only)")
     md.set_defaults(func=_cmd_model)
+
+    pw = sub.add_parser(
+        "power",
+        help="Feed on/off without stopping the daemon",
+        description=(
+            "Off releases the camera and parks the supervisor; on re-enters "
+            "the current mode. In Studio, both directions reboot the "
+            "camera's firmware."
+        ),
+    )
+    pw.add_argument("state", choices=("on", "off"))
+    pw.set_defaults(func=_cmd_power)
 
     fp = sub.add_parser(
         "fps",

@@ -178,9 +178,23 @@ def css(t: Theme) -> str:
     .dc-warn {{ color: {red}; font-size: {small - 1.5:.1f}pt; }}
 
     /* Click and type affordances: the discrete mouseover. */
+    .dc-clickable {{
+        border-bottom: 1px dotted alpha({muted}, 0.8);
+    }}
     .dc-clickable:hover {{ color: {accent}; }}
+
+    /* Capture: countdown numeral, REC badge, and the shutter flash. */
+    .dc-count {{
+        color: {fg_bright}; font-weight: 800; font-size: 34pt;
+        text-shadow: 0 0 8px alpha(black, 0.8);
+    }}
+    .dc-rec {{
+        color: {red}; font-weight: 800; font-size: {small:.1f}pt;
+        text-shadow: 0 0 6px alpha(black, 0.8);
+    }}
+    .dc-flash {{ background: white; }}
     entry.dc-entry:hover {{
-        border-bottom: 1px solid alpha({accent}, 0.55);
+        border-color: alpha({accent}, 0.55);
     }}
 
     .dc-vsep {{
@@ -197,16 +211,19 @@ def css(t: Theme) -> str:
     .dc-mic.live {{ color: {green}; border-color: {green}; }}
     .dc-mic.dead {{ color: {muted}; opacity: 0.7; }}
 
-    /* Value boxes: editable, but dressed as labels until focused. */
+    /* Value boxes: a quiet box says "type here" without shouting. */
     entry.dc-entry {{
-        background: transparent; border: none; box-shadow: none;
+        background: alpha({fg_dim}, 0.07);
+        border: 1px solid alpha({muted}, 0.35);
+        border-radius: 4px;
+        box-shadow: none;
         color: {fg_dim}; font-size: {small - 1.0:.1f}pt;
-        padding: 0; margin: 0; min-height: 0;
+        padding: 0px 4px; margin: 0; min-height: 0;
         caret-color: {accent};
     }}
     entry.dc-entry:focus {{
         color: {fg_bright};
-        border-bottom: 1px solid {accent};
+        border-color: {accent};
     }}
 
     /* Compact sliders: no drawn value, the number lives in its own label. */

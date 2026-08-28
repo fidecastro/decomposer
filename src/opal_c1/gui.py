@@ -17,6 +17,7 @@ import os
 import socket
 import struct
 from pathlib import Path
+import shutil
 import subprocess
 import threading
 import time
@@ -410,7 +411,30 @@ class Panel(Gtk.Box):
         right.connect("released", self._on_preview_menu)
         self.preview.add_controller(right)
         self._pan_base = (0.0, 0.0)
-        left.append(self.preview)
+        stage = Gtk.Overlay()
+        stage.set_child(self.preview)
+        self.count_label = Gtk.Label()
+        self.count_label.add_css_class("dc-count")
+        self.count_label.set_halign(Gtk.Align.CENTER)
+        self.count_label.set_valign(Gtk.Align.CENTER)
+        self.count_label.set_can_target(False)
+        self.count_label.set_visible(False)
+        stage.add_overlay(self.count_label)
+        self.rec_badge = Gtk.Label(label="\u25cf REC")
+        self.rec_badge.add_css_class("dc-rec")
+        self.rec_badge.set_halign(Gtk.Align.START)
+        self.rec_badge.set_valign(Gtk.Align.START)
+        self.rec_badge.set_margin_start(10)
+        self.rec_badge.set_margin_top(8)
+        self.rec_badge.set_can_target(False)
+        self.rec_badge.set_visible(False)
+        stage.add_overlay(self.rec_badge)
+        self.flash_box = Gtk.Box()
+        self.flash_box.add_css_class("dc-flash")
+        self.flash_box.set_can_target(False)
+        self.flash_box.set_opacity(0.0)
+        stage.add_overlay(self.flash_box)
+        left.append(stage)
         left.append(self._mode_row())
         left.append(self._sep())
         left.append(self._camera_block())
@@ -457,6 +481,36 @@ class Panel(Gtk.Box):
         bar.append(self.subtitle)
 
         bar.append(Gtk.Box(hexpand=True))
+
+        self.power_btn = Gtk.Button(label="\u23fb")
+        self.power_btn.add_css_class("dc-tiny")
+        self.power_btn.set_valign(Gtk.Align.CENTER)
+        self.power_btn.set_tooltip_text(
+            "Feed on/off. Off releases the camera; in Studio, either "
+            "direction reboots its firmware"
+        )
+        self.power_btn.connect("clicked", self._on_power)
+        bar.append(self.power_btn)
+
+        # Click: photo after a 3 s count. Hold for a second: recording,
+        # click again to stop. A Button's "clicked" cannot see hold
+        # duration, so a raw click gesture does the timing.
+        self.capture_btn = Gtk.Button(label="\u25c9")
+        self.capture_btn.add_css_class("dc-tiny")
+        self.capture_btn.set_valign(Gtk.Align.CENTER)
+        self.capture_btn.set_tooltip_text(
+            "Click: photo (3 s timer). Hold 1 s: record; click again to stop"
+        )
+        cap = Gtk.GestureClick()
+        cap.connect("pressed", self._on_capture_pressed)
+        cap.connect("released", self._on_capture_released)
+        self.capture_btn.add_controller(cap)
+        bar.append(self.capture_btn)
+        self._hold_timer: Optional[int] = None
+        self._hold_fired = False
+        self._recorder: Optional[subprocess.Popen] = None
+        self._rec_blink: Optional[int] = None
+        self._countdown: Optional[int] = None
 
         # Both selectors are mode-specific: the lists and limits come from
         # the core routing facts, and both dim while a switch is running.
@@ -526,9 +580,23 @@ class Panel(Gtk.Box):
         row.append(lbl)
 
         self.mode_buttons = {}
+        blurbs = {
+            "call": (
+                "The camera's own firmware: the MICROPHONE IS ON, focus and "
+                "white balance stay automatic, and you get the colour "
+                "controls at a fixed 30 fps. The mode for actual calls."
+            ),
+            "studio": (
+                "Stock DepthAI firmware: manual focus and white balance, "
+                "tap-to-focus, effects and free frame rates up to 42 - but "
+                "the MICROPHONE IS OFF (this firmware has no audio at all). "
+                "Switching reboots the camera, about 15 s."
+            ),
+        }
         for mode, text in (("call", "Call"), ("studio", "Studio")):
             b = Gtk.Button(label=text)
             b.add_css_class("dc-chip")
+            b.set_tooltip_text(blurbs[mode])
             b.connect("clicked", self._on_mode, mode)
             self.mode_buttons[mode] = b
             row.append(b)
@@ -1318,6 +1386,196 @@ class Panel(Gtk.Box):
         self._confirm_pop = pop
         pop.popup()
 
+    # -- power ----------------------------------------------------------
+
+    def _on_power(self, btn) -> None:
+        if self.busy:
+            return
+        running = bool(self.status.get("running"))
+
+        def proceed():
+            self._set_busy(
+                True,
+                "stopping the camera\u2026" if running
+                else "starting the camera\u2026",
+            )
+            _worker(
+                lambda: self.client.request(cmd="set_power", on=not running),
+                self._on_result,
+            )
+
+        if self._current_res_mode() == "studio":
+            text = (
+                "Turning the camera off releases it; the firmware reboots "
+                "back to its Call personality."
+                if running else
+                "Turning the camera on re-enters Studio, rebooting the "
+                "firmware (~15 s)."
+            )
+            self._confirm(btn, text, proceed)
+        else:
+            proceed()
+
+    # -- capture --------------------------------------------------------
+    #
+    # One button, two verbs: a click is a photo behind a 3 s count, a
+    # one-second hold starts a recording that the next click stops.
+
+    @staticmethod
+    def _capture_dir(kind: str) -> Path:
+        special = GLib.get_user_special_dir(
+            GLib.UserDirectory.DIRECTORY_PICTURES if kind == "photo"
+            else GLib.UserDirectory.DIRECTORY_VIDEOS
+        )
+        base = Path(special) if special else (
+            Path.home() / ("Pictures" if kind == "photo" else "Videos")
+        )
+        out = base / "decomposer"
+        out.mkdir(parents=True, exist_ok=True)
+        return out
+
+    def _on_capture_pressed(self, _g, _n, _x, _y) -> None:
+        if self._recorder is not None:
+            return  # the release handles stop
+        self._hold_fired = False
+        self._hold_timer = GLib.timeout_add(1000, self._hold_elapsed)
+
+    def _hold_elapsed(self) -> bool:
+        self._hold_timer = None
+        self._hold_fired = True
+        self._start_recording()
+        return False
+
+    def _on_capture_released(self, _g, _n, _x, _y) -> None:
+        if self._hold_timer is not None:
+            GLib.source_remove(self._hold_timer)
+            self._hold_timer = None
+        if self._hold_fired:
+            return  # the hold already started the recording
+        if self._recorder is not None:
+            self._stop_recording()
+        elif self._countdown is None:
+            self._start_countdown()
+
+    def _start_countdown(self) -> None:
+        if not self.status.get("engine_alive"):
+            self._flash("no feed to photograph", 4.0)
+            return
+        self._count_left = 3
+        self.count_label.set_text("3")
+        self.count_label.set_visible(True)
+        self._countdown = GLib.timeout_add(1000, self._count_tick)
+
+    def _count_tick(self) -> bool:
+        self._count_left -= 1
+        if self._count_left > 0:
+            self.count_label.set_text(str(self._count_left))
+            return True
+        self._countdown = None
+        self.count_label.set_visible(False)
+        self._take_photo()
+        return False
+
+    def _take_photo(self) -> None:
+        # The shutter flash fires at the moment of capture.
+        self.flash_box.set_opacity(0.85)
+        GLib.timeout_add(60, self._flash_decay)
+        out = self._capture_dir("photo") / time.strftime(
+            "photo-%Y%m%d-%H%M%S.png"
+        )
+
+        def snap() -> dict:
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-f", "v4l2",
+                 "-i", self.status.get("output") or "/dev/video10",
+                 "-frames:v", "1", str(out)],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode != 0 or not out.is_file():
+                tail = (r.stderr or "").strip().splitlines()
+                return {"ok": False,
+                        "error": tail[-1] if tail else "ffmpeg failed"}
+            return {"ok": True, "saved": str(out)}
+
+        def done(resp: dict) -> bool:
+            self._flash(
+                f"saved {resp['saved']}" if resp.get("ok")
+                else f"photo failed: {resp.get('error')}",
+                6.0,
+            )
+            return False
+
+        _worker(snap, done)
+
+    def _flash_decay(self) -> bool:
+        v = self.flash_box.get_opacity() - 0.17
+        self.flash_box.set_opacity(max(0.0, v))
+        return v > 0.0
+
+    def _start_recording(self) -> None:
+        if self._recorder is not None or not self.status.get("engine_alive"):
+            return
+        out = self._capture_dir("video") / time.strftime(
+            "rec-%Y%m%d-%H%M%S.mkv"
+        )
+        cmd = ["ffmpeg", "-y",
+               "-f", "v4l2", "-i", self.status.get("output") or "/dev/video10"]
+        if shutil.which("pactl"):
+            # Whatever the system's default microphone is - in Call mode
+            # that may well be the C1 itself.
+            cmd += ["-f", "pulse", "-i", "default", "-c:a", "aac"]
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                str(out)]
+        try:
+            self._recorder = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except OSError as e:
+            self._flash(f"recording failed to start: {e}", 6.0)
+            return
+        self._rec_path = out
+        self.capture_btn.set_label("\u25a0")
+        self.capture_btn.set_tooltip_text("Click to stop recording")
+        self.rec_badge.set_visible(True)
+        self._rec_blink = GLib.timeout_add(600, self._blink_rec)
+
+    def _blink_rec(self) -> bool:
+        if self._recorder is None:
+            return False
+        self.rec_badge.set_visible(not self.rec_badge.get_visible())
+        return True
+
+    def _stop_recording(self) -> None:
+        rec, self._recorder = self._recorder, None
+        if self._rec_blink is not None:
+            GLib.source_remove(self._rec_blink)
+            self._rec_blink = None
+        self.rec_badge.set_visible(False)
+        self.capture_btn.set_label("\u25c9")
+        self.capture_btn.set_tooltip_text(
+            "Click: photo (3 s timer). Hold 1 s: record; click again to stop"
+        )
+        path = getattr(self, "_rec_path", None)
+
+        def finish() -> dict:
+            with suppress(Exception):
+                rec.stdin.write(b"q")  # ffmpeg's own clean-finalize knob
+                rec.stdin.flush()
+            try:
+                rec.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                rec.terminate()
+                with suppress(Exception):
+                    rec.wait(timeout=5)
+            return {"ok": True, "saved": str(path)}
+
+        def done(resp: dict) -> bool:
+            self._flash(f"saved {resp['saved']}", 6.0)
+            return False
+
+        _worker(finish, done)
+
     def _on_fps_commit(self, entry) -> None:
         if self._suppress or not self._ready or self.busy:
             return
@@ -1448,7 +1706,7 @@ class Panel(Gtk.Box):
             self.camera_stack.set_opacity(0.45)
             for widget in (
                 list(self.mode_buttons.values())
-                + [self.res_drop, self.fps_entry,
+                + [self.res_drop, self.fps_entry, self.power_btn,
                    self.preset_drop, self.preset_save]
             ):
                 widget.set_sensitive(False)
@@ -1707,6 +1965,13 @@ class Panel(Gtk.Box):
                     self._res_applied = i
                     break
             self.res_drop.set_sensitive(not transitioning)
+            running = bool(st.get("running"))
+            (self.power_btn.add_css_class if running
+             else self.power_btn.remove_css_class)("selected")
+            self.power_btn.set_sensitive(not transitioning)
+            self.capture_btn.set_sensitive(
+                bool(st.get("engine_alive")) or self._recorder is not None
+            )
             self._sync_fps_entry()
             lo, hi = st.get("fps_range") or (30.0, 30.0)
             fps_editable = studio and not transitioning

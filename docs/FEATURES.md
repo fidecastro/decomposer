@@ -83,6 +83,17 @@ model loads):
 - **Tap-to-focus** — click the preview in Studio and focus plus
   exposure metering aim there.
 
+## Capture
+
+- A **power toggle** in the header: feed off releases the camera
+  entirely (and parks the supervisor); on re-enters the current mode.
+- A **capture button**: click for a photo behind a 3-second on-preview
+  countdown and a shutter flash; hold it for a second to start a
+  recording (h264 + your default microphone, saved under
+  `~/Videos/decomposer`), with a blinking REC badge on the preview and
+  the same button - now a stop square - ending it. Photos land in
+  `~/Pictures/decomposer`.
+
 ## Presets
 
 Everything above saves into named presets, **kept per mode** because
