@@ -48,6 +48,7 @@ def test_zoom_and_pan_lines():
 
 def test_capture_size_is_a_restart_field():
     assert cfg(in_width=3840, in_height=2160).needs_restart_from(cfg())
+    assert cfg(normal_output="/dev/video11").needs_restart_from(cfg())
     assert not cfg(zoom=3.0, pan_x=1.0).needs_restart_from(cfg())
 
 
@@ -71,7 +72,8 @@ def test_restart_fields_are_exactly_the_unsendable_ones():
 
 def test_cli_args_carry_every_field_the_engine_needs():
     config = cfg(
-        input="/dev/video1", look="G1", strength=0.65, flip=2,
+        input="/dev/video1", normal_output="/dev/video11",
+        look="G1", strength=0.65, flip=2,
         overlay="/tmp/mark.png", overlay_x=100, overlay_y=200,
         overlay_w=300, overlay_h=300, overlay_opacity=0.8,
         lut_dir="/opt/luts",
@@ -79,6 +81,7 @@ def test_cli_args_carry_every_field_the_engine_needs():
     args = engine_cli_args(config)
     text = " ".join(args)
     assert "--input /dev/video1" in text
+    assert "--normal-output /dev/video11" in text
     assert "--look G1" in text
     assert "--strength 0.65" in text
     assert "--flip 2" in text
@@ -90,6 +93,7 @@ def test_cli_args_carry_every_field_the_engine_needs():
 
 def test_cli_args_omit_absent_optionals():
     text = " ".join(engine_cli_args(cfg()))
+    assert "--normal-output" not in text
     assert "--lut-dir" not in text
     assert "--overlay " not in text
 

@@ -18,11 +18,21 @@ sudo pacman -S python-gobject gtk4 libadwaita gtk4-layer-shell
 pip install 'decomposer[gui]'
 ```
 
-## The virtual camera (v4l2loopback)
+## The virtual cameras (v4l2loopback)
 
-decomposer publishes to `/dev/video10`. The module options pin the node
-number, name the device, and set `exclusive_caps=1` so apps only see the
-camera while the engine is publishing.
+decomposer publishes the processed frame to two devices:
+
+- `/dev/video10`, **decomposer Send Flip**, follows the panel's SEND flips.
+- `/dev/video11`, **decomposer Normal**, always removes SEND flips. Select
+  this once in Meet or any other app that should be excluded.
+
+Both outputs subscribe to v4l2loopback's client-usage event. After one priming
+frame makes a device discoverable, Decomposer converts and writes frames only
+while an application is actually streaming from that device. An unused second
+feed therefore adds no continuous frame-copy load.
+
+The module options pin both node numbers, name the devices, and set
+`exclusive_caps=1` so camera clients negotiate them correctly.
 
 ```
 sudo install -m 0644 packaging/v4l2loopback.conf /etc/modprobe.d/

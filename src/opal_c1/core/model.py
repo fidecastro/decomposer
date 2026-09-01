@@ -196,6 +196,7 @@ class EngineConfig:
 
     input: str = "/dev/video0"          # a V4L2 node, or "-" for stdin
     output: str = "/dev/video10"
+    normal_output: Optional[str] = None
     width: int = 1920
     height: int = 1080
     # Capture size; 0 means same as the output. Capturing 4K while publishing
@@ -235,7 +236,8 @@ class EngineConfig:
     # Fields whose change cannot be applied over the control socket: the
     # engine has to be restarted for them. Everything else is a live update.
     RESTART_FIELDS = (
-        "input", "output", "width", "height", "in_width", "in_height",
+        "input", "output", "normal_output", "width", "height",
+        "in_width", "in_height",
         "lut_dir", "seg_model", "seg_device", "models",
     )
 
@@ -266,6 +268,8 @@ def engine_cli_args(config: EngineConfig) -> list:
         f"{config.overlay_w},{config.overlay_h}",
         "--overlay-opacity", str(config.overlay_opacity),
     ]
+    if config.normal_output:
+        args += ["--normal-output", config.normal_output]
     if config.in_width and config.in_height:
         args += ["--in-width", str(config.in_width),
                  "--in-height", str(config.in_height)]

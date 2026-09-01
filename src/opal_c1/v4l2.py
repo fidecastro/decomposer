@@ -201,6 +201,32 @@ class UvcControls:
 _QUERYCAP_FMT = "<16s32s32sIII3I"
 VIDIOC_QUERYCAP = (2 << 30) | (struct.calcsize(_QUERYCAP_FMT) << 16) | (ord("V") << 8) | 0
 V4L2_CAP_VIDEO_CAPTURE = 0x00000001
+V4L2_CAP_VIDEO_OUTPUT = 0x00000002
+
+
+def exclusive_caps_ready(dev_path: str) -> bool:
+    """True when a loopback node exposes only its currently usable direction.
+
+    v4l2loopback's exclusive_caps mode advertises VIDEO_OUTPUT before a
+    producer connects and VIDEO_CAPTURE after it connects.  A non-exclusive
+    node advertises both at once.  Inspecting the node works for devices added
+    dynamically as well as those created from module parameters.
+    """
+    try:
+        fd = os.open(dev_path, os.O_RDWR | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        buf = bytearray(struct.calcsize(_QUERYCAP_FMT))
+        fcntl.ioctl(fd, VIDIOC_QUERYCAP, buf, True)
+        values = struct.unpack(_QUERYCAP_FMT, bytes(buf))
+        caps = values[5] or values[4]
+        directions = caps & (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_OUTPUT)
+        return directions in (V4L2_CAP_VIDEO_CAPTURE, V4L2_CAP_VIDEO_OUTPUT)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
 
 
 def capture_ready(dev_path: str = "/dev/video0") -> bool:

@@ -1,7 +1,7 @@
 //! decomposer look engine.
 //!
-//! Reads NV12 frames from the Opal C1 and republishes them to a v4l2loopback
-//! node so any application can consume the processed feed.
+//! Reads NV12 frames from the Opal C1 and republishes them to v4l2loopback
+//! nodes so applications can choose SEND flips or a stable normal feed.
 //!
 //! Two input sources, matching decomposer's two modes:
 //!   - a V4L2 device (Call mode: the camera's own /dev/video0)
@@ -32,6 +32,11 @@ struct Args {
     /// v4l2loopback node to publish to
     #[arg(long, default_value = "/dev/video10")]
     output: String,
+
+    /// Optional second v4l2loopback node that always publishes normal
+    /// orientation, undoing --flip without running the GPU twice
+    #[arg(long)]
+    normal_output: Option<String>,
 
     #[arg(long, default_value_t = 1920)]
     width: u32,
@@ -181,6 +186,18 @@ fn main() -> Result<()> {
         eprintln!("output {} {}x{}", args.output, out_w, out_h);
         Some(s)
     };
+    let mut normal_sink = match args.normal_output.as_deref() {
+        None => None,
+        Some(path) if path == args.output => {
+            anyhow::bail!("normal output must differ from primary output {path}")
+        }
+        Some(path) => {
+            let s = source::V4l2Sink::new(path, out_w, out_h)
+                .with_context(|| format!("opening normal output device {path}"))?;
+            eprintln!("normal {path} {out_w}x{out_h} (SEND flips removed)");
+            Some(s)
+        }
+    };
 
     // Timed from the first frame: in Studio mode the producer spends several
     // seconds switching the camera's firmware before anything arrives, and
@@ -236,6 +253,7 @@ fn main() -> Result<()> {
         eprintln!("look   {} @ {:.2} on {}", args.look, args.strength, g.adapter_name);
         Some(g)
     };
+    let mut applied_flip = if engine.is_some() { args.flip & 3 } else { 0 };
 
     let look_state = config::shared(
         gpu::look_index(&args.look).unwrap_or(0),
@@ -366,6 +384,7 @@ fn main() -> Result<()> {
             {
                 g.set_look(look, strength);
                 g.set_flip(flip);
+                applied_flip = flip;
                 g.set_zoom(zoom, pan_x, pan_y);
                 g.set_clahe(clahe);
                 g.set_blur(blur, blur_style);
@@ -549,7 +568,13 @@ fn main() -> Result<()> {
             None => frame,
         };
         if let Some(sink) = sink.as_mut() {
-            sink.write(out)?;
+            sink.write_if_watched(out, 0)?;
+        }
+        if let Some(sink) = normal_sink.as_mut() {
+            // The GPU has already applied SEND's flip. Applying the same
+            // transform once more while copying to I420 restores normal
+            // orientation for this second feed.
+            sink.write_if_watched(out, applied_flip)?;
         }
         if let Some(p) = preview.as_mut() {
             p.publish(out, out_w, out_h);

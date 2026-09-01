@@ -6,18 +6,31 @@
 //! firmware), so frames arrive as raw NV12 on stdin from the depthai layer.
 
 use anyhow::{bail, Context, Result};
-use std::io::Read;
-use std::mem::ManuallyDrop;
+use nix::errno::Errno;
+use std::io::{self, Read};
+use std::mem::{self, ManuallyDrop};
 use std::os::fd::FromRawFd;
 use v4l::buffer::Type;
 use v4l::io::traits::{CaptureStream, OutputStream};
 use v4l::prelude::*;
 use v4l::video::{Capture, Output};
+use v4l::v4l_sys::{v4l2_event, v4l2_event_subscription};
 use v4l::{Format, FourCC};
 
 /// linux/videodev2.h: this frame is progressive, not one field of an
 /// interlaced pair.
 const V4L2_FIELD_NONE: u32 = 1;
+
+// v4l2loopback 0.15's private event. The driver sends one whenever a capture
+// client STREAMONs or STREAMOFFs, including an initial state on subscribe.
+const V4L2_EVENT_PRIVATE_START: u32 = 0x0800_0000;
+const V4L2LOOPBACK_EVENT_OFFSET: u32 = 0x08e0_0000;
+const V4L2_EVENT_PRI_CLIENT_USAGE: u32 =
+    V4L2_EVENT_PRIVATE_START + V4L2LOOPBACK_EVENT_OFFSET + 1;
+const V4L2_EVENT_SUB_FL_SEND_INITIAL: u32 = 1;
+
+nix::ioctl_read!(vidioc_dqevent, b'V', 89, v4l2_event);
+nix::ioctl_write_ptr!(vidioc_subscribe_event, b'V', 90, v4l2_event_subscription);
 
 /// NV12 is 8 bits of luma per pixel plus a half-resolution interleaved
 /// chroma plane, so one frame is width * height * 3 / 2 bytes.
@@ -124,6 +137,10 @@ pub struct V4l2Sink {
     stream: MmapStream<'static>,
     width: u32,
     height: u32,
+    path: String,
+    primed: bool,
+    viewer_active: bool,
+    usage_events: bool,
 }
 
 impl V4l2Sink {
@@ -149,17 +166,36 @@ impl V4l2Sink {
             );
         }
 
+        let usage_events = subscribe_client_usage(dev).is_ok();
+        if !usage_events {
+            eprintln!(
+                "output {path}: viewer detection unavailable; publishing continuously"
+            );
+        }
         let stream = MmapStream::with_buffers(dev, Type::VideoOutput, 2)
             .context("start output stream")?;
-        Ok(Self { stream, width, height })
+        Ok(Self {
+            stream,
+            width,
+            height,
+            path: path.to_string(),
+            primed: false,
+            viewer_active: !usage_events,
+            usage_events,
+        })
     }
 
-    /// Publish one NV12 frame as I420: Y verbatim, then the interleaved UV
-    /// plane split into planar U and V.
-    pub fn write(&mut self, frame: &[u8]) -> Result<()> {
+    /// Publish only while a capture client is streaming. The first frame is
+    /// always prepared because STREAMON on the producer is what makes an
+    /// exclusive-caps v4l2loopback node visible to camera pickers.
+    pub fn write_if_watched(&mut self, frame: &[u8], flip: u32) -> Result<bool> {
+        self.refresh_viewer();
+        if self.primed && self.usage_events && !self.viewer_active {
+            return Ok(false);
+        }
+
         let y_len = (self.width * self.height) as usize;
-        let quarter = y_len / 4;
-        let total = y_len + 2 * quarter;
+        let total = y_len + y_len / 2;
         if frame.len() < total {
             bail!("short frame: {} bytes, need {total}", frame.len());
         }
@@ -167,17 +203,178 @@ impl V4l2Sink {
         if buf.len() < total {
             bail!("output buffer too small: {} < {total}", buf.len());
         }
-        buf[..y_len].copy_from_slice(&frame[..y_len]);
-        let (u_out, v_out) = buf[y_len..y_len + 2 * quarter].split_at_mut(quarter);
-        for (i, pair) in frame[y_len..total].chunks_exact(2).enumerate() {
-            u_out[i] = pair[0];
-            v_out[i] = pair[1];
-        }
+        nv12_to_i420(frame, &mut buf[..total], self.width, self.height, flip)?;
         // V4L2_FIELD_NONE. Not ANY (0), which tells the driver it may choose,
         // and leaves a consumer free to treat the buffer as a single field
         // rather than a whole progressive frame.
         meta.field = V4L2_FIELD_NONE;
         meta.bytesused = total as u32;
-        Ok(())
+        self.primed = true;
+        Ok(true)
+    }
+
+    fn refresh_viewer(&mut self) {
+        if !self.usage_events {
+            return;
+        }
+        loop {
+            let mut event: v4l2_event = unsafe { mem::zeroed() };
+            match unsafe { vidioc_dqevent(self.stream.handle().fd(), &mut event) } {
+                Ok(_) => {
+                    if event.type_ != V4L2_EVENT_PRI_CLIENT_USAGE {
+                        continue;
+                    }
+                    let data = unsafe { event.u.data };
+                    let active = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]) != 0;
+                    if active != self.viewer_active {
+                        self.viewer_active = active;
+                        eprintln!(
+                            "output {}: {}",
+                            self.path,
+                            if active { "viewer connected" } else { "idle" },
+                        );
+                    }
+                }
+                // The V4L2 core normally reports EAGAIN for an empty
+                // nonblocking event queue. v4l2loopback 0.15 also reports
+                // ENOENT after its initial event has been consumed.
+                Err(Errno::EAGAIN | Errno::ENOENT) => return,
+                Err(e) => {
+                    self.usage_events = false;
+                    self.viewer_active = true;
+                    eprintln!(
+                        "output {}: viewer event failed ({e}); publishing continuously",
+                        self.path,
+                    );
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn subscribe_client_usage(dev: &Device) -> io::Result<()> {
+    let subscription = v4l2_event_subscription {
+        type_: V4L2_EVENT_PRI_CLIENT_USAGE,
+        flags: V4L2_EVENT_SUB_FL_SEND_INITIAL,
+        ..unsafe { mem::zeroed() }
+    };
+    unsafe { vidioc_subscribe_event(dev.handle().fd(), &subscription) }
+        .map(|_| ())
+        .map_err(|e| io::Error::from_raw_os_error(e as i32))
+}
+
+/// Convert NV12 to I420 while optionally applying a final output flip.
+/// Applying the same flip after the GPU is an involution, which gives the
+/// second sink a stable normal orientation without another shader pass.
+fn nv12_to_i420(
+    src: &[u8],
+    dst: &mut [u8],
+    width: u32,
+    height: u32,
+    flip: u32,
+) -> Result<()> {
+    let (w, h) = (width as usize, height as usize);
+    let y_len = w * h;
+    let chroma_w = w / 2;
+    let chroma_h = h / 2;
+    let quarter = chroma_w * chroma_h;
+    let total = y_len + 2 * quarter;
+    if src.len() < total || dst.len() < total {
+        bail!(
+            "short conversion buffer: source {}, destination {}, need {total}",
+            src.len(),
+            dst.len(),
+        );
+    }
+    let flip_h = flip & 1 != 0;
+    let flip_v = flip & 2 != 0;
+
+    if !flip_h && !flip_v {
+        dst[..y_len].copy_from_slice(&src[..y_len]);
+    } else {
+        for out_y in 0..h {
+            let src_y = if flip_v { h - 1 - out_y } else { out_y };
+            for out_x in 0..w {
+                let src_x = if flip_h { w - 1 - out_x } else { out_x };
+                dst[out_y * w + out_x] = src[src_y * w + src_x];
+            }
+        }
+    }
+
+    let (u_out, v_out) = dst[y_len..total].split_at_mut(quarter);
+    for out_y in 0..chroma_h {
+        let src_y = if flip_v { chroma_h - 1 - out_y } else { out_y };
+        for out_x in 0..chroma_w {
+            let src_x = if flip_h { chroma_w - 1 - out_x } else { out_x };
+            let src_i = y_len + (src_y * chroma_w + src_x) * 2;
+            let out_i = out_y * chroma_w + out_x;
+            u_out[out_i] = src[src_i];
+            v_out[out_i] = src[src_i + 1];
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nv12_to_i420;
+
+    fn converted(src: &[u8], width: u32, height: u32, flip: u32) -> Vec<u8> {
+        let mut dst = vec![0; src.len()];
+        nv12_to_i420(src, &mut dst, width, height, flip).unwrap();
+        dst
+    }
+
+    #[test]
+    fn converts_nv12_to_i420_without_a_flip() {
+        let src = [0, 1, 2, 3, 4, 5, 6, 7, 10, 20, 30, 40];
+        assert_eq!(
+            converted(&src, 4, 2, 0),
+            [0, 1, 2, 3, 4, 5, 6, 7, 10, 30, 20, 40],
+        );
+    }
+
+    #[test]
+    fn horizontal_flip_reverses_pixels_and_chroma_pairs() {
+        let src = [0, 1, 2, 3, 4, 5, 6, 7, 10, 20, 30, 40];
+        assert_eq!(
+            converted(&src, 4, 2, 1),
+            [3, 2, 1, 0, 7, 6, 5, 4, 30, 10, 40, 20],
+        );
+    }
+
+    #[test]
+    fn vertical_and_180_flips_reverse_the_expected_rows() {
+        let src = [
+            0, 1, 2, 3,
+            4, 5, 6, 7,
+            8, 9, 10, 11,
+            12, 13, 14, 15,
+            20, 30, 40, 50,
+            60, 70, 80, 90,
+        ];
+        assert_eq!(
+            converted(&src, 4, 4, 2),
+            [
+                12, 13, 14, 15,
+                8, 9, 10, 11,
+                4, 5, 6, 7,
+                0, 1, 2, 3,
+                60, 80, 20, 40,
+                70, 90, 30, 50,
+            ],
+        );
+        assert_eq!(
+            converted(&src, 4, 4, 3),
+            [
+                15, 14, 13, 12,
+                11, 10, 9, 8,
+                7, 6, 5, 4,
+                3, 2, 1, 0,
+                80, 60, 40, 20,
+                90, 70, 50, 30,
+            ],
+        );
     }
 }
