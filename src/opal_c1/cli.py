@@ -593,7 +593,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     from opal_c1.daemon import Daemon
 
     return Daemon(
-        output=args.output, width=args.width, height=args.height, fps=args.fps,
+        output=args.output, normal_output=args.normal_output,
+        width=args.width, height=args.height, fps=args.fps,
         tray_enabled=args.tray,
         in_width=args.in_width, in_height=args.in_height,
         seg_model=args.seg_model, seg_device=args.seg_device,
@@ -607,7 +608,12 @@ def _print_status(st: dict) -> None:
         f"  (camera reports: {st.get('mode_actual')})"
     print(f"  mode      {st.get('mode')}{mark}")
     print(f"  look      {st.get('look')} @ {st.get('strength')}")
-    print(f"  output    {st.get('output')}  {st.get('width')}x{st.get('height')}")
+    print(f"  preset    {st.get('active_preset') or '—'}")
+    print(
+        f"  send      {st.get('output')}  "
+        f"{st.get('width')}x{st.get('height')}  follows SEND flips"
+    )
+    print(f"  normal    {st.get('normal_output')}  flips excluded")
     print(f"  engine    {'running' if st.get('engine_alive') else 'STOPPED'}")
     if st.get("frames"):
         print(f"  frames    {st['frames']}")
@@ -824,6 +830,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     import ctypes.util
     import shutil as _shutil
     from opal_c1.daemon import find_engine, lut_dir
+    from opal_c1.v4l2 import exclusive_caps_ready
 
     problems = 0
 
@@ -856,12 +863,12 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
           "models/selfie_segmentation.onnx ships with the repo")
 
     loop = Path("/dev/video10")
-    check(loop.exists(), "v4l2loopback node", str(loop),
+    check(loop.exists(), "SEND v4l2loopback node", str(loop),
           "see docs/SETUP.md \u00a7 The virtual camera")
-    caps = Path("/sys/module/v4l2loopback/parameters/exclusive_caps")
-    # The parameter prints as a bool array ("Y,N,N,..."), one slot per
-    # possible device; ours is the first.
-    caps_ok = caps.is_file() and caps.read_text().strip().split(",")[0] in ("Y", "1")
+    normal_loop = Path("/dev/video11")
+    check(normal_loop.exists(), "normal v4l2loopback node", str(normal_loop),
+          "see docs/SETUP.md \u00a7 The virtual camera")
+    caps_ok = all(exclusive_caps_ready(str(p)) for p in (loop, normal_loop))
     check(caps_ok, "exclusive_caps",
           "", "apps only see the camera when the engine publishes; "
           "see docs/SETUP.md \u00a7 The virtual camera")
@@ -1247,10 +1254,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the daemon: owns the camera and publishes the processed feed",
         description=(
             "Holds the camera and the look engine so that Studio-mode settings "
-            "persist and /dev/video10 never disappears from under an application."
+            "persist and both virtual cameras remain available to applications."
         ),
     )
     dm.add_argument("--output", default="/dev/video10")
+    dm.add_argument(
+        "--normal-output", default="/dev/video11",
+        help="Second virtual camera that always removes SEND flips",
+    )
     dm.add_argument("--width", type=int, default=1920)
     dm.add_argument("--height", type=int, default=1080)
     dm.add_argument("--fps", type=float, default=30.0)
@@ -1498,9 +1509,9 @@ def build_parser() -> argparse.ArgumentParser:
         "mirror",
         help="Mirror the published image",
         description=(
-            "Applied on the GPU at no cost. Both modes share one setting, since "
-            "Studio mode is corrected to Call mode's orientation on the device. "
-            "Both axes together is a 180 degree rotation."
+            "Applied to the decomposer Send Flip camera. The decomposer Normal "
+            "camera removes it for apps you want to exclude. Both modes share "
+            "one setting, and both axes together is a 180 degree rotation."
         ),
     )
     mi.add_argument("--horizontal", choices=("on", "off"), default=None)

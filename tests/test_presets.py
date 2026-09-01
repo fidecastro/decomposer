@@ -2,10 +2,13 @@
 
 import pytest
 
-from opal_c1.core.presets import decode, validate_name
+from opal_c1.core.presets import decode, decode_last_used, validate_name
 
 
-@pytest.mark.parametrize("bad", ["", "  ", "../evil", "a/b", "a\\b", ".hidden", ".", ".."])
+@pytest.mark.parametrize("bad", [
+    "", "  ", "../evil", "a/b", "a\\b", ".hidden", ".", "..",
+    "line\nbreak", "hidden\u202ename", "x" * 81, 42,
+])
 def test_pathlike_names_are_refused(bad):
     with pytest.raises(ValueError):
         validate_name(bad)
@@ -75,3 +78,19 @@ def test_blur_style_decode():
     assert fields["blur_style"] == 1
     fields, _ = decode({"blur_style": 7})
     assert "blur_style" not in fields
+
+
+def test_last_used_state_keeps_only_valid_mode_names():
+    assert decode_last_used({
+        "version": 1,
+        "last_by_mode": {
+            "call": "Desk",
+            "studio": "../unsafe",
+            "turbo": "Ignored",
+        },
+    }) == {"call": "Desk"}
+
+
+@pytest.mark.parametrize("raw", [None, [], "bad", {}, {"version": 99}])
+def test_invalid_last_used_state_is_empty(raw):
+    assert decode_last_used(raw) == {}
