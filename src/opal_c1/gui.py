@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import stat
 import struct
 from pathlib import Path
 import shutil
@@ -44,7 +45,8 @@ except (ValueError, ImportError, OSError):
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+gi.require_version("Graphene", "1.0")
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gtk  # noqa: E402
 
 import cairo  # noqa: E402
 
@@ -53,7 +55,12 @@ gi.require_version("PangoCairo", "1.0")
 from gi.repository import Pango, PangoCairo  # noqa: E402
 
 from opal_c1 import theme as omtheme  # noqa: E402
-from opal_c1.daemon import Client, runtime_dir  # noqa: E402
+from opal_c1.daemon import (  # noqa: E402
+    Client,
+    _atomic_write_json,
+    _read_regular_json,
+    runtime_dir,
+)
 from opal_c1.core.model import (  # noqa: E402
     Mode as _Mode,
     controls_for as _controls_for,
@@ -71,6 +78,78 @@ def model_controls_for(mode: str) -> frozenset:
 WIDTH = 384          # one column: the preview pane, and the controls pane
 PANEL_W = 800        # both columns plus margins
 PREVIEW_H = 216
+HYPR_CURSOR_REPLY_MAX = 256
+
+
+def _position_from_cursor(
+    panel_origin: tuple[int, int],
+    cursor_origin: tuple[float, float],
+    cursor_now: tuple[float, float],
+) -> tuple[int, int]:
+    """Place a panel from a compositor-global cursor delta, in logical pixels."""
+    return (
+        round(panel_origin[0] + cursor_now[0] - cursor_origin[0]),
+        round(panel_origin[1] + cursor_now[1] - cursor_origin[1]),
+    )
+
+
+def _hypr_cursor_position() -> Optional[tuple[float, float]]:
+    """Read Hyprland's global logical cursor position through bounded IPC.
+
+    Wayland intentionally gives GTK only surface-relative pointer coordinates.
+    That is unsuitable for moving the surface underneath an active gesture,
+    because the coordinate origin moves too.  Omarchy runs Hyprland, whose
+    owner-only command socket provides the stable compositor coordinate we
+    need without starting a process for every motion event.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    instance = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    if (
+        not runtime or not instance or len(runtime) > 512 or len(instance) > 160
+        or not all(c.isalnum() or c in "._-" for c in instance)
+    ):
+        return None
+    path = Path(runtime) / "hypr" / instance / ".socket.sock"
+    try:
+        info = path.stat(follow_symlinks=False)
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+            return None
+        with socket.socket(socket.AF_UNIX) as command:
+            command.settimeout(0.05)
+            command.connect(str(path))
+            if hasattr(socket, "SO_PEERCRED"):
+                raw = command.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED,
+                    struct.calcsize("3i"),
+                )
+                _pid, uid, _gid = struct.unpack("3i", raw)
+                if uid != os.getuid():
+                    return None
+            command.sendall(b"j/cursorpos")
+            command.shutdown(socket.SHUT_WR)
+            reply = bytearray()
+            while len(reply) <= HYPR_CURSOR_REPLY_MAX:
+                chunk = command.recv(
+                    min(128, HYPR_CURSOR_REPLY_MAX + 1 - len(reply))
+                )
+                if not chunk:
+                    break
+                reply.extend(chunk)
+            if len(reply) > HYPR_CURSOR_REPLY_MAX:
+                return None
+        parsed = json.loads(reply)
+        if not isinstance(parsed, dict):
+            return None
+        values = parsed.get("x"), parsed.get("y")
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               for value in values):
+            return None
+        x, y = float(values[0]), float(values[1])
+        if not (-1_000_000 <= x <= 1_000_000 and -1_000_000 <= y <= 1_000_000):
+            return None
+        return x, y
+    except (OSError, ValueError, json.JSONDecodeError, struct.error):
+        return None
 
 # Composer's eight Core Image effects, then its own five. Both groups are
 # loaded from LUTs measured off Composer itself, so the descriptions below are
@@ -107,23 +186,26 @@ PANEL_CONFIG = (
     Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
     / "decomposer/panel.json"
 )
+PANEL_CONFIG_MAX = 8 * 1024
 
 
 def _panel_pref(key: str, default):
     try:
-        return json.loads(PANEL_CONFIG.read_text()).get(key, default)
+        value = _read_regular_json(PANEL_CONFIG, PANEL_CONFIG_MAX)
+        return value.get(key, default) if isinstance(value, dict) else default
     except (OSError, ValueError):
         return default
 
 
 def _save_panel_pref(key: str, value) -> None:
     try:
-        data = json.loads(PANEL_CONFIG.read_text())
+        data = _read_regular_json(PANEL_CONFIG, PANEL_CONFIG_MAX)
+        if not isinstance(data, dict):
+            data = {}
     except (OSError, ValueError):
         data = {}
     data[key] = value
-    PANEL_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    PANEL_CONFIG.write_text(json.dumps(data, indent=2) + "\n")
+    _atomic_write_json(PANEL_CONFIG, data, PANEL_CONFIG_MAX)
 
 # Which modes can actually drive each control. Call mode reaches the camera
 # over V4L2; Studio mode runs different firmware where /dev/video0 does not
@@ -143,33 +225,6 @@ SLIDERS = [
 ]
 
 
-def _run_bounded(cmd: list, timeout: float, cap: int = 8192) -> dict:
-    """Run a producer, keeping only the tail of its stderr in memory.
-
-    A capture subprocess left running for its whole timeout could spew an
-    unbounded stderr straight into the panel's memory; drain it fully (so
-    the pipe never blocks) but retain only the last `cap` bytes.
-    """
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-    )
-    tail = b""
-    try:
-        assert proc.stderr is not None
-        for chunk in iter(lambda: proc.stderr.read(4096), b""):
-            tail = (tail + chunk)[-cap:]
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        with suppress(Exception):
-            proc.wait(timeout=5)
-        return {"code": -1, "stderr": tail.decode("utf-8", "replace")}
-    finally:
-        with suppress(Exception):
-            proc.stderr.close()
-    return {"code": proc.returncode, "stderr": tail.decode("utf-8", "replace")}
-
-
 def _worker(fn: Callable[[], dict], done: Callable[[dict], None]) -> None:
     def run() -> None:
         try:
@@ -179,6 +234,50 @@ def _worker(fn: Callable[[], dict], done: Callable[[dict], None]) -> None:
         GLib.idle_add(done, result)
 
     threading.Thread(target=run, daemon=True).start()
+
+
+class _FlipPaintable(GObject.Object, Gdk.Paintable):
+    """A zero-copy flipped view of an immutable frame texture."""
+
+    def __init__(
+        self, source: Gdk.Paintable, horizontal: bool, vertical: bool
+    ):
+        super().__init__()
+        self.source = source
+        self.horizontal = horizontal
+        self.vertical = vertical
+
+    def do_get_intrinsic_width(self) -> int:
+        return self.source.get_intrinsic_width()
+
+    def do_get_intrinsic_height(self) -> int:
+        return self.source.get_intrinsic_height()
+
+    def do_get_intrinsic_aspect_ratio(self) -> float:
+        return self.source.get_intrinsic_aspect_ratio()
+
+    def do_get_flags(self):
+        return Gdk.PaintableFlags.SIZE | Gdk.PaintableFlags.CONTENTS
+
+    def do_snapshot(self, snapshot, width: float, height: float) -> None:
+        snapshot.save()
+        snapshot.translate(Graphene.Point().init(
+            width if self.horizontal else 0,
+            height if self.vertical else 0,
+        ))
+        snapshot.scale(
+            -1.0 if self.horizontal else 1.0,
+            -1.0 if self.vertical else 1.0,
+        )
+        self.source.snapshot(snapshot, width, height)
+        snapshot.restore()
+
+
+def _preview_correction_flips(
+    want_mirrored: bool, send_horizontal: bool, send_vertical: bool
+) -> tuple[bool, bool]:
+    """Transform a SEND-oriented engine preview into the requested self-view."""
+    return bool(want_mirrored) ^ bool(send_horizontal), bool(send_vertical)
 
 
 class Preview(Gtk.Picture):
@@ -206,9 +305,52 @@ class Preview(Gtk.Picture):
         if self.placeholder not in self.PLACEHOLDER_STYLES:
             self.placeholder = "nofeed"
         self._ph_cache: dict = {}
+        # A camera-app mirror is a local viewing preference. Keep it out of
+        # the engine so Meet and other callers receive the ordinary image;
+        # they are then free to mirror their own self-view exactly once.
+        self.mirror_h = bool(_panel_pref("mirror_preview_h", True))
+        # The engine preview follows SEND because it is tapped after the GPU.
+        # Compensate those source flips locally so `mirror_h` remains an
+        # absolute self-view preference instead of "apply one more flip".
+        self.source_flip_h = False
+        self.source_flip_v = False
+        self._last_frame: Optional[Gdk.Paintable] = None
         self._had_frame = False
         self._showing_placeholder = False
         self.show_placeholder()
+
+    def set_mirrored(self, mirrored: bool) -> None:
+        """Mirror only this panel preview, never the virtual camera."""
+        mirrored = bool(mirrored)
+        if mirrored == self.mirror_h:
+            return
+        self.mirror_h = mirrored
+        _save_panel_pref("mirror_preview_h", mirrored)
+        if self._last_frame is not None and not self._showing_placeholder:
+            self._show_frame(self._last_frame)
+
+    def set_source_flips(self, horizontal: bool, vertical: bool) -> None:
+        horizontal, vertical = bool(horizontal), bool(vertical)
+        if (
+            horizontal == self.source_flip_h
+            and vertical == self.source_flip_v
+        ):
+            return
+        self.source_flip_h = horizontal
+        self.source_flip_v = vertical
+        if self._last_frame is not None and not self._showing_placeholder:
+            self._show_frame(self._last_frame)
+
+    def _show_frame(self, texture: Gdk.Paintable) -> None:
+        flip_h, flip_v = _preview_correction_flips(
+            self.mirror_h, self.source_flip_h, self.source_flip_v
+        )
+        paintable = (
+            _FlipPaintable(texture, flip_h, flip_v)
+            if flip_h or flip_v else texture
+        )
+        self.set_paintable(paintable)
+        self._showing_placeholder = False
 
     # -- placeholder ------------------------------------------------------
 
@@ -369,19 +511,31 @@ class Preview(Gtk.Picture):
             texture = Gdk.MemoryTexture.new(
                 w, h, Gdk.MemoryFormat.R8G8B8, GLib.Bytes.new(data), w * 3
             )
-            self.set_paintable(texture)
-            self._showing_placeholder = False
+            self._last_frame = texture
+            self._show_frame(texture)
         except Exception:
             pass
         return False
 
 
 class Panel(Gtk.Box):
-    def __init__(self, theme: omtheme.Theme, on_close: Callable[[], None]):
+    def __init__(
+        self,
+        theme: omtheme.Theme,
+        on_close: Callable[[], None],
+        on_drag_begin: Callable[[], None],
+        on_drag_update: Callable[[float, float], None],
+        on_drag_end: Callable[[float, float], None],
+        on_position_reset: Callable[[], None],
+    ):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add_css_class("dc-root")
         self.theme = theme
         self.on_close = on_close
+        self.on_drag_begin = on_drag_begin
+        self.on_drag_update = on_drag_update
+        self.on_drag_end = on_drag_end
+        self.on_position_reset = on_position_reset
         self.client = Client()
         self.status: dict = {}
         self.busy = False
@@ -396,6 +550,16 @@ class Panel(Gtk.Box):
         # move those sliders for a grace period, or dragging becomes a
         # tug-of-war against the camera's own automatics.
         self._touched: dict = {}
+        # Every typed slider value uses the same footprint, regardless of
+        # whether it contains a single digit, a decimal, or an exposure time.
+        self.slider_value_size = Gtk.SizeGroup.new(Gtk.SizeGroupMode.BOTH)
+        # Header, mode, and preset controls share one measured height. CSS
+        # aligns their boxes; the size group also covers GTK's different
+        # outer widgets (Button, MenuButton, DropDown, Entry, Switch, Label).
+        self.primary_control_height = Gtk.SizeGroup.new(
+            Gtk.SizeGroupMode.VERTICAL
+        )
+        self.identity_height = Gtk.SizeGroup.new(Gtk.SizeGroupMode.VERTICAL)
 
         self.set_size_request(PANEL_W, -1)
         self.append(self._header())
@@ -489,6 +653,31 @@ class Panel(Gtk.Box):
         self.theme = theme
         self.subtitle.set_text(theme.name)
 
+    def _match_primary_height(self, widget: Gtk.Widget) -> None:
+        widget.set_valign(Gtk.Align.CENTER)
+        self.primary_control_height.add_widget(widget)
+
+    def _match_identity_height(self, widget: Gtk.Widget) -> None:
+        widget.set_valign(Gtk.Align.CENTER)
+        self.identity_height.add_widget(widget)
+
+    @staticmethod
+    def _clear_button(tooltip: str, callback) -> Gtk.Button:
+        """Build the common, always-present clear action for asset rows."""
+        button = Gtk.Button(label="\u00d7")
+        button.add_css_class("dc-tiny")
+        button.add_css_class("dc-clear")
+        button.set_valign(Gtk.Align.CENTER)
+        button.set_sensitive(False)
+        button.set_tooltip_text(tooltip)
+        button.connect("clicked", callback)
+        return button
+
+    @staticmethod
+    def _set_asset_present(button: Gtk.Button, present: object) -> None:
+        """Give every asset-row clear button the same enabled-state rule."""
+        button.set_sensitive(bool(present))
+
     def _sep(self) -> Gtk.Widget:
         s = Gtk.Box()
         s.add_css_class("dc-sep")
@@ -497,24 +686,70 @@ class Panel(Gtk.Box):
     def _header(self) -> Gtk.Widget:
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         bar.add_css_class("dc-header")
+        bar.add_css_class("dc-control-row")
+        bar.set_valign(Gtk.Align.CENTER)
+        bar.set_baseline_position(Gtk.BaselinePosition.CENTER)
+
+        grip = Gtk.Label(label="⠿")
+        grip.add_css_class("dc-drag")
+        self._match_identity_height(grip)
+        grip.set_cursor_from_name("move")
+        grip.set_tooltip_text(
+            "Drag to move the panel. Double-click to return it to the top right."
+        )
+        move = Gtk.GestureDrag()
+        move.connect("drag-begin", lambda *_: self.on_drag_begin())
+        move.connect(
+            "drag-update",
+            lambda _gesture, x, y: self.on_drag_update(x, y),
+        )
+        move.connect(
+            "drag-end",
+            lambda _gesture, x, y: self.on_drag_end(x, y),
+        )
+        grip.add_controller(move)
+        reset = Gtk.GestureClick()
+        reset.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+
+        def reset_position(_gesture, presses, _x, _y):
+            if presses == 2:
+                self.on_position_reset()
+
+        reset.connect("pressed", reset_position)
+        grip.add_controller(reset)
+        bar.append(grip)
 
         title = Gtk.Label(label="decomposer", xalign=0)
         title.add_css_class("dc-title")
+        self._match_identity_height(title)
         bar.append(title)
 
         self.subtitle = Gtk.Label(label=self.theme.name, xalign=0)
         self.subtitle.add_css_class("dc-sub")
-        self.subtitle.set_valign(Gtk.Align.CENTER)
+        self._match_identity_height(self.subtitle)
         bar.append(self.subtitle)
 
         bar.append(Gtk.Box(hexpand=True))
+
+        # Pair truthful hardware state with the controls it describes. CAM
+        # labels the four controls to its right: power, capture, resolution,
+        # and frame rate.
+        self.mic_chip = Gtk.Label(label="MIC")
+        self.mic_chip.add_css_class("dc-status")
+        self._match_primary_height(self.mic_chip)
+        bar.append(self.mic_chip)
+
+        self.camera_chip = Gtk.Label(label="CAM")
+        self.camera_chip.add_css_class("dc-status")
+        self._match_primary_height(self.camera_chip)
+        bar.append(self.camera_chip)
 
         # A sliding switch, both positions visible. OFF parks the camera
         # on Studio firmware - the only resting state where the microphone
         # is genuinely dead, since Opal's firmware keeps the mic on the bus
         # whether or not video streams.
         self.power_switch = Gtk.Switch()
-        self.power_switch.set_valign(Gtk.Align.CENTER)
+        self._match_primary_height(self.power_switch)
         self.power_switch.set_tooltip_text(
             "Camera on/off. Off parks it on Studio firmware so the "
             "MICROPHONE turns off too (from Call, that is a firmware reboot)"
@@ -527,7 +762,7 @@ class Panel(Gtk.Box):
         # duration, so a raw click gesture does the timing.
         self.capture_btn = Gtk.Button(label="\u25c9")
         self.capture_btn.add_css_class("dc-cap")
-        self.capture_btn.set_valign(Gtk.Align.CENTER)
+        self._match_primary_height(self.capture_btn)
         self.capture_btn.set_tooltip_text(
             "Click: photo (3 s timer). Hold 1 s: record; click again to stop"
         )
@@ -557,7 +792,7 @@ class Panel(Gtk.Box):
         self._res_mode: str = ""
         self._res_applied: int = 0
         self.res_drop = Gtk.DropDown.new_from_strings(["—"])
-        self.res_drop.set_valign(Gtk.Align.CENTER)
+        self._match_primary_height(self.res_drop)
         self.res_drop.set_tooltip_text(
             "Published resolution. Applying restarts the engine (and in "
             "Studio, the camera); attached apps must reconnect."
@@ -571,7 +806,7 @@ class Panel(Gtk.Box):
         self.fps_entry.set_width_chars(4)
         self.fps_entry.set_max_width_chars(5)
         self.fps_entry.set_alignment(1.0)
-        self.fps_entry.set_valign(Gtk.Align.CENTER)
+        self._match_primary_height(self.fps_entry)
         self.fps_entry.connect("activate", self._on_fps_commit)
         # Clamping happens ONLY on Enter. Correcting while someone is still
         # typing makes the box unusable - the sync loop keeps its hands off
@@ -598,21 +833,24 @@ class Panel(Gtk.Box):
         fps_lbl.set_valign(Gtk.Align.CENTER)
         bar.append(fps_lbl)
 
-        self.mode_pill = Gtk.Label(label="—")
-        self.mode_pill.add_css_class("dc-pill")
-        self.mode_pill.add_css_class("off")
-        self.mode_pill.set_valign(Gtk.Align.CENTER)
-        bar.append(self.mode_pill)
+        # Keep the destructive window action visually separate from the
+        # camera controls. A zero-width child preserves two spacing intervals
+        # without shifting MIC away from the control column below it.
+        close_gap = Gtk.Box()
+        close_gap.set_size_request(0, -1)
+        bar.append(close_gap)
 
         close = Gtk.Button(label="✕")
         close.add_css_class("dc-tiny")
-        close.set_valign(Gtk.Align.CENTER)
+        self._match_primary_height(close)
         close.connect("clicked", lambda *_: self.on_close())
         bar.append(close)
         return bar
 
     def _mode_row(self) -> Gtk.Widget:
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        row.add_css_class("dc-mode-row")
+        row.add_css_class("dc-control-row")
         lbl = Gtk.Label(label="MODE", xalign=0)
         lbl.add_css_class("dc-section")
         lbl.set_valign(Gtk.Align.CENTER)
@@ -635,6 +873,7 @@ class Panel(Gtk.Box):
         for mode, text in (("call", "Call"), ("studio", "Studio")):
             b = Gtk.Button(label=text)
             b.add_css_class("dc-chip")
+            self._match_primary_height(b)
             b.set_tooltip_text(blurbs[mode])
             b.connect("clicked", self._on_mode, mode)
             self.mode_buttons[mode] = b
@@ -642,37 +881,50 @@ class Panel(Gtk.Box):
 
         row.append(Gtk.Box(hexpand=True))
 
-        # Mirroring is a view preference, not a camera setting: it lives next
-        # to the mode because it applies to whatever the mode is publishing.
+        # Preview mirroring and published-image flipping are deliberately
+        # separate. Meet mirrors its self-view too, so using a published flip
+        # as a personal mirror makes that tile look double-flipped and sends a
+        # backwards image to everyone else.
+        self.preview_mirror_button = Gtk.Button(label="SELF MIRROR")
+        self.preview_mirror_button.add_css_class("dc-tiny")
+        self._match_primary_height(self.preview_mirror_button)
+        self.preview_mirror_button.set_tooltip_text(
+            "Show this Decomposer preview like a mirror. This is independent "
+            "of SEND: when off, the preview stays normal even if SEND is flipped."
+        )
+        self.preview_mirror_button.connect("clicked", self._on_preview_mirror)
+        if self.preview.mirror_h:
+            self.preview_mirror_button.add_css_class("selected")
+        row.append(self.preview_mirror_button)
+
         self.mirror_buttons = {}
         for key, glyph, tip in (
-            ("horizontal", "\u21c4", "Mirror left/right"),
-            ("vertical", "\u21c5", "Mirror top/bottom"),
+            (
+                "horizontal", "SEND \u21c4",
+                "Flip the published video left/right for every caller. "
+                "Apps that should be excluded can use decomposer Normal.",
+            ),
+            (
+                "vertical", "SEND \u21c5",
+                "Flip the published video top/bottom for every caller.",
+            ),
         ):
             b = Gtk.Button(label=glyph)
             b.add_css_class("dc-tiny")
-            b.set_valign(Gtk.Align.CENTER)
-            b.set_tooltip_text(f"{tip} (both together is a 180\u00b0 turn)")
+            self._match_primary_height(b)
+            b.set_tooltip_text(f"{tip} Both SEND flips together make a 180\u00b0 turn.")
             b.connect("clicked", self._on_mirror, key)
             self.mirror_buttons[key] = b
             row.append(b)
 
-        self.mode_hint = Gtk.Label(xalign=1)
-        self.mode_hint.add_css_class("dc-hint")
-        self.mode_hint.set_valign(Gtk.Align.CENTER)
-        row.append(self.mode_hint)
-        self.mic_chip = Gtk.Label(label="MIC")
-        self.mic_chip.add_css_class("dc-mic")
-        self.mic_chip.set_valign(Gtk.Align.CENTER)
-        row.append(self.mic_chip)
         return row
 
     def _look_block(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
 
-        # "none" is not a look, it is the absence of one, so it gets its own
-        # column at full height. The other eight then divide evenly 4x2 instead
-        # of leaving a ragged gap on the second row.
+        # Keep every look on the same one-row button rhythm. The first row is
+        # "none" plus four Core Image looks, the second holds the remaining
+        # four, and Composer's five stay together on the third.
         grid = Gtk.Grid()
         grid.set_row_spacing(4)
         grid.set_column_spacing(4)
@@ -689,13 +941,11 @@ class Panel(Gtk.Box):
             return b
 
         none_button = chip("none")
-        none_button.set_vexpand(True)
-        grid.attach(none_button, 0, 0, 1, 2)
+        grid.attach(none_button, 0, 0, 1, 1)
 
-        # The eight Core Image looks fill the block beside "none"; Composer's
-        # own five get their own row so the two families stay legible.
         for i, name in enumerate(CI_LOOKS):
-            grid.attach(chip(name), 1 + i % 4, i // 4, 1, 1)
+            column = i + 1 if i < 4 else i - 4
+            grid.attach(chip(name), column, i // 4, 1, 1)
         for i, name in enumerate(CUSTOM_LOOKS):
             grid.attach(chip(name), i, 2, 1, 1)
 
@@ -710,6 +960,7 @@ class Panel(Gtk.Box):
 
     def _overlay_row(self) -> Gtk.Widget:
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        row.add_css_class("dc-control-row")
         lbl = Gtk.Label(label="Overlay", xalign=0)
         lbl.add_css_class("dc-label")
         lbl.set_size_request(64, -1)
@@ -721,11 +972,9 @@ class Panel(Gtk.Box):
         self.overlay_button.connect("clicked", self._on_overlay_choose)
         row.append(self.overlay_button)
 
-        self.overlay_clear = Gtk.Button(label="\u00d7")
-        self.overlay_clear.add_css_class("dc-tiny")
-        self.overlay_clear.set_valign(Gtk.Align.CENTER)
-        self.overlay_clear.set_tooltip_text("Remove the overlay")
-        self.overlay_clear.connect("clicked", self._on_overlay_clear)
+        self.overlay_clear = self._clear_button(
+            "Remove the overlay", self._on_overlay_clear
+        )
         row.append(self.overlay_clear)
 
         self.overlay_opacity = Gtk.Scale.new_with_range(
@@ -780,6 +1029,10 @@ class Panel(Gtk.Box):
         w = max(1, self.preview.get_width())
         h = max(1, self.preview.get_height())
         span = 2.0 * zoom / (zoom - 1.0)
+        # SEND is compensated before display, so only the absolute SELF MIRROR
+        # preference changes the direction the picture visibly moves.
+        if self.preview.mirror_h:
+            dx = -dx
         px = max(-1.0, min(1.0, self._pan_base[0] - dx / w * span))
         py = max(-1.0, min(1.0, self._pan_base[1] - dy / h * span))
         self._queue({"pan_x": round(px, 3), "pan_y": round(py, 3)})
@@ -835,26 +1088,28 @@ class Panel(Gtk.Box):
 
     def _background_row(self) -> Gtk.Widget:
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        row.add_css_class("dc-control-row")
+        backdrop_help = (
+            "Replace the background with an image using the same person "
+            "mask as Blur. The × returns to blur, or to the unaltered "
+            "background when blur is off."
+        )
         lbl = Gtk.Label(label="Backdrop", xalign=0)
         lbl.add_css_class("dc-label")
         lbl.set_size_request(64, -1)
+        lbl.set_tooltip_text(backdrop_help)
         row.append(lbl)
 
         self.background_button = Gtk.Button(label="choose…")
         self.background_button.add_css_class("dc-chip")
         self.background_button.set_hexpand(True)
-        self.background_button.set_tooltip_text(
-            "Replace the background with an image (uses the same person "
-            "mask as blur)"
-        )
+        self.background_button.set_tooltip_text(backdrop_help)
         self.background_button.connect("clicked", self._on_background_choose)
         row.append(self.background_button)
 
-        self.background_clear = Gtk.Button(label="×")
-        self.background_clear.add_css_class("dc-tiny")
-        self.background_clear.set_valign(Gtk.Align.CENTER)
-        self.background_clear.set_tooltip_text("Back to blur (or nothing)")
-        self.background_clear.connect("clicked", self._on_background_clear)
+        self.background_clear = self._clear_button(
+            "Back to blur (or nothing)", self._on_background_clear
+        )
         row.append(self.background_clear)
         return row
 
@@ -889,25 +1144,34 @@ class Panel(Gtk.Box):
         )
 
     def _models_section(self) -> Gtk.Widget:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        head.add_css_class("dc-control-row")
+        model_help = (
+            "Add your own ONNX model to the live video chain. One-channel "
+            "output extends the person mask; three-channel output recolors "
+            "the frame. Choose CPU or CUDA before it loads. Adding, removing, "
+            "or changing device restarts the engine; strength changes are live."
+        )
         lbl = Gtk.Label(label="Models", xalign=0)
         lbl.add_css_class("dc-label")
         lbl.set_size_request(64, -1)
-        lbl.set_tooltip_text(
-            "Your own ONNX models over the feed. One-channel output = joins "
-            "the person mask; three-channel output = recolors the frame. "
-            "Strength is live; add/remove/device restarts the engine"
-        )
+        lbl.set_tooltip_text(model_help)
         head.append(lbl)
         add = Gtk.Button(label="add model…")
         add.add_css_class("dc-chip")
         add.set_hexpand(True)
+        add.set_tooltip_text(model_help)
         add.connect("clicked", self._on_model_add)
         head.append(add)
         self.model_add_btn = add
+        self.models_clear = self._clear_button(
+            "Remove all models from the chain (restarts the engine)",
+            self._on_models_clear,
+        )
+        head.append(self.models_clear)
         box.append(head)
-        self.models_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        self.models_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.append(self.models_box)
         self._models_cache: list = []
         return box
@@ -920,6 +1184,7 @@ class Panel(Gtk.Box):
             child = nxt
         for i, m in enumerate(models):
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+            row.add_css_class("dc-control-row")
             name = Gtk.Label(label=Path(m["path"]).name, xalign=0)
             name.add_css_class("dc-hint")
             name.set_ellipsize(3)  # Pango.EllipsizeMode.END
@@ -953,6 +1218,7 @@ class Panel(Gtk.Box):
 
             rm = Gtk.Button(label="×")
             rm.add_css_class("dc-tiny")
+            rm.add_css_class("dc-clear")
             rm.set_valign(Gtk.Align.CENTER)
             rm.set_tooltip_text("Remove from the chain (restarts the engine)")
             rm.connect("clicked", self._on_model_rm, i)
@@ -984,6 +1250,7 @@ class Panel(Gtk.Box):
         # A popover, not a dialog - the panel is a layer surface and a
         # parented dialog is a protocol error that kills the client.
         pop = Gtk.Popover()
+        pop.add_css_class("dc-popover")
         pop.set_parent(self.model_add_btn)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.set_margin_top(8); box.set_margin_bottom(8)
@@ -1051,6 +1318,16 @@ class Panel(Gtk.Box):
 
         self._maybe_confirm_restart(btn, "Removing this model", proceed)
 
+    def _on_models_clear(self, btn) -> None:
+        def proceed():
+            self._set_busy(True, "removing models… the engine restarts")
+            _worker(
+                lambda: self.client.request(cmd="set_models", models=[]),
+                self._on_result,
+            )
+
+        self._maybe_confirm_restart(btn, "Removing all models", proceed)
+
     def _on_model_device(self, btn, index: int) -> None:
         models = [dict(m) for m in self._models_cache]
         if not 0 <= index < len(models):
@@ -1076,6 +1353,7 @@ class Panel(Gtk.Box):
 
     def _preset_row(self) -> Gtk.Widget:
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        row.add_css_class("dc-control-row")
         lbl = Gtk.Label(label="Preset", xalign=0)
         lbl.add_css_class("dc-label")
         lbl.set_size_request(64, -1)
@@ -1084,52 +1362,139 @@ class Panel(Gtk.Box):
         self.preset_names: list[str] = []
         self.preset_drop = Gtk.DropDown.new_from_strings(["\u2014"])
         self.preset_drop.set_hexpand(True)
+        self._match_primary_height(self.preset_drop)
         self.preset_drop.connect("notify::selected", self._on_preset_selected)
         row.append(self.preset_drop)
 
+        self.preset_save_selected = Gtk.Button(label="save")
+        self.preset_save_selected.add_css_class("dc-tiny")
+        self._match_primary_height(self.preset_save_selected)
+        self.preset_save_selected.set_tooltip_text(
+            "Overwrite the selected preset with the controls as they are now"
+        )
+        self.preset_save_selected.connect(
+            "clicked", self._on_preset_save_selected
+        )
+        row.append(self.preset_save_selected)
+
         # A popover rather than a dialog: a layer surface cannot parent a
         # dialog, but xdg_popup is part of the protocol and works.
-        self.preset_save = Gtk.MenuButton(label="save")
-        self.preset_save.add_css_class("dc-tiny")
-        self.preset_save.set_valign(Gtk.Align.CENTER)
+        self.preset_save_as = Gtk.Button(label="save as…")
+        self.preset_save_as.add_css_class("dc-tiny")
+        self._match_primary_height(self.preset_save_as)
+        self.preset_save_as.set_tooltip_text(
+            "Save the current controls as a new named preset"
+        )
         popover = Gtk.Popover()
+        popover.add_css_class("dc-popover")
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         box.set_margin_top(6); box.set_margin_bottom(6)
         box.set_margin_start(6); box.set_margin_end(6)
         self.preset_entry = Gtk.Entry()
         self.preset_entry.set_placeholder_text("preset name")
-        self.preset_entry.connect("activate", self._on_preset_save)
+        self.preset_entry.connect("activate", self._on_preset_save_as)
         box.append(self.preset_entry)
         confirm = Gtk.Button(label="Save")
         confirm.add_css_class("dc-chip")
-        confirm.connect("clicked", self._on_preset_save)
+        confirm.connect("clicked", self._on_preset_save_as)
         box.append(confirm)
         popover.set_child(box)
-        self.preset_save.set_popover(popover)
-        row.append(self.preset_save)
+        popover.set_parent(self.preset_save_as)
+        self.preset_save_as.connect("clicked", lambda _b: popover.popup())
+        self._preset_save_as_popover = popover
+        row.append(self.preset_save_as)
+
+        self.preset_delete = Gtk.Button(label="delete")
+        self.preset_delete.add_css_class("dc-tiny")
+        self._match_primary_height(self.preset_delete)
+        self.preset_delete.set_tooltip_text("Delete the selected preset")
+        self.preset_delete.connect("clicked", self._on_preset_delete)
+        row.append(self.preset_delete)
         return row
+
+    def _selected_preset(self) -> Optional[str]:
+        selected = self.preset_drop.get_selected()
+        if selected == 0 or selected - 1 >= len(self.preset_names):
+            return None
+        return self.preset_names[selected - 1]
 
     def _on_preset_selected(self, drop, _param) -> None:
         if self._suppress or not self._ready:
             return
-        i = drop.get_selected()
-        if i == 0 or i - 1 >= len(self.preset_names):
+        name = self._selected_preset()
+        if name is None:
             return
-        name = self.preset_names[i - 1]
+        self._set_busy(True, f"loading preset {name}…")
+
+        def done(resp: dict) -> None:
+            self._on_result(resp)
+            if resp.get("ok"):
+                self._flash(f"loaded preset {name}")
+
         _worker(
             lambda: self.client.request(cmd="preset_load", name=name),
-            self._on_result,
+            done,
         )
 
-    def _on_preset_save(self, _widget) -> None:
+    def _on_preset_save_as(self, _widget) -> None:
         name = self.preset_entry.get_text().strip()
         if not name:
             return
         self.preset_entry.set_text("")
-        self.preset_save.popdown()
+        self._preset_save_as_popover.popdown()
+
+        def done(resp: dict) -> None:
+            self._on_result(resp)
+            if resp.get("ok"):
+                self._flash(f"saved preset {name}; it will restore on launch")
+
         _worker(
             lambda: self.client.request(cmd="preset_save", name=name),
-            self._on_result,
+            done,
+        )
+
+    def _on_preset_save_selected(self, _widget) -> None:
+        if self.busy:
+            return
+        name = self._selected_preset()
+        if name is None:
+            return
+        self._set_busy(True, f"saving preset {name}…")
+
+        def done(resp: dict) -> None:
+            self._on_result(resp)
+            if resp.get("ok"):
+                self._flash(f"saved preset {name}; it will restore on launch")
+
+        _worker(
+            lambda: self.client.request(cmd="preset_save", name=name),
+            done,
+        )
+
+    def _on_preset_delete(self, _widget) -> None:
+        if self.busy:
+            return
+        name = self._selected_preset()
+        if name is None:
+            return
+
+        def proceed() -> None:
+            self._set_busy(True, f"deleting preset {name}…")
+
+            def done(resp: dict) -> None:
+                self._on_result(resp)
+                if resp.get("ok"):
+                    self._flash(f"deleted preset {name}")
+
+            _worker(
+                lambda: self.client.request(cmd="preset_delete", name=name),
+                done,
+            )
+
+        self._confirm(
+            self.preset_delete,
+            f"Delete preset “{name}”? This cannot be undone.",
+            proceed,
         )
 
     def _on_overlay_choose(self, _btn) -> None:
@@ -1172,6 +1537,7 @@ class Panel(Gtk.Box):
 
     def _slider_row(self, label: str, lo, hi, step, digits: int = 0):
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        row.add_css_class("dc-control-row")
         lbl = Gtk.Label(label=label, xalign=0)
         lbl.add_css_class("dc-label")
         lbl.set_size_request(64, -1)
@@ -1189,11 +1555,13 @@ class Panel(Gtk.Box):
         # Enter commits (clamped to the slider's range).
         value = Gtk.Entry()
         value.add_css_class("dc-entry")
+        value.add_css_class("dc-value-entry")
         value.set_has_frame(False)
         value.set_width_chars(6)
         value.set_max_width_chars(7)
         value.set_alignment(1.0)
         value.set_valign(Gtk.Align.CENTER)
+        self.slider_value_size.add_widget(value)
         row.append(value)
 
         # From the first keystroke until Enter, the box belongs to the
@@ -1258,9 +1626,32 @@ class Panel(Gtk.Box):
 
         self.camera_hint = Gtk.Label(xalign=0, wrap=True)
         self.camera_hint.add_css_class("dc-hint")
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.camera_hint.set_hexpand(True)
+        self.camera_hint.set_valign(Gtk.Align.CENTER)
+
+        hint_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        hint_row.add_css_class("dc-control-row")
+        hint_row.append(self.camera_hint)
+
+        self.undo_button = Gtk.Button(label="↶ Undo")
+        self.undo_button.add_css_class("dc-tiny")
+        self._match_primary_height(self.undo_button)
+        self.undo_button.set_sensitive(False)
+        self.undo_button.set_tooltip_text("Nothing to undo (Ctrl+Z)")
+        self.undo_button.connect("clicked", self._on_undo)
+        hint_row.append(self.undo_button)
+
+        self.redo_button = Gtk.Button(label="↷ Redo")
+        self.redo_button.add_css_class("dc-tiny")
+        self._match_primary_height(self.redo_button)
+        self.redo_button.set_sensitive(False)
+        self.redo_button.set_tooltip_text("Nothing to redo (Ctrl+Shift+Z)")
+        self.redo_button.connect("clicked", self._on_redo)
+        hint_row.append(self.redo_button)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.append(self.camera_stack)
-        box.append(self.camera_hint)
+        box.append(hint_row)
         return box
 
     def _camera_page(self, page_mode: str) -> Gtk.Widget:
@@ -1286,6 +1677,7 @@ class Panel(Gtk.Box):
 
         if page_mode == STUDIO:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+            row.add_css_class("dc-control-row")
             lbl = Gtk.Label(label="Effect", xalign=0)
             lbl.add_css_class("dc-label")
             lbl.set_size_request(64, -1)
@@ -1304,10 +1696,40 @@ class Panel(Gtk.Box):
         self.footer.set_margin_start(10)
         self.footer.set_margin_end(10)
         self.footer.set_margin_bottom(8)
+        self.footer.set_visible(False)
         box.append(self.footer)
         return box
 
+    def _set_footer(self, text: str) -> None:
+        """Show actionable status, but consume no idle panel space."""
+        self.footer.set_text(text)
+        self.footer.set_visible(bool(text))
+
     # -- actions --------------------------------------------------------
+
+    def _on_undo(self, _button=None) -> None:
+        if self.busy or self._pending or not self.status.get("can_undo"):
+            return
+        self._set_busy(True, "undoing last adjustment…")
+
+        def done(resp: dict) -> None:
+            self._on_result(resp)
+            if resp.get("ok") and resp.get("undone"):
+                self._flash(f"undid {resp['undone']}")
+
+        _worker(lambda: self.client.request(cmd="undo"), done)
+
+    def _on_redo(self, _button=None) -> None:
+        if self.busy or self._pending or not self.status.get("can_redo"):
+            return
+        self._set_busy(True, "redoing last adjustment…")
+
+        def done(resp: dict) -> None:
+            self._on_result(resp)
+            if resp.get("ok") and resp.get("redone"):
+                self._flash(f"redid {resp['redone']}")
+
+        _worker(lambda: self.client.request(cmd="redo"), done)
 
     def _confirm(self, anchor, text: str, on_proceed) -> None:
         """Firmware reboots are never free: every action that costs one
@@ -1315,6 +1737,7 @@ class Panel(Gtk.Box):
         a popover, because the panel is a layer surface and a parented
         dialog is a protocol error."""
         pop = Gtk.Popover()
+        pop.add_css_class("dc-popover")
         pop.set_parent(anchor)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.set_margin_top(8); box.set_margin_bottom(8)
@@ -1386,6 +1809,7 @@ class Panel(Gtk.Box):
 
     def _confirm_with_revert(self, anchor, text, on_proceed, on_cancel) -> None:
         pop = Gtk.Popover()
+        pop.add_css_class("dc-popover")
         pop.set_parent(anchor)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         box.set_margin_top(8); box.set_margin_bottom(8)
@@ -1564,33 +1988,6 @@ class Panel(Gtk.Box):
         # The shutter flash fires at the moment of capture.
         self.flash_box.set_opacity(0.85)
         GLib.timeout_add(60, self._flash_decay)
-        try:
-            tmp, final = self._secure_target("photo", ".png")
-        except (OSError, RuntimeError) as e:
-            self._flash(f"photo failed: {e}", 6.0)
-            return
-        node = self.status.get("output") or "/dev/video10"
-
-        def snap() -> dict:
-            err = _run_bounded(
-                ["ffmpeg", "-y", "-nostats", "-loglevel", "error",
-                 "-f", "v4l2", "-i", node, "-frames:v", "1", tmp],
-                timeout=15,
-            )
-            if err.get("code") != 0 or not os.path.isfile(tmp):
-                with suppress(OSError):
-                    os.unlink(tmp)
-                tail = (err.get("stderr") or "").strip().splitlines()
-                return {"ok": False,
-                        "error": tail[-1] if tail else "ffmpeg failed"}
-            try:
-                os.replace(tmp, final)
-            except OSError as e:
-                with suppress(OSError):
-                    os.unlink(tmp)
-                return {"ok": False, "error": str(e)}
-            return {"ok": True, "saved": str(final)}
-
         def done(resp: dict) -> bool:
             self._flash(
                 f"saved {resp['saved']}" if resp.get("ok")
@@ -1599,7 +1996,7 @@ class Panel(Gtk.Box):
             )
             return False
 
-        _worker(snap, done)
+        _worker(lambda: self.client.request(cmd="capture_photo"), done)
 
     def _flash_decay(self) -> bool:
         v = self.flash_box.get_opacity() - 0.17
@@ -1744,14 +2141,14 @@ class Panel(Gtk.Box):
     def _on_preview_menu(self, *_args) -> None:
         style = self.preview.cycle_placeholder()
         pretty = {"nofeed": "NO FEED card", "bars": "broadcast bars"}[style]
-        self.footer.set_text(f"no-feed placeholder: {pretty}")
+        self._flash(f"no-feed placeholder: {pretty}", 4.0)
 
     def _on_preview_tap(self, gesture, _n_press, cx: float, cy: float) -> None:
         """Tap to focus: aim autofocus and exposure metering where clicked."""
         if self.busy or not self._ready:
             return
         if self.status.get("mode") != "studio":
-            self.footer.set_text("tap-to-focus needs Studio mode")
+            self._flash("tap-to-focus needs Studio mode", 4.0)
             return
         # The preview uses ContentFit.CONTAIN (letterboxed), so undo that
         # mapping - with the stream's actual aspect - before converting to
@@ -1764,13 +2161,17 @@ class Panel(Gtk.Box):
         iy = (cy - (h - ph * scale) / 2) / scale
         if not (0 <= ix < pw and 0 <= iy < ph):
             return  # tapped the letterbox, not the picture
+        # SEND is compensated before display; undo only the absolute self-view
+        # mirror before aiming the camera's sensor region.
+        if self.preview.mirror_h:
+            ix = pw - ix
         fw = int(self.status.get("width") or 1920)
         fh = int(self.status.get("height") or 1080)
         fx = max(0, min(fw - 1, int(ix / pw * fw)))
         fy = max(0, min(fh - 1, int(iy / ph * fh)))
         x0, y0 = max(0, fx - 128), max(0, fy - 128)
         region = [x0, y0, 256, 256]
-        self.footer.set_text(f"focusing at {fx},{fy}…")
+        self._set_footer(f"focusing at {fx},{fy}…")
         _worker(
             lambda: self.client.request(
                 cmd="set_camera", values={"af_region": region, "ae_region": region}
@@ -1830,6 +2231,27 @@ class Panel(Gtk.Box):
             tip = "The C1's mic card is not registered (camera rebooting?)."
         self.mic_chip.set_tooltip_text(tip)
 
+    def _update_camera_chip(
+        self, running: bool, transitioning: bool = False
+    ) -> None:
+        for cls in ("live", "dead"):
+            self.camera_chip.remove_css_class(cls)
+        if transitioning:
+            self.camera_chip.set_text("CAM ~")
+            self.camera_chip.add_css_class("dead")
+            self.camera_chip.set_tooltip_text(
+                "Camera is rebooting. Controls to the right: power, capture, "
+                "resolution, and frame rate."
+            )
+            return
+        self.camera_chip.set_text("CAM \u25cf" if running else "CAM \u2013")
+        self.camera_chip.add_css_class("live" if running else "dead")
+        state = "on" if running else "off"
+        self.camera_chip.set_tooltip_text(
+            f"Camera is {state}. Controls to the right: power, capture, "
+            "resolution, and frame rate."
+        )
+
     def _on_mode(self, btn, mode: str) -> None:
         if self.busy or self.status.get("mode") == mode:
             return
@@ -1844,7 +2266,8 @@ class Panel(Gtk.Box):
             for widget in (
                 list(self.mode_buttons.values())
                 + [self.res_drop, self.fps_entry, self.power_switch,
-                   self.preset_drop, self.preset_save]
+                   self.preset_drop, self.preset_save_as,
+                   self.preset_save_selected, self.preset_delete]
             ):
                 widget.set_sensitive(False)
             self._set_busy(True, f"switching to {mode}, the camera reboots…")
@@ -1888,16 +2311,41 @@ class Panel(Gtk.Box):
     def _flash(self, text: str, seconds: float = 8.0) -> bool:
         self._flash_text = text
         self._flash_until = time.monotonic() + seconds
-        self.footer.set_text(text)
+        self._set_footer(text)
         return False
+
+    def _on_preview_mirror(self, _btn) -> None:
+        mirrored = not self.preview.mirror_h
+        self.preview.set_mirrored(mirrored)
+        (self.preview_mirror_button.add_css_class if mirrored
+         else self.preview_mirror_button.remove_css_class)("selected")
+        self._flash(
+            f"self preview is {'mirrored' if mirrored else 'normal'}; "
+            "SEND and Normal virtual cameras are unchanged",
+            7.0,
+        )
 
     def _on_mirror(self, _btn, axis: str) -> None:
         if self.busy:
             return
         current = self.status.get("mirror_h" if axis == "horizontal" else "mirror_v")
+
+        def done(resp: dict) -> None:
+            self._on_result(resp)
+            if resp.get("ok"):
+                state = "on" if not current else "off"
+                note = (
+                    "; excluded apps can use decomposer Normal"
+                    if axis == "horizontal" and not current else ""
+                )
+                self._flash(
+                    f"published {axis} flip {state}: callers receive this{note}",
+                    8.0,
+                )
+
         _worker(
             lambda: self.client.request(cmd="set_mirror", **{axis: not current}),
-            self._on_result,
+            done,
         )
 
     def _on_look(self, _btn, name: str) -> None:
@@ -1930,6 +2378,8 @@ class Panel(Gtk.Box):
 
     def _queue(self, values: dict) -> None:
         self._pending.update(values)
+        self.undo_button.set_sensitive(False)
+        self.redo_button.set_sensitive(False)
         if self._debounce is not None:
             GLib.source_remove(self._debounce)
         self._debounce = GLib.timeout_add(180, self._flush)
@@ -1997,8 +2447,14 @@ class Panel(Gtk.Box):
         self.busy = busy
         for b in list(self.mode_buttons.values()) + list(self.look_buttons.values()):
             b.set_sensitive(not busy)
+        self.undo_button.set_sensitive(
+            not busy and not self._pending and bool(self.status.get("can_undo"))
+        )
+        self.redo_button.set_sensitive(
+            not busy and not self._pending and bool(self.status.get("can_redo"))
+        )
         if message:
-            self.footer.set_text(message)
+            self._set_footer(message)
 
     def refresh(self) -> None:
         # One in flight, ever: the 2s tick plus a slow daemon used to pile up
@@ -2031,12 +2487,10 @@ class Panel(Gtk.Box):
     def _on_result(self, resp: dict) -> bool:
         self._set_busy(False)
         if not resp.get("ok"):
-            self.mode_pill.set_text("no daemon")
-            for cls in ("call", "studio"):
-                self.mode_pill.remove_css_class(cls)
-            self.mode_pill.add_css_class("off")
-            self.footer.set_text(resp.get("error", "unknown error"))
+            self._set_footer(resp.get("error", "unknown error"))
             self.footer.add_css_class("dc-warn")
+            self._update_camera_chip(False)
+            self.camera_chip.set_tooltip_text("Camera status unavailable")
             for b in list(self.mode_buttons.values()) + list(self.look_buttons.values()):
                 b.set_sensitive(False)
             self.camera_stack.set_sensitive(False)
@@ -2055,13 +2509,33 @@ class Panel(Gtk.Box):
         mode = st.get("mode", "call")
         studio = mode == "studio"
         transitioning = bool(st.get("transitioning"))
+        running = bool(st.get("running"))
 
-        self.mode_pill.set_text(mode.upper())
-        for cls in ("call", "studio", "off"):
-            self.mode_pill.remove_css_class(cls)
-        self.mode_pill.add_css_class(mode if mode in ("call", "studio") else "off")
-        self.mode_hint.set_text("")
+        undo_label = st.get("undo_label")
+        can_undo = bool(st.get("can_undo")) and not transitioning and not self._pending
+        self.undo_button.set_sensitive(can_undo)
+        self.undo_button.set_tooltip_text(
+            f"Undo {undo_label} (Ctrl+Z)"
+            if can_undo and undo_label else "Nothing to undo (Ctrl+Z)"
+        )
+        redo_label = st.get("redo_label")
+        can_redo = bool(st.get("can_redo")) and not transitioning and not self._pending
+        self.redo_button.set_sensitive(can_redo)
+        self.redo_button.set_tooltip_text(
+            f"Redo {redo_label} (Ctrl+Shift+Z)"
+            if can_redo and redo_label
+            else "Nothing to redo (Ctrl+Shift+Z)"
+        )
+
         self._update_mic_chip(studio, transitioning)
+        self._update_camera_chip(running, transitioning)
+
+        self.preview.set_source_flips(
+            bool(st.get("mirror_h")), bool(st.get("mirror_v"))
+        )
+
+        (self.preview_mirror_button.add_css_class if self.preview.mirror_h
+         else self.preview_mirror_button.remove_css_class)("selected")
 
         for axis, key in (("horizontal", "mirror_h"), ("vertical", "mirror_v")):
             b = self.mirror_buttons[axis]
@@ -2102,7 +2576,6 @@ class Panel(Gtk.Box):
                     self._res_applied = i
                     break
             self.res_drop.set_sensitive(not transitioning)
-            running = bool(st.get("running"))
             self.power_switch.set_active(running)
             self.power_switch.set_state(running)
             self.power_switch.set_sensitive(not transitioning)
@@ -2128,7 +2601,6 @@ class Panel(Gtk.Box):
             Path(overlay).name if overlay else "choose\u2026"
         )
         self.overlay_button.set_tooltip_text(overlay or "No overlay")
-        self.overlay_clear.set_sensitive(bool(overlay))
         self.overlay_opacity.set_sensitive(bool(overlay))
         models = st.get("models") or []
         def _sig(items):
@@ -2140,7 +2612,12 @@ class Panel(Gtk.Box):
         self.background_button.set_label(
             Path(background).name if background else "choose\u2026"
         )
-        self.background_clear.set_sensitive(bool(background))
+        for clear_button, present in (
+            (self.overlay_clear, overlay),
+            (self.background_clear, background),
+            (self.models_clear, models),
+        ):
+            self._set_asset_present(clear_button, present)
 
         self._suppress = True
         try:
@@ -2152,8 +2629,18 @@ class Panel(Gtk.Box):
                 self.preset_drop.set_model(
                     Gtk.StringList.new(["\u2014"] + names)
                 )
+            active_preset = st.get("active_preset")
+            selected = (
+                names.index(active_preset) + 1
+                if active_preset in names else 0
+            )
+            if self.preset_drop.get_selected() != selected:
+                self.preset_drop.set_selected(selected)
             self.preset_drop.set_sensitive(bool(names) and not transitioning)
-            self.preset_save.set_sensitive(not transitioning)
+            self.preset_save_as.set_sensitive(not transitioning)
+            can_change_preset = selected > 0 and not transitioning
+            self.preset_save_selected.set_sensitive(can_change_preset)
+            self.preset_delete.set_sensitive(can_change_preset)
             self.overlay_opacity.set_value(float(st.get("overlay_opacity", 1.0)))
             self.zoom_scale.set_value(float(st.get("zoom", 1.0)))
             self.clahe_scale.set_value(float(st.get("clahe", 0.0)))
@@ -2206,24 +2693,22 @@ class Panel(Gtk.Box):
         self.camera_hint.set_text(
             "tap the preview to focus \u00b7 scroll to zoom, drag to pan"
             if studio
-            else "focus, white balance and effects live in Studio mode"
+            else "Focus, white balance and effects live in Studio mode"
         )
 
         if time.monotonic() < getattr(self, "_flash_until", 0.0):
-            self.footer.set_text(self._flash_text)
+            self._set_footer(self._flash_text)
         elif transitioning:
-            self.footer.set_text("switching modes… the camera is rebooting")
+            self._set_footer("switching modes… the camera is rebooting")
         elif st.get("engine_alive"):
-            self.footer.set_text(
-                f"{st.get('width')}×{st.get('height')} → {st.get('output')}"
-            )
+            self._set_footer("")
         else:
             self.preview.show_placeholder()
             message = st.get("notice") or st.get("error") or "engine not running"
             # Engine logs can be a wall; the footer is one line of truth.
             if len(message) > 160:
                 message = message[:157] + "…"
-            self.footer.set_text(message)
+            self._set_footer(message)
 
 
 class App(Adw.Application):
@@ -2242,6 +2727,20 @@ class App(Adw.Application):
         self.connect("name-lost", self._on_name_lost)
         self.window: Optional[Gtk.Window] = None
         self.panel: Optional[Panel] = None
+        self._layer_surface = False
+        saved_position = _panel_pref("position", None)
+        self._panel_position: Optional[tuple[int, int]] = None
+        if isinstance(saved_position, dict):
+            x, y = saved_position.get("x"), saved_position.get("y")
+            if (
+                isinstance(x, int) and not isinstance(x, bool)
+                and isinstance(y, int) and not isinstance(y, bool)
+                and 0 <= x <= 100_000 and 0 <= y <= 100_000
+            ):
+                self._panel_position = (x, y)
+        self._drag_panel_origin = (0, 0)
+        self._drag_cursor_origin: Optional[tuple[float, float]] = None
+        self._left_anchored = self._panel_position is not None
         self.connect("activate", self.on_activate)
 
     def _on_name_lost(self, _app) -> bool:
@@ -2286,30 +2785,60 @@ class App(Adw.Application):
             # so they cover the panel instead of being haunted by it.
             LayerShell.set_layer(win, LayerShell.Layer.TOP)
             LayerShell.set_anchor(win, LayerShell.Edge.TOP, True)
-            LayerShell.set_anchor(win, LayerShell.Edge.RIGHT, True)
-            LayerShell.set_margin(win, LayerShell.Edge.TOP, 6)
-            LayerShell.set_margin(win, LayerShell.Edge.RIGHT, 6)
+            if self._panel_position is None:
+                LayerShell.set_anchor(win, LayerShell.Edge.RIGHT, True)
+                LayerShell.set_margin(win, LayerShell.Edge.TOP, 6)
+                LayerShell.set_margin(win, LayerShell.Edge.RIGHT, 6)
+                self._left_anchored = False
+            else:
+                x, y = self._panel_position
+                LayerShell.set_anchor(win, LayerShell.Edge.LEFT, True)
+                LayerShell.set_margin(win, LayerShell.Edge.LEFT, x)
+                LayerShell.set_margin(win, LayerShell.Edge.TOP, y)
+                self._left_anchored = True
             LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.ON_DEMAND)
+            self._layer_surface = True
 
         keys = Gtk.EventControllerKey()
         keys.connect("key-pressed", self._on_key)
         win.add_controller(keys)
 
-        self.panel = Panel(theme, on_close=self._hide)
+        self.panel = Panel(
+            theme,
+            on_close=self._hide,
+            on_drag_begin=self._on_drag_begin,
+            on_drag_update=self._on_drag_update,
+            on_drag_end=self._on_drag_end,
+            on_position_reset=self._reset_position,
+        )
         win.set_child(self.panel)
         self.window = win
         self._watch_desktop()
 
-    def _on_key(self, _c, keyval, _code, _state) -> bool:
+    def _on_key(self, _c, keyval, _code, state) -> bool:
         if keyval == Gdk.KEY_Escape:
             self._hide()
             return True
+        if state & Gdk.ModifierType.CONTROL_MASK and self.panel is not None:
+            if (
+                keyval in (Gdk.KEY_y, Gdk.KEY_Y)
+                or (
+                    keyval in (Gdk.KEY_z, Gdk.KEY_Z)
+                    and state & Gdk.ModifierType.SHIFT_MASK
+                )
+            ):
+                self.panel._on_redo()
+                return True
+            if keyval in (Gdk.KEY_z, Gdk.KEY_Z):
+                self.panel._on_undo()
+                return True
         return False
 
     def _show(self) -> None:
         if self.window is None:
             return
         self.window.present()
+        GLib.idle_add(self._clamp_panel_position)
         if self.panel is not None:
             self.panel.preview.start()
             self.panel.refresh()
@@ -2320,6 +2849,107 @@ class App(Adw.Application):
         if self.panel is not None:
             self.panel.preview.stop()
         self.window.set_visible(False)
+
+    # -- panel placement ------------------------------------------------
+
+    def _monitor_size(self) -> Optional[tuple[int, int]]:
+        if not self._layer_surface or self.window is None:
+            return None
+        monitor = LayerShell.get_monitor(self.window)
+        surface = self.window.get_surface()
+        if monitor is None and surface is not None:
+            monitor = Gdk.Display.get_default().get_monitor_at_surface(surface)
+        if monitor is None:
+            return None
+        geometry = monitor.get_geometry()
+        return geometry.width, geometry.height
+
+    def _clamped_position(self, x: int, y: int) -> tuple[int, int]:
+        bounds = self._monitor_size()
+        if bounds is None or self.window is None:
+            return max(0, x), max(0, y)
+        width, height = bounds
+        panel_width = max(PANEL_W, self.window.get_width())
+        panel_height = max(1, self.window.get_height())
+        return (
+            max(0, min(x, max(0, width - panel_width))),
+            max(0, min(y, max(0, height - panel_height))),
+        )
+
+    def _set_panel_position(self, x: int, y: int) -> None:
+        if not self._layer_surface or self.window is None:
+            return
+        x, y = self._clamped_position(int(x), int(y))
+        LayerShell.set_margin(self.window, LayerShell.Edge.LEFT, x)
+        LayerShell.set_margin(self.window, LayerShell.Edge.TOP, y)
+        self._panel_position = (x, y)
+
+    def _on_drag_begin(self) -> None:
+        if not self._layer_surface or self.window is None:
+            return
+        if not self._left_anchored:
+            bounds = self._monitor_size()
+            right = LayerShell.get_margin(self.window, LayerShell.Edge.RIGHT)
+            width = bounds[0] if bounds else PANEL_W + right
+            x = max(0, width - max(PANEL_W, self.window.get_width()) - right)
+            # Set the equivalent left margin before changing anchors, so the
+            # first drag frame does not jump across the display.
+            LayerShell.set_margin(self.window, LayerShell.Edge.LEFT, x)
+            LayerShell.set_anchor(self.window, LayerShell.Edge.LEFT, True)
+            LayerShell.set_anchor(self.window, LayerShell.Edge.RIGHT, False)
+            self._left_anchored = True
+        self._drag_panel_origin = (
+            LayerShell.get_margin(self.window, LayerShell.Edge.LEFT),
+            LayerShell.get_margin(self.window, LayerShell.Edge.TOP),
+        )
+        self._drag_cursor_origin = _hypr_cursor_position()
+
+    def _on_drag_update(self, offset_x: float, offset_y: float) -> None:
+        if not self._layer_surface or not self._left_anchored:
+            return
+        cursor = _hypr_cursor_position()
+        if self._drag_cursor_origin is not None and cursor is not None:
+            position = _position_from_cursor(
+                self._drag_panel_origin, self._drag_cursor_origin, cursor
+            )
+        else:
+            # Non-Hyprland fallback. This is idempotent and safe, although a
+            # moving Wayland surface cannot perfectly reconstruct global input
+            # from GTK's widget-relative coordinates alone.
+            position = (
+                round(self._drag_panel_origin[0] + offset_x),
+                round(self._drag_panel_origin[1] + offset_y),
+            )
+        self._set_panel_position(*position)
+
+    def _on_drag_end(self, offset_x: float, offset_y: float) -> None:
+        # Sample once more at release so the saved position includes motion
+        # since GTK's last drag-update.
+        self._on_drag_update(offset_x, offset_y)
+        if self._panel_position is not None:
+            x, y = self._panel_position
+            _save_panel_pref("position", {"x": x, "y": y})
+        self._drag_cursor_origin = None
+
+    def _reset_position(self) -> None:
+        if not self._layer_surface or self.window is None:
+            return
+        LayerShell.set_anchor(self.window, LayerShell.Edge.LEFT, False)
+        LayerShell.set_anchor(self.window, LayerShell.Edge.RIGHT, True)
+        LayerShell.set_margin(self.window, LayerShell.Edge.RIGHT, 6)
+        LayerShell.set_margin(self.window, LayerShell.Edge.TOP, 6)
+        self._left_anchored = False
+        self._panel_position = None
+        _save_panel_pref("position", None)
+
+    def _clamp_panel_position(self) -> bool:
+        if self._left_anchored and self._panel_position is not None:
+            old = self._panel_position
+            self._set_panel_position(*old)
+            if self._panel_position != old:
+                x, y = self._panel_position
+                _save_panel_pref("position", {"x": x, "y": y})
+        return False
 
     # -- follow the desktop ---------------------------------------------
 

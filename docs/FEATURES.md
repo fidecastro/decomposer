@@ -30,8 +30,10 @@ the same size in both modes, and dims everything while the feed is down.
   real range only when you press Enter.
 - Anti-banding runs from the first frame, so mains-flicker waves do not
   ride along at odd frame rates.
-- Publishes clean I420 to `/dev/video10`; Chrome, OBS, Zoom, Discord
-  and friends see a camera named *decomposer*.
+- Publishes clean I420 to two reader-driven virtual cameras: `/dev/video10`
+  follows SEND flips, while `/dev/video11` always removes them for excluded
+  apps such as Meet. Chrome, OBS, Zoom, Discord and friends consume either,
+  and idle outputs stop copying frames.
 
 ## Color
 
@@ -76,8 +78,14 @@ model loads):
 
 - **Digital zoom to 8×**, lossless to 2× when capturing 4K and
   publishing 1080p — scroll on the preview to zoom, drag to pan.
-- **Mirroring**, horizontal and vertical, identical in both modes
-  (Studio's sensor orientation is corrected on the device).
+- **An independent local self-view**, mirror-like by default. **SELF MIRROR**
+  controls the panel's final orientation absolutely: turning SEND flips on or
+  off never changes what that button means. It does not alter either virtual
+  camera.
+- **Intentional output flipping**, horizontal and vertical, identical in both
+  modes and clearly marked **SEND**. A second **Normal** camera removes both
+  SEND flips for excluded apps (Studio's sensor orientation is corrected on
+  the device).
 - **Overlays** — PNG stickers and watermarks with placement, size
   limits and opacity.
 - **Tap-to-focus** — click the preview in Studio and focus plus
@@ -97,14 +105,24 @@ model loads):
   recording (h264 + your default microphone, saved under
   `~/Videos/decomposer`), with a blinking REC badge on the preview and
   the same button - now a stop square - ending it. Photos land in
-  `~/Pictures/decomposer`.
+  `~/Pictures/decomposer`. Still capture and finalization run in the daemon,
+  so replacing or closing the panel during capture cannot strand the photo.
 
 ## Presets
 
 Everything above saves into named presets, **kept per mode** because
 the two firmwares expose different controls. Hand-edited preset files
 are clamped and repaired, never silently half-loaded. Loading a preset
-saved in the other mode applies what it can and reports the rest.
+saved in the other mode applies what it can and reports the rest. The panel
+can update or delete the selected preset, and remembers the last successful
+selection for each mode. On daemon launch that preset is applied before the
+first engine starts; camera controls replay as soon as the firmware is ready.
+The panel's **Undo** and **Redo** controls (or **Ctrl+Z** and
+**Ctrl+Shift+Z**) traverse successful live adjustments and preset loads. Slider
+updates made as one gesture collapse into one undo step; a new adjustment after
+Undo clears the forward path. Restarts, power changes and preset deletion clear
+the short in-memory history rather than pretending those destructive actions
+are undone.
 
 ## The panel
 
@@ -114,8 +132,12 @@ are typed entries that commit on Enter and never fight your typing;
 sliders honor a grace period so the camera's automatics cannot yank a
 control out of your hand. When the feed drops, you get a NO FEED card
 or classic broadcast bars — right-click to choose. A MIC chip tells
-the audio truth from ALSA, not from assumptions. Every action that
+the audio truth from ALSA, not from assumptions; a CAM chip shows whether
+the camera controls beside it are live. Every action that
 would reboot the camera's firmware asks first, with a real Cancel.
+Drag the dotted grip beside the title to place the panel anywhere on the current
+display—for example directly below a monitor-mounted camera. Its position is
+remembered; double-click the grip to return to the top-right default.
 
 ## Care and feeding
 
