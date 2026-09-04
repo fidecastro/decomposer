@@ -355,6 +355,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "clap",
+ "libc",
  "nix",
  "ort",
  "png",

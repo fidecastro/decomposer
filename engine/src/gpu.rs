@@ -82,7 +82,10 @@ pub struct Gpu {
     params: Params,
     size: u64,
     src_size: u64,
+    /// The SEND frame, and the same frame rendered without the mirror for
+    /// the normal feed. Two buffers so both stay readable at once.
     out: Vec<u8>,
+    normal_out: Vec<u8>,
     pub adapter_name: String,
 }
 
@@ -304,7 +307,9 @@ impl Gpu {
             overlay_buf, lut_buf, clahe_hist, clahe_lut,
             mask_buf, bg_buf, layer_buf,
             staging, params, size, src_size,
-            out: vec![0u8; size as usize], adapter_name,
+            out: vec![0u8; size as usize],
+            normal_out: vec![0u8; size as usize],
+            adapter_name,
         })
     }
 
@@ -516,11 +521,49 @@ impl Gpu {
             .write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
     }
 
-    /// Grade one NV12 frame. The returned slice is valid until the next call.
-    pub fn process(&mut self, frame: &[u8]) -> Result<&[u8]> {
+    /// Whether the SEND output is mirrored on either axis.
+    pub fn flipped(&self) -> bool {
+        self.params.flip != 0
+    }
+
+    /// Grade one NV12 frame into the SEND output; read it with `output()`.
+    pub fn process(&mut self, frame: &[u8]) -> Result<()> {
         let n = (frame.len() as u64).min(self.src_size);
         self.queue.write_buffer(&self.src_buf, 0, &frame[..n as usize]);
+        self.render(false)
+    }
 
+    /// Grade the frame last given to `process` once more with no mirror,
+    /// into the buffer `normal_output()` reads.
+    ///
+    /// The mirror is applied where the source is sampled, while the overlay
+    /// and a replacement background are placed in output pixels. Undoing
+    /// the mirror on the finished frame would therefore mirror those too,
+    /// so the normal feed is a second pass rather than a copy. Only the
+    /// uniform changes; the source is already on the GPU.
+    pub fn process_normal(&mut self) -> Result<()> {
+        let send_flip = self.params.flip;
+        self.params.flip = 0;
+        self.upload_params();
+        let rendered = self.render(true);
+        self.params.flip = send_flip;
+        self.upload_params();
+        rendered
+    }
+
+    /// The SEND frame from the last `process` call.
+    pub fn output(&self) -> &[u8] {
+        &self.out
+    }
+
+    /// The unmirrored frame from the last `process_normal` call.
+    pub fn normal_output(&self) -> &[u8] {
+        &self.normal_out
+    }
+
+    /// Run the passes over the uploaded source with the current uniform,
+    /// then read the result back into one of the two output buffers.
+    fn render(&mut self, into_normal: bool) -> Result<()> {
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("look") });
@@ -561,10 +604,11 @@ impl Gpu {
 
         {
             let view = slice.get_mapped_range()?;
-            self.out.copy_from_slice(&view[..]);
+            let target = if into_normal { &mut self.normal_out } else { &mut self.out };
+            target.copy_from_slice(&view[..]);
         }
         self.staging.unmap();
-        Ok(&self.out)
+        Ok(())
     }
 }
 
@@ -599,4 +643,113 @@ fn make_bind_group(
             wgpu::BindGroupEntry { binding: 9, resource: layer.as_entire_binding() },
         ],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! These need a GPU adapter. Where wgpu finds none the tests report it
+    //! and pass, so a headless CI box does not fail on hardware it lacks.
+    use super::Gpu;
+    use crate::overlay::Overlay;
+
+    const W: u32 = 64;
+    const H: u32 = 32;
+
+    /// A dark left half and a bright right half, neutral chroma: the
+    /// orientation of the result is readable from a single luma sample.
+    fn split_frame() -> Vec<u8> {
+        let mut f = vec![128u8; crate::source::nv12_len(W, H)];
+        for y in 0..H {
+            for x in 0..W {
+                f[(y * W + x) as usize] = if x < W / 2 { 50 } else { 200 };
+            }
+        }
+        f
+    }
+
+    fn luma(nv12: &[u8], x: u32, y: u32) -> u8 {
+        nv12[(y * W + x) as usize]
+    }
+
+    fn near(a: u8, b: u8) -> bool {
+        (a as i32 - b as i32).abs() <= 3
+    }
+
+    fn solid(width: u32, height: u32, rgba: u32) -> Overlay {
+        Overlay { width, height, pixels: vec![rgba; (width * height) as usize] }
+    }
+
+    fn gpu(flip: u32) -> Option<Gpu> {
+        match Gpu::new(W, H, W, H, 0, 1.0, flip) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                eprintln!("skipping GPU test: {e:#}");
+                None
+            }
+        }
+    }
+
+    // Opaque red, as the shader writes it: Y' ~ 82 in limited range.
+    const RED: u32 = 0xff00_00ff;
+    const RED_LUMA: u8 = 82;
+
+    #[test]
+    fn normal_pass_unmirrors_the_image_but_not_the_overlay() {
+        let Some(mut g) = gpu(1) else { return };
+        g.set_overlay(Some(&solid(4, 4, RED)), 2, 2, 1.0);
+        g.process(&split_frame()).unwrap();
+        g.process_normal().unwrap();
+
+        // SEND: mirrored, so the bright half is on the left.
+        let send = g.output();
+        assert!(near(luma(send, 10, 20), 200), "send left {}", luma(send, 10, 20));
+        assert!(near(luma(send, 50, 20), 50), "send right {}", luma(send, 50, 20));
+        assert!(near(luma(send, 3, 3), RED_LUMA), "send overlay {}", luma(send, 3, 3));
+
+        // Normal: the camera image is upright again, the logo has not moved.
+        let normal = g.normal_output();
+        assert!(near(luma(normal, 10, 20), 50), "normal left {}", luma(normal, 10, 20));
+        assert!(near(luma(normal, 50, 20), 200), "normal right {}", luma(normal, 50, 20));
+        assert!(near(luma(normal, 3, 3), RED_LUMA), "normal overlay {}", luma(normal, 3, 3));
+        // And the mirrored corner carries no overlay on either feed.
+        assert!(!near(luma(send, W - 4, 3), RED_LUMA));
+        assert!(!near(luma(normal, W - 4, 3), RED_LUMA));
+
+        // The SEND flip survives the detour: the next frame is mirrored again.
+        g.process(&split_frame()).unwrap();
+        assert!(near(luma(g.output(), 10, 20), 200));
+        assert!(g.flipped());
+    }
+
+    #[test]
+    fn normal_pass_keeps_a_replacement_background_in_place() {
+        let Some(mut g) = gpu(1) else { return };
+        // Background: opaque white on the left, black on the right, and a
+        // mask that says "nobody here" so the background shows everywhere.
+        let mut bg = solid(W, H, 0xff00_0000);
+        for y in 0..H {
+            for x in 0..W / 2 {
+                bg.pixels[(y * W + x) as usize] = 0xffff_ffff;
+            }
+        }
+        g.set_background(Some(&bg));
+        g.set_mask(&vec![0u8; (W * H) as usize], W, H);
+        g.process(&split_frame()).unwrap();
+        g.process_normal().unwrap();
+
+        // A replacement is placed in output pixels, so it must not mirror on
+        // either feed: white stays on the left of both.
+        for (name, frame) in [("send", g.output()), ("normal", g.normal_output())] {
+            assert!(near(luma(frame, 10, 20), 235), "{name} left {}", luma(frame, 10, 20));
+            assert!(near(luma(frame, 50, 20), 16), "{name} right {}", luma(frame, 50, 20));
+        }
+    }
+
+    #[test]
+    fn unflipped_send_needs_no_normal_pass() {
+        let Some(mut g) = gpu(0) else { return };
+        g.process(&split_frame()).unwrap();
+        assert!(!g.flipped());
+        assert!(near(luma(g.output(), 10, 20), 50));
+    }
 }

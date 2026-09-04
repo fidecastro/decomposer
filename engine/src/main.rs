@@ -34,7 +34,8 @@ struct Args {
     output: String,
 
     /// Optional second v4l2loopback node that always publishes normal
-    /// orientation, undoing --flip without running the GPU twice
+    /// orientation. While --flip is set and a viewer is attached to it,
+    /// the frame is rendered a second time without the mirror
     #[arg(long)]
     normal_output: Option<String>,
 
@@ -191,12 +192,19 @@ fn main() -> Result<()> {
         Some(path) if path == args.output => {
             anyhow::bail!("normal output must differ from primary output {path}")
         }
-        Some(path) => {
-            let s = source::V4l2Sink::new(path, out_w, out_h)
-                .with_context(|| format!("opening normal output device {path}"))?;
-            eprintln!("normal {path} {out_w}x{out_h} (SEND flips removed)");
-            Some(s)
-        }
+        // The normal feed is a convenience, the SEND feed is the camera. A
+        // node that is busy, missing or not a loopback output must not cost
+        // the user the camera, so this one fails soft.
+        Some(path) => match source::V4l2Sink::new(path, out_w, out_h) {
+            Ok(s) => {
+                eprintln!("normal {path} {out_w}x{out_h} (SEND flips removed)");
+                Some(s)
+            }
+            Err(e) => {
+                eprintln!("normal {path} unavailable, publishing SEND only: {e:#}");
+                None
+            }
+        },
     };
 
     // Timed from the first frame: in Studio mode the producer spends several
@@ -253,8 +261,6 @@ fn main() -> Result<()> {
         eprintln!("look   {} @ {:.2} on {}", args.look, args.strength, g.adapter_name);
         Some(g)
     };
-    let mut applied_flip = if engine.is_some() { args.flip & 3 } else { 0 };
-
     let look_state = config::shared(
         gpu::look_index(&args.look).unwrap_or(0),
         args.look.clone(),
@@ -384,7 +390,6 @@ fn main() -> Result<()> {
             {
                 g.set_look(look, strength);
                 g.set_flip(flip);
-                applied_flip = flip;
                 g.set_zoom(zoom, pan_x, pan_y);
                 g.set_clahe(clahe);
                 g.set_blur(blur, blur_style);
@@ -563,18 +568,28 @@ fn main() -> Result<()> {
                 layer_live = false;
             }
         }
-        let out = match engine.as_mut() {
-            Some(g) => g.process(frame)?,
-            None => frame,
+        // Decided before the GPU runs: the unmirrored pass for the normal
+        // feed is only worth doing when that feed will actually be written.
+        let normal_wanted = normal_sink.as_mut().is_some_and(|s| s.wants_frame());
+        let (out, normal_out): (&[u8], Option<&[u8]>) = match engine.as_mut() {
+            Some(g) => {
+                g.process(frame)?;
+                let normal = if normal_wanted && g.flipped() {
+                    g.process_normal()?;
+                    Some(g.normal_output())
+                } else {
+                    None
+                };
+                (g.output(), normal)
+            }
+            None => (frame, None),
         };
         if let Some(sink) = sink.as_mut() {
-            sink.write_if_watched(out, 0)?;
+            sink.write_if_watched(out)?;
         }
-        if let Some(sink) = normal_sink.as_mut() {
-            // The GPU has already applied SEND's flip. Applying the same
-            // transform once more while copying to I420 restores normal
-            // orientation for this second feed.
-            sink.write_if_watched(out, applied_flip)?;
+        if let (Some(sink), true) = (normal_sink.as_mut(), normal_wanted) {
+            // Without a SEND flip the two feeds are the same frame.
+            sink.write(normal_out.unwrap_or(out))?;
         }
         if let Some(p) = preview.as_mut() {
             p.publish(out, out_w, out_h);

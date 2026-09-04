@@ -7,14 +7,23 @@
 
 use anyhow::{bail, Context, Result};
 use nix::errno::Errno;
+use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::mem::{self, ManuallyDrop};
 use std::os::fd::FromRawFd;
+use std::os::raw::{c_int, c_void};
+use std::ptr;
+use std::slice;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use v4l::buffer::Type;
-use v4l::io::traits::{CaptureStream, OutputStream};
+use v4l::device::Handle;
+use v4l::io::traits::CaptureStream;
+use v4l::memory::Memory;
 use v4l::prelude::*;
+use v4l::v4l2;
 use v4l::video::{Capture, Output};
-use v4l::v4l_sys::{v4l2_event, v4l2_event_subscription};
+use v4l::v4l_sys::{v4l2_buffer, v4l2_event, v4l2_event_subscription, v4l2_requestbuffers};
 use v4l::{Format, FourCC};
 
 /// linux/videodev2.h: this frame is progressive, not one field of an
@@ -133,21 +142,34 @@ impl FrameSource for StdinSource {
     }
 }
 
+/// While nobody is streaming from a node, one frame per second keeps its ring
+/// current. A capture client that connects is handed the most recently queued
+/// frame before anything new arrives, so without this the first frame a viewer
+/// saw was whatever the engine started on - typically the camera's black
+/// warm-up frame - rather than the room as it is now.
+const IDLE_REFRESH: Duration = Duration::from_secs(1);
+const OUTPUT_BUFFERS: u32 = 2;
+
 pub struct V4l2Sink {
-    stream: MmapStream<'static>,
+    handle: Arc<Handle>,
+    /// The driver's mmapped output buffers, in index order.
+    buffers: Vec<&'static mut [u8]>,
+    /// Buffers never handed to the driver yet; once these run out, every
+    /// write asks the driver for a finished buffer with DQBUF.
+    free: VecDeque<usize>,
+    streaming: bool,
     width: u32,
     height: u32,
     path: String,
     primed: bool,
     viewer_active: bool,
     usage_events: bool,
+    last_write: Option<Instant>,
 }
 
 impl V4l2Sink {
     pub fn new(path: &str, width: u32, height: u32) -> Result<Self> {
-        let dev: &'static Device = Box::leak(Box::new(
-            Device::with_path(path).with_context(|| format!("open {path}"))?,
-        ));
+        let dev = Device::with_path(path).with_context(|| format!("open {path}"))?;
 
         // The virtual camera speaks I420 (YU12), not NV12, deliberately.
         // OBS consumes this device through libv4l2's emulated formats, and
@@ -157,7 +179,7 @@ impl V4l2Sink {
         // 630-661, the exact mirror positions. Publishing I420 lets every
         // consumer take the frames natively and the flipping code never runs.
         let want = Format::new(width, height, FourCC::new(b"YU12"));
-        let got = Output::set_format(dev, &want).context("set output format")?;
+        let got = Output::set_format(&dev, &want).context("set output format")?;
         if got.width != width || got.height != height || &got.fourcc.repr != b"YU12" {
             bail!(
                 "{path} rejected {width}x{height} YU12 (got {}x{} {}). \
@@ -166,51 +188,143 @@ impl V4l2Sink {
             );
         }
 
-        let usage_events = subscribe_client_usage(dev).is_ok();
+        let usage_events = subscribe_client_usage(&dev).is_ok();
         if !usage_events {
             eprintln!(
                 "output {path}: viewer detection unavailable; publishing continuously"
             );
         }
-        let stream = MmapStream::with_buffers(dev, Type::VideoOutput, 2)
-            .context("start output stream")?;
+        // The buffers are managed here rather than through the crate's
+        // output stream: that stream only queues a buffer on the *next* call,
+        // so every frame reached viewers one write late, and a frame written
+        // while idle never reached them at all.
+        let handle = dev.handle();
+        let buffers = map_output_buffers(&handle, OUTPUT_BUFFERS)?;
+        let free = (0..buffers.len()).collect();
         Ok(Self {
-            stream,
+            handle,
+            buffers,
+            free,
+            streaming: false,
             width,
             height,
             path: path.to_string(),
             primed: false,
             viewer_active: !usage_events,
             usage_events,
+            last_write: None,
         })
     }
 
-    /// Publish only while a capture client is streaming. The first frame is
-    /// always prepared because STREAMON on the producer is what makes an
-    /// exclusive-caps v4l2loopback node visible to camera pickers.
-    pub fn write_if_watched(&mut self, frame: &[u8], flip: u32) -> Result<bool> {
+    /// Whether the next frame should be converted and published here.
+    ///
+    /// The first frame always is: STREAMON on the producer is what makes an
+    /// exclusive-caps v4l2loopback node visible to camera pickers. After
+    /// that, frames flow while a capture client is streaming, plus one
+    /// keep-warm frame per second while nobody is.
+    pub fn wants_frame(&mut self) -> bool {
         self.refresh_viewer();
-        if self.primed && self.usage_events && !self.viewer_active {
-            return Ok(false);
-        }
+        should_publish(
+            self.primed,
+            self.usage_events,
+            self.viewer_active,
+            self.last_write.map(|t| t.elapsed()),
+        )
+    }
 
+    /// Publish one NV12 frame now, converted to I420.
+    pub fn write(&mut self, frame: &[u8]) -> Result<()> {
         let y_len = (self.width * self.height) as usize;
         let total = y_len + y_len / 2;
         if frame.len() < total {
             bail!("short frame: {} bytes, need {total}", frame.len());
         }
-        let (buf, meta) = OutputStream::next(&mut self.stream)?;
-        if buf.len() < total {
-            bail!("output buffer too small: {} < {total}", buf.len());
+        let index = match self.free.pop_front() {
+            Some(i) => i,
+            None => self.dequeue()?,
+        };
+        {
+            let buf = &mut self.buffers[index];
+            if buf.len() < total {
+                bail!("output buffer too small: {} < {total}", buf.len());
+            }
+            nv12_to_i420(frame, &mut buf[..total], self.width, self.height)?;
         }
-        nv12_to_i420(frame, &mut buf[..total], self.width, self.height, flip)?;
+        if !self.streaming {
+            self.stream_on()?;
+            self.streaming = true;
+        }
+        // Queued immediately: the frame is visible to readers before this
+        // function returns, not one write later.
+        self.queue(index, total)?;
+        self.primed = true;
+        self.last_write = Some(Instant::now());
+        Ok(())
+    }
+
+    /// `wants_frame` and `write` in one step, for the sink whose frame needs
+    /// no extra work to prepare.
+    pub fn write_if_watched(&mut self, frame: &[u8]) -> Result<bool> {
+        if !self.wants_frame() {
+            return Ok(false);
+        }
+        self.write(frame)?;
+        Ok(true)
+    }
+
+    fn buffer_desc(&self, index: usize) -> v4l2_buffer {
+        v4l2_buffer {
+            index: index as u32,
+            type_: Type::VideoOutput as u32,
+            memory: Memory::Mmap as u32,
+            ..unsafe { mem::zeroed() }
+        }
+    }
+
+    fn queue(&mut self, index: usize, bytesused: usize) -> Result<()> {
+        let mut desc = self.buffer_desc(index);
+        desc.bytesused = bytesused as u32;
         // V4L2_FIELD_NONE. Not ANY (0), which tells the driver it may choose,
         // and leaves a consumer free to treat the buffer as a single field
         // rather than a whole progressive frame.
-        meta.field = V4L2_FIELD_NONE;
-        meta.bytesused = total as u32;
-        self.primed = true;
-        Ok(true)
+        desc.field = V4L2_FIELD_NONE;
+        unsafe {
+            v4l2::ioctl(
+                self.handle.fd(),
+                v4l2::vidioc::VIDIOC_QBUF,
+                &mut desc as *mut _ as *mut c_void,
+            )
+        }
+        .with_context(|| format!("queue output buffer on {}", self.path))
+    }
+
+    fn dequeue(&mut self) -> Result<usize> {
+        let mut desc = self.buffer_desc(0);
+        unsafe {
+            v4l2::ioctl(
+                self.handle.fd(),
+                v4l2::vidioc::VIDIOC_DQBUF,
+                &mut desc as *mut _ as *mut c_void,
+            )
+        }
+        .with_context(|| format!("dequeue output buffer on {}", self.path))?;
+        let index = desc.index as usize;
+        if index >= self.buffers.len() {
+            bail!("driver returned output buffer {index} of {}", self.buffers.len());
+        }
+        Ok(index)
+    }
+
+    fn stream_on(&mut self) -> Result<()> {
+        let mut kind = Type::VideoOutput as c_int;
+        unsafe {
+            v4l2::ioctl(
+                self.handle.fd(),
+                v4l2::vidioc::VIDIOC_STREAMON,
+                &mut kind as *mut _ as *mut c_void,
+            )
+        }
+        .with_context(|| format!("start output stream on {}", self.path))
     }
 
     fn refresh_viewer(&mut self) {
@@ -219,7 +333,7 @@ impl V4l2Sink {
         }
         loop {
             let mut event: v4l2_event = unsafe { mem::zeroed() };
-            match unsafe { vidioc_dqevent(self.stream.handle().fd(), &mut event) } {
+            match unsafe { vidioc_dqevent(self.handle.fd(), &mut event) } {
                 Ok(_) => {
                     if event.type_ != V4L2_EVENT_PRI_CLIENT_USAGE {
                         continue;
@@ -235,10 +349,10 @@ impl V4l2Sink {
                         );
                     }
                 }
-                // The V4L2 core normally reports EAGAIN for an empty
-                // nonblocking event queue. v4l2loopback 0.15 also reports
-                // ENOENT after its initial event has been consumed.
-                Err(Errno::EAGAIN | Errno::ENOENT) => return,
+                // The V4L2 core answers ENOENT for an empty non-blocking event
+                // queue (v4l2_event_dequeue). EAGAIN is matched as well in
+                // case a driver follows the read(2) convention instead.
+                Err(Errno::ENOENT | Errno::EAGAIN) => return,
                 Err(e) => {
                     self.usage_events = false;
                     self.viewer_active = true;
@@ -253,6 +367,82 @@ impl V4l2Sink {
     }
 }
 
+impl Drop for V4l2Sink {
+    fn drop(&mut self) {
+        for buf in self.buffers.drain(..) {
+            let _ = unsafe { v4l2::munmap(buf.as_mut_ptr() as *mut c_void, buf.len()) };
+        }
+    }
+}
+
+/// The publishing policy, kept free of device state so it can be tested:
+/// prime once, then follow the viewer, with a slow heartbeat while idle.
+fn should_publish(
+    primed: bool,
+    usage_events: bool,
+    viewer_active: bool,
+    since_last_write: Option<Duration>,
+) -> bool {
+    if !primed || !usage_events || viewer_active {
+        return true;
+    }
+    since_last_write.map_or(true, |idle| idle >= IDLE_REFRESH)
+}
+
+/// REQBUFS + QUERYBUF + mmap for an output queue. The mappings live for the
+/// process: the sink is created once and dropped at exit.
+fn map_output_buffers(handle: &Handle, count: u32) -> Result<Vec<&'static mut [u8]>> {
+    let mut request = v4l2_requestbuffers {
+        count,
+        type_: Type::VideoOutput as u32,
+        memory: Memory::Mmap as u32,
+        ..unsafe { mem::zeroed() }
+    };
+    unsafe {
+        v4l2::ioctl(
+            handle.fd(),
+            v4l2::vidioc::VIDIOC_REQBUFS,
+            &mut request as *mut _ as *mut c_void,
+        )
+    }
+    .context("request output buffers")?;
+    if request.count == 0 {
+        bail!("driver granted no output buffers");
+    }
+    let mut buffers = Vec::with_capacity(request.count as usize);
+    for index in 0..request.count {
+        let mut desc = v4l2_buffer {
+            index,
+            type_: Type::VideoOutput as u32,
+            memory: Memory::Mmap as u32,
+            ..unsafe { mem::zeroed() }
+        };
+        unsafe {
+            v4l2::ioctl(
+                handle.fd(),
+                v4l2::vidioc::VIDIOC_QUERYBUF,
+                &mut desc as *mut _ as *mut c_void,
+            )
+        }
+        .with_context(|| format!("query output buffer {index}"))?;
+        let len = desc.length as usize;
+        let offset = unsafe { desc.m.offset } as libc::off_t;
+        let ptr = unsafe {
+            v4l2::mmap(
+                ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                handle.fd(),
+                offset,
+            )
+        }
+        .with_context(|| format!("map output buffer {index}"))?;
+        buffers.push(unsafe { slice::from_raw_parts_mut(ptr as *mut u8, len) });
+    }
+    Ok(buffers)
+}
+
 fn subscribe_client_usage(dev: &Device) -> io::Result<()> {
     let subscription = v4l2_event_subscription {
         type_: V4L2_EVENT_PRI_CLIENT_USAGE,
@@ -264,21 +454,13 @@ fn subscribe_client_usage(dev: &Device) -> io::Result<()> {
         .map_err(|e| io::Error::from_raw_os_error(e as i32))
 }
 
-/// Convert NV12 to I420 while optionally applying a final output flip.
-/// Applying the same flip after the GPU is an involution, which gives the
-/// second sink a stable normal orientation without another shader pass.
-fn nv12_to_i420(
-    src: &[u8],
-    dst: &mut [u8],
-    width: u32,
-    height: u32,
-    flip: u32,
-) -> Result<()> {
+/// Convert NV12 (interleaved chroma) to I420 (planar chroma). Both feeds
+/// are rendered in their own orientation on the GPU, so no geometry changes
+/// here: this is a copy and a deinterleave.
+fn nv12_to_i420(src: &[u8], dst: &mut [u8], width: u32, height: u32) -> Result<()> {
     let (w, h) = (width as usize, height as usize);
     let y_len = w * h;
-    let chroma_w = w / 2;
-    let chroma_h = h / 2;
-    let quarter = chroma_w * chroma_h;
+    let quarter = (w / 2) * (h / 2);
     let total = y_len + 2 * quarter;
     if src.len() < total || dst.len() < total {
         bail!(
@@ -287,65 +469,34 @@ fn nv12_to_i420(
             dst.len(),
         );
     }
-    let flip_h = flip & 1 != 0;
-    let flip_v = flip & 2 != 0;
-
-    if !flip_h && !flip_v {
-        dst[..y_len].copy_from_slice(&src[..y_len]);
-    } else {
-        for out_y in 0..h {
-            let src_y = if flip_v { h - 1 - out_y } else { out_y };
-            for out_x in 0..w {
-                let src_x = if flip_h { w - 1 - out_x } else { out_x };
-                dst[out_y * w + out_x] = src[src_y * w + src_x];
-            }
-        }
-    }
-
+    dst[..y_len].copy_from_slice(&src[..y_len]);
     let (u_out, v_out) = dst[y_len..total].split_at_mut(quarter);
-    for out_y in 0..chroma_h {
-        let src_y = if flip_v { chroma_h - 1 - out_y } else { out_y };
-        for out_x in 0..chroma_w {
-            let src_x = if flip_h { chroma_w - 1 - out_x } else { out_x };
-            let src_i = y_len + (src_y * chroma_w + src_x) * 2;
-            let out_i = out_y * chroma_w + out_x;
-            u_out[out_i] = src[src_i];
-            v_out[out_i] = src[src_i + 1];
-        }
+    for (i, pair) in src[y_len..total].chunks_exact(2).enumerate() {
+        u_out[i] = pair[0];
+        v_out[i] = pair[1];
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::nv12_to_i420;
+    use super::{nv12_to_i420, should_publish, IDLE_REFRESH};
+    use std::time::Duration;
 
-    fn converted(src: &[u8], width: u32, height: u32, flip: u32) -> Vec<u8> {
+    fn converted(src: &[u8], width: u32, height: u32) -> Vec<u8> {
         let mut dst = vec![0; src.len()];
-        nv12_to_i420(src, &mut dst, width, height, flip).unwrap();
+        nv12_to_i420(src, &mut dst, width, height).unwrap();
         dst
     }
 
     #[test]
-    fn converts_nv12_to_i420_without_a_flip() {
+    fn converts_nv12_to_i420() {
         let src = [0, 1, 2, 3, 4, 5, 6, 7, 10, 20, 30, 40];
-        assert_eq!(
-            converted(&src, 4, 2, 0),
-            [0, 1, 2, 3, 4, 5, 6, 7, 10, 30, 20, 40],
-        );
+        assert_eq!(converted(&src, 4, 2), [0, 1, 2, 3, 4, 5, 6, 7, 10, 30, 20, 40]);
     }
 
     #[test]
-    fn horizontal_flip_reverses_pixels_and_chroma_pairs() {
-        let src = [0, 1, 2, 3, 4, 5, 6, 7, 10, 20, 30, 40];
-        assert_eq!(
-            converted(&src, 4, 2, 1),
-            [3, 2, 1, 0, 7, 6, 5, 4, 30, 10, 40, 20],
-        );
-    }
-
-    #[test]
-    fn vertical_and_180_flips_reverse_the_expected_rows() {
+    fn deinterleaves_chroma_rows_in_order() {
         let src = [
             0, 1, 2, 3,
             4, 5, 6, 7,
@@ -355,26 +506,41 @@ mod tests {
             60, 70, 80, 90,
         ];
         assert_eq!(
-            converted(&src, 4, 4, 2),
+            converted(&src, 4, 4),
             [
-                12, 13, 14, 15,
-                8, 9, 10, 11,
-                4, 5, 6, 7,
                 0, 1, 2, 3,
-                60, 80, 20, 40,
-                70, 90, 30, 50,
+                4, 5, 6, 7,
+                8, 9, 10, 11,
+                12, 13, 14, 15,
+                20, 40, 60, 80,
+                30, 50, 70, 90,
             ],
         );
-        assert_eq!(
-            converted(&src, 4, 4, 3),
-            [
-                15, 14, 13, 12,
-                11, 10, 9, 8,
-                7, 6, 5, 4,
-                3, 2, 1, 0,
-                80, 60, 40, 20,
-                90, 70, 50, 30,
-            ],
-        );
+    }
+
+    #[test]
+    fn short_buffers_are_refused() {
+        let src = [0u8; 12];
+        let mut dst = [0u8; 11];
+        assert!(nv12_to_i420(&src, &mut dst, 4, 2).is_err());
+    }
+
+    #[test]
+    fn priming_frame_is_always_published() {
+        assert!(should_publish(false, true, false, None));
+    }
+
+    #[test]
+    fn viewer_or_missing_events_publish_every_frame() {
+        assert!(should_publish(true, true, true, Some(Duration::ZERO)));
+        assert!(should_publish(true, false, false, Some(Duration::ZERO)));
+    }
+
+    #[test]
+    fn idle_node_gets_one_keep_warm_frame_per_second() {
+        assert!(!should_publish(true, true, false, Some(Duration::from_millis(33))));
+        assert!(!should_publish(true, true, false, Some(IDLE_REFRESH - Duration::from_millis(1))));
+        assert!(should_publish(true, true, false, Some(IDLE_REFRESH)));
+        assert!(should_publish(true, true, false, None));
     }
 }

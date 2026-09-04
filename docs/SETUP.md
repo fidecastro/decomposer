@@ -27,9 +27,12 @@ decomposer publishes the processed frame to two devices:
   this once in Meet or any other app that should be excluded.
 
 Both outputs subscribe to v4l2loopback's client-usage event. After one priming
-frame makes a device discoverable, Decomposer converts and writes frames only
-while an application is actually streaming from that device. An unused second
-feed therefore adds no continuous frame-copy load.
+frame makes a device discoverable, decomposer converts and writes frames only
+while an application is actually streaming from that device, plus one
+keep-warm frame per second so that the first frame a newly connected viewer
+receives is recent. While a SEND flip is on and something is watching the
+Normal camera, the engine renders that frame a second time without the flip,
+so overlays and replacement backgrounds stay in place on both feeds.
 
 The module options pin both node numbers, name the devices, and set
 `exclusive_caps=1` so camera clients negotiate them correctly.
