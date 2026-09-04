@@ -140,6 +140,38 @@ STICKY_CONTROLS = frozenset({
 })
 
 
+# Controls the camera can drive itself. Asking for -1 hands one back to the
+# firmware; exposure and ISO go back together, since the ISP owns them as a
+# pair. Effect and scene have no automatic mode but do have an "off".
+AUTO_CONTROLS = frozenset({"focus", "wb", "exposure", "iso"})
+CONTROL_RESET = {**{key: -1 for key in AUTO_CONTROLS}, "effect": "off", "scene": "off"}
+
+
+def restore_values(touched, sticky: dict, readback: dict) -> tuple:
+    """What to send the camera to undo a request that touched `touched`.
+
+    A key the user had set before goes back to that request. One they had
+    never set returns to automatic (or its reset value): re-sending the
+    hardware readback would instead pin an auto-exposed camera to manual at
+    whatever value it happened to be reporting. A plain slider with no
+    request and no automatic mode goes back to what the camera reported
+    before the request, which is the only previous value there is.
+
+    Returns (values, unknown): unknown lists keys with nothing to restore.
+    """
+    values, unknown = {}, []
+    for key in touched:
+        if key in sticky:
+            values[key] = sticky[key]
+        elif key in CONTROL_RESET:
+            values[key] = CONTROL_RESET[key]
+        elif key in readback:
+            values[key] = readback[key]
+        else:
+            unknown.append(key)
+    return values, unknown
+
+
 def sticky_for_mode(sticky: dict, mode: Mode) -> dict:
     """The subset of remembered requests that this mode can replay."""
     reachable = controls_for(mode)

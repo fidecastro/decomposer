@@ -1155,10 +1155,16 @@ class Daemon:
 
         Restart-level configuration is deliberately absent.  Model membership
         is a barrier, so only the live strengths need to be retained here.
-        Camera readback comes from the poller's snapshot; `_sticky` separately
-        preserves automatic/manual intent across firmware sessions.
+
+        For the camera, `sticky` is what gets restored: the user's explicit
+        requests, with absence meaning automatic. The hardware readback is
+        kept only as the previous value of plain sliders that have no
+        automatic mode. It is never re-applied wholesale - under
+        auto-exposure the readback carries exposure/iso, and re-sending those
+        would pin the camera to manual at whatever it happened to report.
         """
         with self.lock:
+            readback = self._snapshot.get("controls") or {}
             return {
                 "state": {
                     name: copy.deepcopy(getattr(self.state, name))
@@ -1168,11 +1174,23 @@ class Daemon:
                     (m.get("path"), m.get("device"), m.get("strength", 1.0))
                     for m in self.state.models
                 ],
-                "controls": copy.deepcopy(
-                    self._snapshot.get("controls") or {}
-                ),
+                "controls": {
+                    key: copy.deepcopy(value)
+                    for key, value in readback.items()
+                    if key in model.STICKY_CONTROLS
+                },
                 "sticky": copy.deepcopy(self._sticky),
             }
+
+    @staticmethod
+    def _undo_relevant(snapshot: dict) -> tuple:
+        """The parts of a snapshot whose change makes a request undoable.
+
+        The hardware readback is left out: it drifts on its own (auto
+        exposure hunting between two snapshots) and must not create
+        history entries for requests that changed nothing.
+        """
+        return snapshot["state"], snapshot["models"], snapshot["sticky"]
 
     @staticmethod
     def _undo_key(req: dict) -> tuple:
@@ -1220,8 +1238,15 @@ class Daemon:
             return f"preset {req.get('name', '')}".rstrip()
         return "adjustment"
 
-    def _record_undo(self, req: dict, before: dict, after: dict) -> None:
-        if before == after:
+    def _record_undo(
+        self, req: dict, before: dict, after: dict, touched: list
+    ) -> None:
+        """Remember `before` as the state to return to.
+
+        `touched` names the camera controls the request applied; undoing the
+        entry restores exactly those, and nothing else about the camera.
+        """
+        if self._undo_relevant(before) == self._undo_relevant(after):
             return
         now = time.monotonic()
         key = self._undo_key(req)
@@ -1240,12 +1265,13 @@ class Daemon:
                 entry = self._undo_history[-1]
                 entry["at"] = now
                 entry["label"] = label
-                if entry["snapshot"] == after:
+                entry["touched"] = sorted(set(entry["touched"]) | set(touched))
+                if self._undo_relevant(entry["snapshot"]) == self._undo_relevant(after):
                     self._undo_history.pop()
                 return
             self._undo_history.append({
                 "cmd": req.get("cmd"), "key": key, "label": label,
-                "at": now, "snapshot": before,
+                "at": now, "snapshot": before, "touched": sorted(touched),
             })
             del self._undo_history[:-UNDO_LIMIT]
 
@@ -1275,6 +1301,7 @@ class Daemon:
             destination.append(reverse)
             del destination[:-UNDO_LIMIT]
             snapshot = entry["snapshot"]
+            touched = list(entry.get("touched") or [])
             current_mode = self.state.mode
             old_active = self.state.active_preset
             for name, value in snapshot["state"].items():
@@ -1296,25 +1323,46 @@ class Daemon:
                     current["strength"] = strength
 
             backend = self._backend
-            controls = copy.deepcopy(snapshot["controls"])
-            sticky = copy.deepcopy(snapshot["sticky"])
+            previous_sticky = copy.deepcopy(snapshot["sticky"])
+            # Only the controls this request touched go back, each to the
+            # user's earlier request for it or to automatic. The rest of the
+            # camera is not part of this entry and stays exactly as it is.
+            values, unknown = model.restore_values(
+                touched, previous_sticky, snapshot["controls"]
+            )
 
-        refused = {}
-        if backend is not None and controls:
-            allowed = {
-                key: value for key, value in controls.items()
-                if model.refusal_reason(Mode(current_mode), key) is None
-            }
-            if allowed:
+        applied, refused = {}, {}
+        for key in unknown:
+            refused[key] = "no earlier value is known"
+        for key in list(values):
+            why = model.refusal_reason(Mode(current_mode), key)
+            if why:
+                refused[key] = why
+                del values[key]
+        if values:
+            if backend is None:
+                for key in values:
+                    refused[key] = "no camera attached (mode transition in progress?)"
+            else:
                 try:
-                    _applied, refused = backend.apply_controls(allowed)
+                    applied, denied = backend.apply_controls(values)
+                    refused.update(denied)
                 except Exception as e:
-                    refused = {"camera controls": str(e)}
+                    refused["camera controls"] = str(e)
 
         with self.lock:
-            self._sticky = sticky
-            self.state.controls = copy.deepcopy(controls)
-            self._snapshot["controls"] = copy.deepcopy(controls)
+            for key, value in applied.items():
+                self.state.controls[key] = value
+                self._snapshot.setdefault("controls", {})[key] = value
+                if key not in model.STICKY_CONTROLS:
+                    continue
+                # Intent follows the hardware: a key the user had never set
+                # is automatic again, so status reports auto only when the
+                # camera really is.
+                if key in previous_sticky:
+                    self._sticky[key] = previous_sticky[key]
+                else:
+                    self._sticky.pop(key, None)
         self._sync_engine()
 
         active = snapshot["state"].get("active_preset")
@@ -1516,6 +1564,7 @@ class Daemon:
                 )
 
         controls = data.get("controls") or {}
+        reached: dict = {}
         if controls:
             if startup:
                 # Mode entry replays this intent after the firmware and its
@@ -1527,12 +1576,16 @@ class Daemon:
                     })
             else:
                 applied = self.set_camera(**controls)
+                reached = applied.get("applied") or {}
                 for key, why in (applied.get("refused") or {}).items():
                     notes.append(f"{key} skipped: {why}")
 
         self._remember_preset(self.state.mode, name)
         out = self.status()
         out["preset_loaded"] = name
+        # What reached the camera, so an undo of this load knows which
+        # controls to restore.
+        out["applied"] = reached
         if notes:
             out["notes"] = notes
         return out
@@ -1923,7 +1976,16 @@ class Daemon:
             response = self._dispatch(req)
             if response.get("ok"):
                 if undoable and before is not None:
-                    self._record_undo(req, before, self._undo_snapshot())
+                    # The camera controls a request actually reached, as
+                    # reported by the backend; regions are moments rather
+                    # than policies and are never restored.
+                    touched = [
+                        key for key in (response.get("applied") or {})
+                        if key in model.STICKY_CONTROLS
+                    ]
+                    self._record_undo(
+                        req, before, self._undo_snapshot(), touched
+                    )
                 elif cmd in UNDO_BARRIER_COMMANDS or (
                     cmd == "preset_load" and bool(req.get("with_mode"))
                 ):
