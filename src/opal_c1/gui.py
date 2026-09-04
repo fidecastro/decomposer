@@ -12,16 +12,15 @@ takes up to fifteen seconds.
 
 from __future__ import annotations
 
-import json
 import os
 import socket
-import stat
 import struct
 from pathlib import Path
 import shutil
 import subprocess
 import threading
 import time
+from contextlib import suppress
 from typing import Callable, Optional
 
 import gi
@@ -55,11 +54,12 @@ gi.require_version("PangoCairo", "1.0")
 from gi.repository import Pango, PangoCairo  # noqa: E402
 
 from opal_c1 import theme as omtheme  # noqa: E402
-from opal_c1.daemon import (  # noqa: E402
-    Client,
-    _atomic_write_json,
-    _read_regular_json,
-    runtime_dir,
+from opal_c1.daemon import Client, runtime_dir  # noqa: E402
+from opal_c1.files import atomic_write_json, read_regular_json  # noqa: E402
+from opal_c1.geometry import (  # noqa: E402
+    hypr_cursor_position,
+    position_from_cursor,
+    preview_correction_flips,
 )
 from opal_c1.core.model import (  # noqa: E402
     Mode as _Mode,
@@ -78,79 +78,6 @@ def model_controls_for(mode: str) -> frozenset:
 WIDTH = 384          # one column: the preview pane, and the controls pane
 PANEL_W = 800        # both columns plus margins
 PREVIEW_H = 216
-HYPR_CURSOR_REPLY_MAX = 256
-
-
-def _position_from_cursor(
-    panel_origin: tuple[int, int],
-    cursor_origin: tuple[float, float],
-    cursor_now: tuple[float, float],
-) -> tuple[int, int]:
-    """Place a panel from a compositor-global cursor delta, in logical pixels."""
-    return (
-        round(panel_origin[0] + cursor_now[0] - cursor_origin[0]),
-        round(panel_origin[1] + cursor_now[1] - cursor_origin[1]),
-    )
-
-
-def _hypr_cursor_position() -> Optional[tuple[float, float]]:
-    """Read Hyprland's global logical cursor position through bounded IPC.
-
-    Wayland intentionally gives GTK only surface-relative pointer coordinates.
-    That is unsuitable for moving the surface underneath an active gesture,
-    because the coordinate origin moves too.  Omarchy runs Hyprland, whose
-    owner-only command socket provides the stable compositor coordinate we
-    need without starting a process for every motion event.
-    """
-    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
-    instance = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
-    if (
-        not runtime or not instance or len(runtime) > 512 or len(instance) > 160
-        or not all(c.isalnum() or c in "._-" for c in instance)
-    ):
-        return None
-    path = Path(runtime) / "hypr" / instance / ".socket.sock"
-    try:
-        info = path.stat(follow_symlinks=False)
-        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
-            return None
-        with socket.socket(socket.AF_UNIX) as command:
-            command.settimeout(0.05)
-            command.connect(str(path))
-            if hasattr(socket, "SO_PEERCRED"):
-                raw = command.getsockopt(
-                    socket.SOL_SOCKET, socket.SO_PEERCRED,
-                    struct.calcsize("3i"),
-                )
-                _pid, uid, _gid = struct.unpack("3i", raw)
-                if uid != os.getuid():
-                    return None
-            command.sendall(b"j/cursorpos")
-            command.shutdown(socket.SHUT_WR)
-            reply = bytearray()
-            while len(reply) <= HYPR_CURSOR_REPLY_MAX:
-                chunk = command.recv(
-                    min(128, HYPR_CURSOR_REPLY_MAX + 1 - len(reply))
-                )
-                if not chunk:
-                    break
-                reply.extend(chunk)
-            if len(reply) > HYPR_CURSOR_REPLY_MAX:
-                return None
-        parsed = json.loads(reply)
-        if not isinstance(parsed, dict):
-            return None
-        values = parsed.get("x"), parsed.get("y")
-        if any(isinstance(value, bool) or not isinstance(value, (int, float))
-               for value in values):
-            return None
-        x, y = float(values[0]), float(values[1])
-        if not (-1_000_000 <= x <= 1_000_000 and -1_000_000 <= y <= 1_000_000):
-            return None
-        return x, y
-    except (OSError, ValueError, json.JSONDecodeError, struct.error):
-        return None
-
 # Composer's eight Core Image effects, then its own five. Both groups are
 # loaded from LUTs measured off Composer itself, so the descriptions below are
 # from measuring what each one does, not from marketing copy.
@@ -191,7 +118,7 @@ PANEL_CONFIG_MAX = 8 * 1024
 
 def _panel_pref(key: str, default):
     try:
-        value = _read_regular_json(PANEL_CONFIG, PANEL_CONFIG_MAX)
+        value = read_regular_json(PANEL_CONFIG, PANEL_CONFIG_MAX)
         return value.get(key, default) if isinstance(value, dict) else default
     except (OSError, ValueError):
         return default
@@ -199,13 +126,13 @@ def _panel_pref(key: str, default):
 
 def _save_panel_pref(key: str, value) -> None:
     try:
-        data = _read_regular_json(PANEL_CONFIG, PANEL_CONFIG_MAX)
+        data = read_regular_json(PANEL_CONFIG, PANEL_CONFIG_MAX)
         if not isinstance(data, dict):
             data = {}
     except (OSError, ValueError):
         data = {}
     data[key] = value
-    _atomic_write_json(PANEL_CONFIG, data, PANEL_CONFIG_MAX)
+    atomic_write_json(PANEL_CONFIG, data, PANEL_CONFIG_MAX)
 
 # Which modes can actually drive each control. Call mode reaches the camera
 # over V4L2; Studio mode runs different firmware where /dev/video0 does not
@@ -273,13 +200,6 @@ class _FlipPaintable(GObject.Object, Gdk.Paintable):
         snapshot.restore()
 
 
-def _preview_correction_flips(
-    want_mirrored: bool, send_horizontal: bool, send_vertical: bool
-) -> tuple[bool, bool]:
-    """Transform a SEND-oriented engine preview into the requested self-view."""
-    return bool(want_mirrored) ^ bool(send_horizontal), bool(send_vertical)
-
-
 class Preview(Gtk.Picture):
     """Live frames from the engine's preview socket.
 
@@ -342,7 +262,7 @@ class Preview(Gtk.Picture):
             self._show_frame(self._last_frame)
 
     def _show_frame(self, texture: Gdk.Paintable) -> None:
-        flip_h, flip_v = _preview_correction_flips(
+        flip_h, flip_v = preview_correction_flips(
             self.mirror_h, self.source_flip_h, self.source_flip_v
         )
         paintable = (
@@ -2902,14 +2822,14 @@ class App(Adw.Application):
             LayerShell.get_margin(self.window, LayerShell.Edge.LEFT),
             LayerShell.get_margin(self.window, LayerShell.Edge.TOP),
         )
-        self._drag_cursor_origin = _hypr_cursor_position()
+        self._drag_cursor_origin = hypr_cursor_position()
 
     def _on_drag_update(self, offset_x: float, offset_y: float) -> None:
         if not self._layer_surface or not self._left_anchored:
             return
-        cursor = _hypr_cursor_position()
+        cursor = hypr_cursor_position()
         if self._drag_cursor_origin is not None and cursor is not None:
-            position = _position_from_cursor(
+            position = position_from_cursor(
                 self._drag_panel_origin, self._drag_cursor_origin, cursor
             )
         else:

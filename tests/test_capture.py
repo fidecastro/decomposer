@@ -43,9 +43,13 @@ def test_daemon_finalizes_photo_when_panel_is_not_involved(
     monkeypatch.setattr(
         daemon_module, "_photo_target", lambda: (str(temporary), final)
     )
+    monkeypatch.setattr(
+        daemon_module.shutil, "which", lambda name: f"/opt/tools/bin/{name}"
+    )
 
     def capture(cmd, timeout, cap):
-        assert cmd[0] == "/usr/bin/ffmpeg"
+        # ffmpeg comes from PATH, as it does for the panel's recorder.
+        assert cmd[0] == "/opt/tools/bin/ffmpeg"
         assert timeout == 15
         Path(cmd[-1]).write_bytes(b"complete png")
         return {"code": 0, "stderr": ""}
@@ -69,6 +73,7 @@ def test_failed_daemon_capture_removes_partial_file(tmp_path, monkeypatch):
     monkeypatch.setattr(
         daemon_module, "_photo_target", lambda: (str(temporary), final)
     )
+    monkeypatch.setattr(daemon_module.shutil, "which", lambda name: "/usr/bin/ffmpeg")
     monkeypatch.setattr(
         daemon_module,
         "_run_bounded",
@@ -79,3 +84,33 @@ def test_failed_daemon_capture_removes_partial_file(tmp_path, monkeypatch):
     assert result == {"ok": False, "error": "RuntimeError: capture broke"}
     assert not temporary.exists()
     assert not final.exists()
+
+
+def test_missing_ffmpeg_is_a_clear_error_before_any_file_exists(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    daemon = Daemon()
+    daemon._engine = _LiveEngine()
+    monkeypatch.setattr(daemon_module.shutil, "which", lambda name: None)
+
+    def no_target():
+        raise AssertionError("no temporary file should be created")
+
+    monkeypatch.setattr(daemon_module, "_photo_target", no_target)
+    result = daemon.handle({"cmd": "capture_photo"})
+    assert result["ok"] is False
+    assert "ffmpeg" in result["error"]
+
+
+def test_photos_land_in_the_xdg_pictures_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "user-dirs.dirs").write_text(
+        'XDG_DESKTOP_DIR="$HOME/Desktop"\nXDG_PICTURES_DIR="$HOME/Bilder"\n'
+    )
+    temporary, final = daemon_module._photo_target()
+    assert final.parent == tmp_path / "Bilder" / "decomposer"
+    assert Path(temporary).parent == final.parent
+    Path(temporary).unlink()

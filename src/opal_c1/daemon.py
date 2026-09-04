@@ -24,10 +24,8 @@ import errno
 import json
 import os
 import queue
-import secrets
 import shutil
 import socket
-import stat
 import subprocess
 import sys
 import tempfile
@@ -40,6 +38,9 @@ from typing import Optional
 
 from opal_c1.core import health, model, presets as preset_codec, transitions
 from opal_c1.core.model import Mode
+from opal_c1.files import (
+    atomic_write_json, read_regular_json, unlink_regular, xdg_user_dir,
+)
 from opal_c1.modes import current_mode, wait_until_capturable
 from opal_c1.modes import camera_video_node  # engine input node discovery
 from opal_c1.ports import FrameSource
@@ -113,7 +114,6 @@ UNDO_STATE_FIELDS = (
     "mirror_h", "mirror_v", "zoom", "pan_x", "pan_y", "clahe",
 )
 
-FFMPEG_PATH = Path("/usr/bin/ffmpeg")
 CAPTURE_STDERR_MAX = 8192
 
 
@@ -154,7 +154,7 @@ def _run_bounded(cmd: list[str], timeout: float, cap: int = 8192) -> dict:
 
 def _photo_target() -> tuple[str, Path]:
     """Create a private temporary PNG and its final Pictures destination."""
-    out = Path.home() / "Pictures" / "decomposer"
+    out = xdg_user_dir("PICTURES", "Pictures") / "decomposer"
     if out.is_symlink():
         raise RuntimeError(f"{out} is a symlink; refusing to capture there")
     out.mkdir(parents=True, exist_ok=True)
@@ -211,91 +211,6 @@ def preset_state_file() -> Path:
 
 PRESET_JSON_MAX = 128 * 1024
 PRESET_STATE_MAX = 8 * 1024
-
-
-def _read_regular_json(path: Path, maximum: int):
-    """Read one bounded, owner-controlled regular file without following links."""
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(path, flags)
-    except OSError as e:
-        raise ValueError(f"cannot safely read {path}: {e.strerror}") from e
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-            raise ValueError(f"refusing non-regular or foreign-owned file {path}")
-        if info.st_size > maximum:
-            raise ValueError(f"{path} is larger than {maximum} bytes")
-        chunks, retained = [], 0
-        while True:
-            chunk = os.read(fd, min(16 * 1024, maximum + 1 - retained))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            retained += len(chunk)
-            if retained > maximum:
-                raise ValueError(f"{path} is larger than {maximum} bytes")
-        return json.loads(b"".join(chunks).decode("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as e:
-        raise ValueError(f"invalid JSON in {path}: {e}") from e
-    finally:
-        os.close(fd)
-
-
-def _atomic_write_json(path: Path, value, maximum: int) -> None:
-    """Publish a private JSON file atomically within a pinned directory."""
-    payload = (json.dumps(value, indent=2) + "\n").encode("utf-8")
-    if len(payload) > maximum:
-        raise ValueError(f"JSON for {path} is larger than {maximum} bytes")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    dir_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
-    dir_fd = os.open(path.parent, dir_flags)
-    temporary = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
-    fd = None
-    try:
-        try:
-            current = os.stat(path.name, dir_fd=dir_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            current = None
-        if current is not None and (
-            not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid()
-        ):
-            raise ValueError(f"refusing to replace unsafe file {path}")
-        fd = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
-            0o600,
-            dir_fd=dir_fd,
-        )
-        view = memoryview(payload)
-        while view:
-            written = os.write(fd, view)
-            view = view[written:]
-        os.fsync(fd)
-        os.close(fd)
-        fd = None
-        os.replace(temporary, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-        os.fsync(dir_fd)
-    finally:
-        if fd is not None:
-            os.close(fd)
-        with suppress(FileNotFoundError):
-            os.unlink(temporary, dir_fd=dir_fd)
-        os.close(dir_fd)
-
-
-def _unlink_regular(path: Path) -> None:
-    """Delete only an owned regular entry from the pinned preset directory."""
-    dir_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
-    dir_fd = os.open(path.parent, dir_flags)
-    try:
-        info = os.stat(path.name, dir_fd=dir_fd, follow_symlinks=False)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-            raise ValueError(f"refusing to delete unsafe preset file {path}")
-        os.unlink(path.name, dir_fd=dir_fd)
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
 
 
 def _preset_path(name: str, mode: str) -> Path:
@@ -431,7 +346,7 @@ class Daemon:
         if selection_file.exists() or selection_file.is_symlink():
             try:
                 self._last_presets = preset_codec.decode_last_used(
-                    _read_regular_json(selection_file, PRESET_STATE_MAX)
+                    read_regular_json(selection_file, PRESET_STATE_MAX)
                 )
             except ValueError as e:
                 print(f"preset selection ignored: {e}")
@@ -1399,17 +1314,15 @@ class Daemon:
             node = self.state.output
         if engine is None or not engine.alive():
             raise RuntimeError("no feed to photograph")
-        try:
-            info = FFMPEG_PATH.stat(follow_symlinks=False)
-        except OSError as e:
-            raise RuntimeError("/usr/bin/ffmpeg is unavailable") from e
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0:
-            raise RuntimeError("/usr/bin/ffmpeg is not a trusted system binary")
+        # Resolved on PATH, the same way the panel's recorder finds it.
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise RuntimeError("ffmpeg is not installed (or not on PATH)")
 
         tmp, final = _photo_target()
         result = _run_bounded(
             [
-                str(FFMPEG_PATH), "-y", "-nostats", "-loglevel", "error",
+                ffmpeg, "-y", "-nostats", "-loglevel", "error",
                 "-f", "v4l2", "-i", node, "-frames:v", "1", tmp,
             ],
             timeout=15,
@@ -1443,7 +1356,7 @@ class Daemon:
                 "version": preset_codec.VERSION,
                 "last_by_mode": dict(self._last_presets),
             }
-        _atomic_write_json(preset_state_file(), document, PRESET_STATE_MAX)
+        atomic_write_json(preset_state_file(), document, PRESET_STATE_MAX)
 
     def _restore_startup_preset(self, mode: str) -> None:
         """Prepare the last preset before the first engine/camera transition."""
@@ -1492,7 +1405,7 @@ class Daemon:
                 "controls": dict(self._snapshot.get("controls") or {}),
             }
         path = preset_dir() / mode / f"{name}.json"
-        _atomic_write_json(path, data, PRESET_JSON_MAX)
+        atomic_write_json(path, data, PRESET_JSON_MAX)
         self._remember_preset(mode, name)
         self._refresh_presets()
         out = self.status()
@@ -1518,7 +1431,7 @@ class Daemon:
         # The pure codec normalizes: unknown fields dropped, out-of-range
         # values clamped, and every such repair reported rather than silent.
         data, notes = preset_codec.decode(
-            _read_regular_json(path, PRESET_JSON_MAX)
+            read_regular_json(path, PRESET_JSON_MAX)
         )
 
         with self.lock:
@@ -1608,7 +1521,7 @@ class Daemon:
                 name = preset_codec.validate_name(path.stem)
                 if name in seen:
                     continue
-                data = _read_regular_json(path, PRESET_JSON_MAX)
+                data = read_regular_json(path, PRESET_JSON_MAX)
                 if not isinstance(data, dict):
                     continue
             except (OSError, ValueError):
@@ -1629,7 +1542,7 @@ class Daemon:
         if not path.exists() and not path.is_symlink():
             raise FileNotFoundError(f"no preset named {name!r}")
         mode = self.state.mode
-        _unlink_regular(path)
+        unlink_regular(path)
         if self._last_presets.get(mode) == name:
             self._remember_preset(mode, None)
         self._refresh_presets()

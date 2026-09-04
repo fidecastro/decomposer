@@ -1,13 +1,15 @@
-"""Coordinate math for dragging the movable layer surface."""
+"""Coordinate math for dragging the movable layer surface.
+
+Imports the toolkit-free module on purpose: the suite must not need GTK."""
 
 import socket
 import threading
 
-from opal_c1.gui import (
+from opal_c1.geometry import (
     HYPR_CURSOR_REPLY_MAX,
-    _hypr_cursor_position,
-    _position_from_cursor,
-    _preview_correction_flips,
+    hypr_cursor_position,
+    position_from_cursor,
+    preview_correction_flips,
 )
 
 
@@ -40,7 +42,7 @@ def _cursor_server(tmp_path, monkeypatch, reply: bytes):
 
 
 def test_drag_uses_compositor_cursor_delta_from_fixed_origins():
-    assert _position_from_cursor(
+    assert position_from_cursor(
         panel_origin=(1000, 400),
         cursor_origin=(1220, 450),
         cursor_now=(1460, 525),
@@ -50,14 +52,14 @@ def test_drag_uses_compositor_cursor_delta_from_fixed_origins():
 def test_drag_math_uses_wayland_logical_pixels_without_dpi_multiplier():
     # On a 2x output this 75-pixel logical move renders as 150 physical pixels
     # for both cursor and panel.  The layer margin must remain 75, not 150.
-    assert _position_from_cursor((400, 300), (100, 100), (175, 25)) == (475, 225)
+    assert position_from_cursor((400, 300), (100, 100), (175, 25)) == (475, 225)
 
 
 def test_self_preview_orientation_is_independent_of_send_flips():
     for want_mirrored in (False, True):
         for send_horizontal in (False, True):
             for send_vertical in (False, True):
-                correction_h, correction_v = _preview_correction_flips(
+                correction_h, correction_v = preview_correction_flips(
                     want_mirrored, send_horizontal, send_vertical
                 )
                 # The engine preview already contains SEND. Applying the local
@@ -69,7 +71,7 @@ def test_self_preview_orientation_is_independent_of_send_flips():
 def test_hypr_cursor_reader_accepts_small_owned_socket_reply(tmp_path, monkeypatch):
     thread = _cursor_server(tmp_path, monkeypatch, b'{"x": 123.5, "y": -40}\n')
     try:
-        assert _hypr_cursor_position() == (123.5, -40.0)
+        assert hypr_cursor_position() == (123.5, -40.0)
     finally:
         thread.join(timeout=1)
 
@@ -78,6 +80,6 @@ def test_hypr_cursor_reader_rejects_reply_over_limit(tmp_path, monkeypatch):
     reply = b'{"x": 1, "y": 2, "padding":"' + b"x" * HYPR_CURSOR_REPLY_MAX + b'"}'
     thread = _cursor_server(tmp_path, monkeypatch, reply)
     try:
-        assert _hypr_cursor_position() is None
+        assert hypr_cursor_position() is None
     finally:
         thread.join(timeout=1)

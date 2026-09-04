@@ -66,7 +66,7 @@ def test_linked_preset_is_neither_loaded_nor_deleted(daemon, tmp_path):
 
     with pytest.raises(ValueError, match="safely read"):
         daemon.load_preset("Linked")
-    with pytest.raises(ValueError, match="unsafe preset"):
+    with pytest.raises(ValueError, match="unsafe file"):
         daemon.delete_preset("Linked")
     assert target.exists()
 
