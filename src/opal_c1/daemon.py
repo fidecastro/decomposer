@@ -19,14 +19,16 @@ per request.
 
 from __future__ import annotations
 
+import copy
 import errno
 import json
 import os
-import shutil
 import queue
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from contextlib import suppress
@@ -36,9 +38,13 @@ from typing import Optional
 
 from opal_c1.core import health, model, presets as preset_codec, transitions
 from opal_c1.core.model import Mode
+from opal_c1.files import (
+    atomic_write_json, read_regular_json, unlink_regular, xdg_user_dir,
+)
 from opal_c1.modes import current_mode, wait_until_capturable
 from opal_c1.modes import camera_video_node  # engine input node discovery
 from opal_c1.ports import FrameSource
+from opal_c1.v4l2 import output_ready
 
 # The eight Core Image effects Composer exposed, then its five own looks.
 # Order is deliberate: it is the order they appear in the panel.
@@ -85,6 +91,80 @@ LOOKS = available_looks()
 # look then remembers whatever you dial in for it.
 DEFAULT_STRENGTH = 0.5
 
+# Undo/redo is intentionally a short, in-memory history of live adjustments.
+# It does not try to reverse hardware restarts, power changes, or file
+# operations such as deleting a preset. Those commands form a barrier and
+# discard stale snapshots whose camera/backend assumptions may no longer be
+# true.
+UNDO_LIMIT = 32
+UNDO_COALESCE_SECONDS = 0.8
+UNDOABLE_COMMANDS = frozenset({
+    "set_look", "set_model_strength", "set_blur", "set_background",
+    "set_overlay", "set_clahe", "set_zoom", "set_mirror", "set_camera",
+    "preset_load",
+})
+UNDO_BARRIER_COMMANDS = frozenset({
+    "set_mode", "set_models", "set_power", "set_fps", "set_resolution",
+    "preset_delete",
+})
+UNDO_STATE_FIELDS = (
+    "active_preset", "look", "strength", "look_strength",
+    "overlay", "overlay_x", "overlay_y", "overlay_w", "overlay_h",
+    "overlay_opacity", "blur", "blur_style", "background",
+    "mirror_h", "mirror_v", "zoom", "pan_x", "pan_y", "clahe",
+)
+
+CAPTURE_STDERR_MAX = 8192
+
+
+def _run_bounded(cmd: list[str], timeout: float, cap: int = 8192) -> dict:
+    """Run a producer with a real deadline and capped retained stderr."""
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+    )
+    tail = bytearray()
+
+    def drain() -> None:
+        assert proc.stderr is not None
+        for chunk in iter(lambda: proc.stderr.read(4096), b""):
+            tail.extend(chunk)
+            if len(tail) > cap:
+                del tail[:-cap]
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        with suppress(Exception):
+            proc.wait(timeout=5)
+    finally:
+        reader.join(timeout=5)
+        with suppress(Exception):
+            if proc.stderr is not None:
+                proc.stderr.close()
+    return {
+        "code": -1 if timed_out else proc.returncode,
+        "stderr": bytes(tail).decode("utf-8", "replace"),
+    }
+
+
+def _photo_target() -> tuple[str, Path]:
+    """Create a private temporary PNG and its final Pictures destination."""
+    out = xdg_user_dir("PICTURES", "Pictures") / "decomposer"
+    if out.is_symlink():
+        raise RuntimeError(f"{out} is a symlink; refusing to capture there")
+    out.mkdir(parents=True, exist_ok=True)
+    if out.is_symlink() or not out.is_dir():
+        raise RuntimeError(f"{out} is not a real directory")
+    final = out / (time.strftime("photo-%Y%m%d-%H%M%S") + ".png")
+    fd, tmp = tempfile.mkstemp(dir=out, prefix=".part-", suffix=".png")
+    os.close(fd)
+    return tmp, final
+
 def runtime_dir() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/decomposer-{os.getuid()}"
     d = Path(base) / "decomposer"
@@ -124,6 +204,15 @@ def preset_dir() -> Path:
     return d
 
 
+def preset_state_file() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    return Path(base) / "decomposer" / "preset-state.json"
+
+
+PRESET_JSON_MAX = 128 * 1024
+PRESET_STATE_MAX = 8 * 1024
+
+
 def _preset_path(name: str, mode: str) -> Path:
     """Resolve a preset name to a file. Validation lives in the pure core.
 
@@ -133,10 +222,10 @@ def _preset_path(name: str, mode: str) -> Path:
     """
     name = preset_codec.validate_name(name)
     namespaced = preset_dir() / mode / f"{name}.json"
-    if namespaced.is_file():
+    if namespaced.exists() or namespaced.is_symlink():
         return namespaced
     legacy = preset_dir() / f"{name}.json"
-    if legacy.is_file():
+    if legacy.exists() or legacy.is_symlink():
         return legacy
     return namespaced
 
@@ -144,6 +233,7 @@ def _preset_path(name: str, mode: str) -> Path:
 @dataclass
 class State:
     mode: str = Mode.CALL.value
+    active_preset: Optional[str] = None
     look: str = "none"
     strength: float = 1.0
     # Intensity is remembered per look. Composer's filters carry their own
@@ -152,6 +242,7 @@ class State:
     width: int = 1920
     height: int = 1080
     output: str = "/dev/video10"
+    normal_output: str = "/dev/video11"
     overlay: Optional[str] = None
     blur: float = 0.0
     blur_style: int = 0
@@ -184,14 +275,16 @@ class State:
 
 class Daemon:
     def __init__(
-        self, output="/dev/video10", width=1920, height=1080, fps=30.0,
+        self, output="/dev/video10", normal_output="/dev/video11",
+        width=1920, height=1080, fps=30.0,
         tray_enabled: bool = False,
         default_strength: float = DEFAULT_STRENGTH,
         in_width: int = 0, in_height: int = 0,
         seg_model: Optional[str] = None, seg_device: Optional[str] = None,
     ):
         self.state = State(
-            output=output, width=width, height=height,
+            output=output, normal_output=normal_output,
+            width=width, height=height,
             in_width=in_width, in_height=in_height,
         )
         self.tray_enabled = tray_enabled
@@ -244,8 +337,19 @@ class Daemon:
         # status() must never touch hardware: a poller keeps this snapshot
         # fresh and status reads it. See _status_poller.
         self._snapshot = {"controls": {}, "mode_actual": None}
+        self._undo_history: list[dict] = []
+        self._redo_history: list[dict] = []
         self._preset_cache: Optional[list] = None
         self._looks_cache: list = available_looks()
+        self._last_presets: dict[str, str] = {}
+        selection_file = preset_state_file()
+        if selection_file.exists() or selection_file.is_symlink():
+            try:
+                self._last_presets = preset_codec.decode_last_used(
+                    read_regular_json(selection_file, PRESET_STATE_MAX)
+                )
+            except ValueError as e:
+                print(f"preset selection ignored: {e}")
 
     # -- engine ---------------------------------------------------------
 
@@ -276,6 +380,12 @@ class Daemon:
         return model.EngineConfig(
             input="-" if from_stdin else (camera_video_node() or "/dev/video0"),
             output=st.output,
+            # Handed over only when the node answers as a video output: a
+            # missing node, or a real camera that landed on /dev/video11,
+            # leaves the engine publishing SEND alone rather than failing.
+            normal_output=(
+                st.normal_output if output_ready(st.normal_output) else None
+            ),
             width=st.width,
             height=st.height,
             look=st.look,
@@ -533,6 +643,8 @@ class Daemon:
 
         self._teardown()
         with self.lock:
+            if self.state.mode != Mode.CALL.value:
+                self.state.active_preset = None
             self.state.mode = Mode.CALL.value
             self.state.error = None
         # Leaving Studio mode reboots the camera; /dev/video0 takes ~14s.
@@ -580,6 +692,8 @@ class Daemon:
 
         self._teardown()
         with self.lock:
+            if self.state.mode != Mode.STUDIO.value:
+                self.state.active_preset = None
             self.state.mode = Mode.STUDIO.value
             self.state.error = None
         # The device delivers the capture size, which may exceed the output.
@@ -940,6 +1054,10 @@ class Daemon:
                 refused.update(denied)
         with self.lock:
             self.state.controls.update(applied)
+            # Publish accepted hardware values immediately. The poller will
+            # refresh them later, but undo/redo snapshots taken at this IPC
+            # boundary must not capture the pre-request readback.
+            self._snapshot.setdefault("controls", {}).update(applied)
             for key, value in applied.items():
                 if key in model.STICKY_CONTROLS:
                     self._sticky[key] = value
@@ -949,16 +1067,323 @@ class Daemon:
             out["refused"] = refused
         return out
 
+    # -- undo / redo -----------------------------------------------------
+
+    def _undo_snapshot(self) -> dict:
+        """Capture only state that can be restored live and safely.
+
+        Restart-level configuration is deliberately absent.  Model membership
+        is a barrier, so only the live strengths need to be retained here.
+
+        For the camera, `sticky` is what gets restored: the user's explicit
+        requests, with absence meaning automatic. The hardware readback is
+        kept only as the previous value of plain sliders that have no
+        automatic mode. It is never re-applied wholesale - under
+        auto-exposure the readback carries exposure/iso, and re-sending those
+        would pin the camera to manual at whatever it happened to report.
+        """
+        with self.lock:
+            readback = self._snapshot.get("controls") or {}
+            return {
+                "state": {
+                    name: copy.deepcopy(getattr(self.state, name))
+                    for name in UNDO_STATE_FIELDS
+                },
+                "models": [
+                    (m.get("path"), m.get("device"), m.get("strength", 1.0))
+                    for m in self.state.models
+                ],
+                "controls": {
+                    key: copy.deepcopy(value)
+                    for key, value in readback.items()
+                    if key in model.STICKY_CONTROLS
+                },
+                "sticky": copy.deepcopy(self._sticky),
+            }
+
+    @staticmethod
+    def _undo_relevant(snapshot: dict) -> tuple:
+        """The parts of a snapshot whose change makes a request undoable.
+
+        The hardware readback is left out: it drifts on its own (auto
+        exposure hunting between two snapshots) and must not create
+        history entries for requests that changed nothing.
+        """
+        return snapshot["state"], snapshot["models"], snapshot["sticky"]
+
+    @staticmethod
+    def _undo_key(req: dict) -> tuple:
+        cmd = str(req.get("cmd"))
+        if cmd == "set_camera":
+            return (cmd, *sorted((req.get("values") or {}).keys()))
+        if cmd == "set_overlay":
+            return (cmd, *sorted((req.get("values") or {}).keys()))
+        if cmd == "set_zoom":
+            return (cmd, *(k for k in ("zoom", "pan_x", "pan_y") if k in req))
+        if cmd == "set_look":
+            return (cmd, "look" if req.get("look") is not None else "strength")
+        if cmd == "set_mirror":
+            return (
+                cmd,
+                *(k for k in ("horizontal", "vertical") if k in req),
+            )
+        if cmd == "set_model_strength":
+            return (cmd, req.get("index"))
+        return (cmd,)
+
+    @staticmethod
+    def _undo_label(req: dict) -> str:
+        cmd = req.get("cmd")
+        if cmd == "set_camera":
+            names = list((req.get("values") or {}).keys())
+            return ", ".join(name.replace("_", " ") for name in names) or "camera adjustment"
+        if cmd == "set_look":
+            return "look" if req.get("look") is not None else "look strength"
+        if cmd == "set_model_strength":
+            return "model strength"
+        if cmd == "set_blur":
+            return "background blur"
+        if cmd == "set_background":
+            return "background"
+        if cmd == "set_overlay":
+            return "overlay"
+        if cmd == "set_clahe":
+            return "clarity"
+        if cmd == "set_zoom":
+            return "framing"
+        if cmd == "set_mirror":
+            return "published flip"
+        if cmd == "preset_load":
+            return f"preset {req.get('name', '')}".rstrip()
+        return "adjustment"
+
+    def _record_undo(
+        self, req: dict, before: dict, after: dict, touched: list
+    ) -> None:
+        """Remember `before` as the state to return to.
+
+        `touched` names the camera controls the request applied; undoing the
+        entry restores exactly those, and nothing else about the camera.
+        """
+        if self._undo_relevant(before) == self._undo_relevant(after):
+            return
+        now = time.monotonic()
+        key = self._undo_key(req)
+        label = self._undo_label(req)
+        with self.lock:
+            # Once the user branches from an undone state, the old forward
+            # path is no longer truthful and must disappear.
+            self._redo_history.clear()
+            if (
+                self._undo_history
+                and self._undo_history[-1]["key"] == key
+                and now - self._undo_history[-1]["at"] <= UNDO_COALESCE_SECONDS
+            ):
+                # A slider drag emits several requests.  Keep the state from
+                # before the drag and merely extend its coalescing window.
+                entry = self._undo_history[-1]
+                entry["at"] = now
+                entry["label"] = label
+                entry["touched"] = sorted(set(entry["touched"]) | set(touched))
+                if self._undo_relevant(entry["snapshot"]) == self._undo_relevant(after):
+                    self._undo_history.pop()
+                return
+            self._undo_history.append({
+                "cmd": req.get("cmd"), "key": key, "label": label,
+                "at": now, "snapshot": before, "touched": sorted(touched),
+            })
+            del self._undo_history[:-UNDO_LIMIT]
+
+    def _clear_undo(self) -> None:
+        """Clear both directions at a restart/file-operation barrier."""
+        with self.lock:
+            self._undo_history.clear()
+            self._redo_history.clear()
+
+    def _restore_history(
+        self,
+        source: list[dict],
+        destination: list[dict],
+        result_key: str,
+    ) -> dict:
+        with self.lock:
+            if not source:
+                out = self.status()
+                out[result_key] = None
+                return out
+            entry = source.pop()
+            reverse = dict(entry)
+            reverse["snapshot"] = self._undo_snapshot()
+            # A history traversal is a discrete gesture. A rapid adjustment
+            # after Redo must not coalesce back through that boundary.
+            reverse["at"] = 0.0
+            destination.append(reverse)
+            del destination[:-UNDO_LIMIT]
+            snapshot = entry["snapshot"]
+            touched = list(entry.get("touched") or [])
+            current_mode = self.state.mode
+            old_active = self.state.active_preset
+            for name, value in snapshot["state"].items():
+                # Saving a preset after an adjustment changes the selection,
+                # but it is not itself an adjustment.  An older undo step must
+                # not roll that later selection back.  Preset loading is the
+                # one history entry that deliberately restores selection too.
+                if name == "active_preset" and entry["cmd"] != "preset_load":
+                    continue
+                setattr(self.state, name, copy.deepcopy(value))
+
+            saved_models = snapshot["models"]
+            for index, model_state in enumerate(saved_models):
+                if index >= len(self.state.models):
+                    break
+                path, device, strength = model_state
+                current = self.state.models[index]
+                if (current.get("path"), current.get("device")) == (path, device):
+                    current["strength"] = strength
+
+            backend = self._backend
+            previous_sticky = copy.deepcopy(snapshot["sticky"])
+            # Only the controls this request touched go back, each to the
+            # user's earlier request for it or to automatic. The rest of the
+            # camera is not part of this entry and stays exactly as it is.
+            values, unknown = model.restore_values(
+                touched, previous_sticky, snapshot["controls"]
+            )
+
+        applied, refused = {}, {}
+        for key in unknown:
+            refused[key] = "no earlier value is known"
+        for key in list(values):
+            why = model.refusal_reason(Mode(current_mode), key)
+            if why:
+                refused[key] = why
+                del values[key]
+        if values:
+            if backend is None:
+                for key in values:
+                    refused[key] = "no camera attached (mode transition in progress?)"
+            else:
+                try:
+                    applied, denied = backend.apply_controls(values)
+                    refused.update(denied)
+                except Exception as e:
+                    refused["camera controls"] = str(e)
+
+        with self.lock:
+            for key, value in applied.items():
+                self.state.controls[key] = value
+                self._snapshot.setdefault("controls", {})[key] = value
+                if key not in model.STICKY_CONTROLS:
+                    continue
+                # Intent follows the hardware: a key the user had never set
+                # is automatic again, so status reports auto only when the
+                # camera really is.
+                if key in previous_sticky:
+                    self._sticky[key] = previous_sticky[key]
+                else:
+                    self._sticky.pop(key, None)
+        self._sync_engine()
+
+        active = snapshot["state"].get("active_preset")
+        if entry["cmd"] == "preset_load" and active != old_active:
+            self._remember_preset(current_mode, active)
+
+        out = self.status()
+        out[result_key] = entry["label"]
+        if refused:
+            out["notes"] = [
+                f"{key} could not be restored: {why}"
+                for key, why in refused.items()
+            ]
+        return out
+
+    def undo(self) -> dict:
+        return self._restore_history(
+            self._undo_history, self._redo_history, "undone"
+        )
+
+    def redo(self) -> dict:
+        return self._restore_history(
+            self._redo_history, self._undo_history, "redone"
+        )
+
+    def capture_photo(self) -> dict:
+        """Capture and finalize a still in the daemon, not the replaceable UI."""
+        with self.lock:
+            engine = self._engine
+            node = self.state.output
+        if engine is None or not engine.alive():
+            raise RuntimeError("no feed to photograph")
+        # Resolved on PATH, the same way the panel's recorder finds it.
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise RuntimeError("ffmpeg is not installed (or not on PATH)")
+
+        tmp, final = _photo_target()
+        result = _run_bounded(
+            [
+                ffmpeg, "-y", "-nostats", "-loglevel", "error",
+                "-f", "v4l2", "-i", node, "-frames:v", "1", tmp,
+            ],
+            timeout=15,
+            cap=CAPTURE_STDERR_MAX,
+        )
+        if result.get("code") != 0 or not os.path.isfile(tmp):
+            with suppress(OSError):
+                os.unlink(tmp)
+            tail = (result.get("stderr") or "").strip().splitlines()
+            raise RuntimeError(tail[-1] if tail else "ffmpeg failed")
+        try:
+            os.replace(tmp, final)
+        except OSError:
+            with suppress(OSError):
+                os.unlink(tmp)
+            raise
+        return {"saved": str(final)}
+
     # -- presets ---------------------------------------------------------
+
+    def _remember_preset(self, mode: str, name: Optional[str]) -> None:
+        """Persist the last successful preset selection for one firmware mode."""
+        with self.lock:
+            if name is None:
+                self._last_presets.pop(mode, None)
+            else:
+                self._last_presets[mode] = preset_codec.validate_name(name)
+            if self.state.mode == mode:
+                self.state.active_preset = name
+            document = {
+                "version": preset_codec.VERSION,
+                "last_by_mode": dict(self._last_presets),
+            }
+        atomic_write_json(preset_state_file(), document, PRESET_STATE_MAX)
+
+    def _restore_startup_preset(self, mode: str) -> None:
+        """Prepare the last preset before the first engine/camera transition."""
+        with self.lock:
+            self.state.mode = Mode(mode).value
+            name = self._last_presets.get(mode)
+        if not name:
+            return
+        try:
+            restored = self.load_preset(name, startup=True)
+            notes = restored.get("notes") or []
+            detail = f" ({'; '.join(notes)})" if notes else ""
+            print(f"restored {mode} preset {name!r} for startup{detail}")
+        except Exception as e:
+            print(f"startup preset {name!r} ignored: {type(e).__name__}: {e}")
+            self._remember_preset(mode, None)
 
     def save_preset(self, name: str) -> dict:
         """Capture the current look, framing and camera settings under a name."""
+        name = preset_codec.validate_name(name)
         with self.lock:
             st = self.state
+            mode = st.mode
             data = {
-                "version": 1,
+                "version": preset_codec.VERSION,
                 "name": name,
-                "mode": st.mode,
+                "mode": mode,
                 "look": st.look,
                 "strength": st.strength,
                 "look_strength": dict(st.look_strength),
@@ -979,15 +1404,17 @@ class Daemon:
                 },
                 "controls": dict(self._snapshot.get("controls") or {}),
             }
-        path = preset_dir() / st.mode / f"{preset_codec.validate_name(name)}.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2) + "\n")
+        path = preset_dir() / mode / f"{name}.json"
+        atomic_write_json(path, data, PRESET_JSON_MAX)
+        self._remember_preset(mode, name)
         self._refresh_presets()
         out = self.status()
         out["preset_saved"] = str(path)
         return out
 
-    def load_preset(self, name: str, with_mode: bool = False) -> dict:
+    def load_preset(
+        self, name: str, with_mode: bool = False, startup: bool = False
+    ) -> dict:
         """Apply a saved preset.
 
         The mode is recorded but not switched into unless asked: switching
@@ -995,14 +1422,17 @@ class Daemon:
         something a preset should do to you by surprise. Controls the current
         mode cannot reach are reported rather than silently dropped.
         """
+        name = preset_codec.validate_name(name)
         path = _preset_path(name, self.state.mode)
-        if not path.is_file():
+        if not path.exists() and not path.is_symlink():
             raise FileNotFoundError(
                 f"no preset named {name!r} for {self.state.mode} mode"
             )
         # The pure codec normalizes: unknown fields dropped, out-of-range
         # values clamped, and every such repair reported rather than silent.
-        data, notes = preset_codec.decode(json.loads(path.read_text()))
+        data, notes = preset_codec.decode(
+            read_regular_json(path, PRESET_JSON_MAX)
+        )
 
         with self.lock:
             self.state.look_strength.update(data.get("look_strength") or {})
@@ -1051,13 +1481,28 @@ class Daemon:
                 )
 
         controls = data.get("controls") or {}
+        reached: dict = {}
         if controls:
-            applied = self.set_camera(**controls)
-            for key, why in (applied.get("refused") or {}).items():
-                notes.append(f"{key} skipped: {why}")
+            if startup:
+                # Mode entry replays this intent after the firmware and its
+                # backend exist. Regions are deliberately not sticky.
+                with self.lock:
+                    self._sticky.update({
+                        key: value for key, value in controls.items()
+                        if key in model.STICKY_CONTROLS
+                    })
+            else:
+                applied = self.set_camera(**controls)
+                reached = applied.get("applied") or {}
+                for key, why in (applied.get("refused") or {}).items():
+                    notes.append(f"{key} skipped: {why}")
 
+        self._remember_preset(self.state.mode, name)
         out = self.status()
         out["preset_loaded"] = name
+        # What reached the camera, so an undo of this load knows which
+        # controls to restore.
+        out["applied"] = reached
         if notes:
             out["notes"] = notes
         return out
@@ -1065,15 +1510,25 @@ class Daemon:
     def list_presets(self) -> list[dict]:
         """Presets for the current mode, plus legacy un-namespaced ones."""
         mode_dir = preset_dir() / self.state.mode
-        paths = sorted(mode_dir.glob("*.json")) + sorted(preset_dir().glob("*.json"))
+        paths = (
+            sorted(mode_dir.glob("*.json"))
+            + sorted(preset_dir().glob("*.json"))
+        )[:256]
         found = []
+        seen = set()
         for path in paths:
             try:
-                data = json.loads(path.read_text())
+                name = preset_codec.validate_name(path.stem)
+                if name in seen:
+                    continue
+                data = read_regular_json(path, PRESET_JSON_MAX)
+                if not isinstance(data, dict):
+                    continue
             except (OSError, ValueError):
                 continue
+            seen.add(name)
             found.append({
-                "name": path.stem,
+                "name": name,
                 "look": data.get("look"),
                 "strength": data.get("strength"),
                 "mode": data.get("mode"),
@@ -1082,12 +1537,18 @@ class Daemon:
         return found
 
     def delete_preset(self, name: str) -> dict:
+        name = preset_codec.validate_name(name)
         path = _preset_path(name, self.state.mode)
-        if not path.is_file():
+        if not path.exists() and not path.is_symlink():
             raise FileNotFoundError(f"no preset named {name!r}")
-        path.unlink()
+        mode = self.state.mode
+        unlink_regular(path)
+        if self._last_presets.get(mode) == name:
+            self._remember_preset(mode, None)
         self._refresh_presets()
-        return {"deleted": name}
+        out = self.status()
+        out["deleted"] = name
+        return out
 
     # -- status ---------------------------------------------------------
 
@@ -1223,6 +1684,13 @@ class Daemon:
         s["mode_actual"] = snapshot.get("mode_actual")
         engine = self._engine
         s["engine_alive"] = engine is not None and engine.alive()
+        # The normal node is optional: this says whether the running engine
+        # was given one, so nobody reports a feed that is not there.
+        s["normal_active"] = bool(
+            s["engine_alive"]
+            and engine.config is not None
+            and engine.config.normal_output
+        )
         with self.lock:
             s["looks"] = list(self._looks_cache)
         s["restarts"] = self.restarts
@@ -1233,6 +1701,14 @@ class Daemon:
             )
         with self.lock:
             s["transitioning"] = self._ledger.in_progress
+            s["can_undo"] = bool(self._undo_history)
+            s["undo_label"] = (
+                self._undo_history[-1]["label"] if self._undo_history else None
+            )
+            s["can_redo"] = bool(self._redo_history)
+            s["redo_label"] = (
+                self._redo_history[-1]["label"] if self._redo_history else None
+            )
         with self.lock:
             cached = self._preset_cache
         s["presets"] = [p["name"] for p in (cached or [])]
@@ -1416,63 +1892,107 @@ class Daemon:
     def handle(self, req: dict) -> dict:
         cmd = req.get("cmd")
         try:
-            if cmd == "status":
-                return {"ok": True, **self.status()}
-            if cmd == "looks":
-                return {"ok": True, "looks": LOOKS}
-            if cmd == "set_look":
-                return {"ok": True, **self.set_look(req.get("look"), req.get("strength"))}
-            if cmd == "set_mode":
-                return {"ok": True, **self.set_mode(req.get("mode", "call"))}
-            if cmd == "preset_save":
-                return {"ok": True, **self.save_preset(req["name"])}
-            if cmd == "preset_load":
-                return {"ok": True, **self.load_preset(
-                    req["name"], bool(req.get("with_mode"))
-                )}
-            if cmd == "preset_list":
-                return {"ok": True, "presets": self.list_presets()}
-            if cmd == "preset_delete":
-                return {"ok": True, **self.delete_preset(req["name"])}
-            if cmd == "set_models":
-                return {"ok": True, **self.set_models(req.get("models"))}
-            if cmd == "set_model_strength":
-                return {"ok": True, **self.set_model_strength(
-                    req.get("index"), req.get("strength"))}
-            if cmd == "set_power":
-                return {"ok": True, **self.set_power(bool(req.get("on")))}
-            if cmd == "set_fps":
-                return {"ok": True, **self.set_fps(req.get("fps"))}
-            if cmd == "set_blur":
-                return {"ok": True, **self.set_blur(
-                    req.get("strength"), req.get("style"))}
-            if cmd == "set_background":
-                return {"ok": True, **self.set_background(req.get("path"))}
-            if cmd == "set_overlay":
-                return {"ok": True, **self.set_overlay(**req.get("values", {}))}
-            if cmd == "set_resolution":
-                return {"ok": True, **self.set_resolution(
-                    req["width"], req["height"],
-                    req.get("in_width", 0), req.get("in_height", 0),
-                )}
-            if cmd == "set_clahe":
-                return {"ok": True, **self.set_clahe(req.get("strength", 0.0))}
-            if cmd == "set_zoom":
-                return {"ok": True, **self.set_zoom(
-                    req.get("zoom"), req.get("pan_x"), req.get("pan_y")
-                )}
-            if cmd == "set_mirror":
-                return {"ok": True, **self.set_mirror(
-                    req.get("horizontal"), req.get("vertical")
-                )}
-            if cmd == "set_camera":
-                return {"ok": True, **self.set_camera(**req.get("values", {}))}
-            if cmd == "stop":
-                self._shutdown.set()
-                return {"ok": True, "stopping": True}
-            return {"ok": False, "error": f"unknown command {cmd!r}"}
+            undoable = (
+                cmd in UNDOABLE_COMMANDS
+                and not (cmd == "preset_load" and bool(req.get("with_mode")))
+            )
+            before = self._undo_snapshot() if undoable else None
+            response = self._dispatch(req)
+            if response.get("ok"):
+                if undoable and before is not None:
+                    # The camera controls a request actually reached, as
+                    # reported by the backend; regions are moments rather
+                    # than policies and are never restored.
+                    touched = [
+                        key for key in (response.get("applied") or {})
+                        if key in model.STICKY_CONTROLS
+                    ]
+                    self._record_undo(
+                        req, before, self._undo_snapshot(), touched
+                    )
+                elif cmd in UNDO_BARRIER_COMMANDS or (
+                    cmd == "preset_load" and bool(req.get("with_mode"))
+                ):
+                    self._clear_undo()
+                with self.lock:
+                    response["can_undo"] = bool(self._undo_history)
+                    response["undo_label"] = (
+                        self._undo_history[-1]["label"]
+                        if self._undo_history else None
+                    )
+                    response["can_redo"] = bool(self._redo_history)
+                    response["redo_label"] = (
+                        self._redo_history[-1]["label"]
+                        if self._redo_history else None
+                    )
+            return response
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    def _dispatch(self, req: dict) -> dict:
+        """Execute one already-decoded request; history wraps this boundary."""
+        cmd = req.get("cmd")
+        if cmd == "status":
+            return {"ok": True, **self.status()}
+        if cmd == "looks":
+            return {"ok": True, "looks": LOOKS}
+        if cmd == "undo":
+            return {"ok": True, **self.undo()}
+        if cmd == "redo":
+            return {"ok": True, **self.redo()}
+        if cmd == "capture_photo":
+            return {"ok": True, **self.capture_photo()}
+        if cmd == "set_look":
+            return {"ok": True, **self.set_look(req.get("look"), req.get("strength"))}
+        if cmd == "set_mode":
+            return {"ok": True, **self.set_mode(req.get("mode", "call"))}
+        if cmd == "preset_save":
+            return {"ok": True, **self.save_preset(req["name"])}
+        if cmd == "preset_load":
+            return {"ok": True, **self.load_preset(
+                req["name"], bool(req.get("with_mode"))
+            )}
+        if cmd == "preset_list":
+            return {"ok": True, "presets": self.list_presets()}
+        if cmd == "preset_delete":
+            return {"ok": True, **self.delete_preset(req["name"])}
+        if cmd == "set_models":
+            return {"ok": True, **self.set_models(req.get("models"))}
+        if cmd == "set_model_strength":
+            return {"ok": True, **self.set_model_strength(
+                req.get("index"), req.get("strength"))}
+        if cmd == "set_power":
+            return {"ok": True, **self.set_power(bool(req.get("on")))}
+        if cmd == "set_fps":
+            return {"ok": True, **self.set_fps(req.get("fps"))}
+        if cmd == "set_blur":
+            return {"ok": True, **self.set_blur(
+                req.get("strength"), req.get("style"))}
+        if cmd == "set_background":
+            return {"ok": True, **self.set_background(req.get("path"))}
+        if cmd == "set_overlay":
+            return {"ok": True, **self.set_overlay(**req.get("values", {}))}
+        if cmd == "set_resolution":
+            return {"ok": True, **self.set_resolution(
+                req["width"], req["height"],
+                req.get("in_width", 0), req.get("in_height", 0),
+            )}
+        if cmd == "set_clahe":
+            return {"ok": True, **self.set_clahe(req.get("strength", 0.0))}
+        if cmd == "set_zoom":
+            return {"ok": True, **self.set_zoom(
+                req.get("zoom"), req.get("pan_x"), req.get("pan_y")
+            )}
+        if cmd == "set_mirror":
+            return {"ok": True, **self.set_mirror(
+                req.get("horizontal"), req.get("vertical")
+            )}
+        if cmd == "set_camera":
+            return {"ok": True, **self.set_camera(**req.get("values", {}))}
+        if cmd == "stop":
+            self._shutdown.set()
+            return {"ok": True, "stopping": True}
+        return {"ok": False, "error": f"unknown command {cmd!r}"}
 
     def _serve_client(self, conn: socket.socket) -> None:
         with conn, conn.makefile("rwb") as f:
@@ -1583,6 +2103,11 @@ class Daemon:
         except Exception as e:
             print(f"usb hotplug watcher not started: {e}")
         self._start_tray()
+
+        # Load the last named configuration before the first engine starts,
+        # avoiding a flash of defaults. Camera controls are staged as sticky
+        # intent and replayed once the requested firmware backend is attached.
+        self._restore_startup_preset(initial_mode)
 
         # Entering the initial mode takes seconds to minutes when the camera
         # is settling; clients must be able to ask what is happening from the

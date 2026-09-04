@@ -107,11 +107,15 @@ def css(t: Theme) -> str:
     bg_dark = t.color("dark_background", bg)
     bg_light = t.color("lighter_background")
     fg = t.color("foreground")
-    fg_dim = t.color("dark_foreground")
+    # Several themes use dark_foreground/muted for non-text decoration.  On a
+    # dark panel those values can be below readable text contrast (Nord's
+    # muted colour is a concrete example), so secondary *text* starts from the
+    # theme's light foreground instead.
+    fg_dim = t.color("light_foreground", t.color("dark_foreground", fg))
     fg_bright = t.color("bright_foreground", fg)
     accent = t.color("accent")
     sel = t.color("selection")
-    muted = t.color("muted")
+    muted = t.color("light_foreground", fg_dim)
     red = t.color("red")
     green = t.color("green")
 
@@ -128,7 +132,12 @@ def css(t: Theme) -> str:
         color: {fg};
     }}
 
-    .dc-header {{ padding: 7px 10px 5px 10px; }}
+    .dc-header {{ padding: 6px 10px; }}
+    .dc-drag {{
+        color: {fg_dim}; padding: 4px 2px 0 2px; min-width: 12px;
+        font-size: {small + 1.0:.1f}pt;
+    }}
+    .dc-drag:hover {{ color: {accent}; }}
     .dc-title {{ font-weight: 700; color: {fg_bright}; font-size: {small:.1f}pt; }}
     .dc-sub {{ color: {muted}; font-size: {small - 1.5:.1f}pt; }}
     .dc-section {{
@@ -159,21 +168,31 @@ def css(t: Theme) -> str:
 
     button.dc-tiny {{
         background: transparent; color: {muted};
-        border: 1px solid {sel}; border-radius: 5px;
+        border: 1px solid {sel}; border-radius: 6px;
         padding: 0 6px; margin: 0; min-height: 0; min-width: 0;
-        font-size: {small - 2.0:.1f}pt; font-weight: 600;
+        font-size: {small - 1.0:.1f}pt; font-weight: 600;
     }}
     button.dc-tiny:hover {{ color: {fg_bright}; border-color: {accent}; }}
     button.dc-tiny.selected {{ background: {accent}; color: {bg_dark}; border-color: {accent}; }}
     button.dc-tiny:disabled {{ color: {muted}; opacity: 0.4; }}
 
-    .dc-pill {{
-        border-radius: 5px; padding: 1px 7px; font-weight: 700;
-        font-size: {small - 2.0:.1f}pt;
+    /* Popovers sit over a dimmed parent, so their own text and actions need a
+       fully opaque contrast treatment.  This class is shared by confirmations,
+       the model chooser, and preset naming. */
+    popover.dc-popover > contents {{
+        background: {bg_light}; color: {fg_bright};
+        border: 1px solid {accent}; border-radius: 9px;
     }}
-    .dc-pill.call {{ background: {green}; color: {bg_dark}; }}
-    .dc-pill.studio {{ background: {accent}; color: {bg_dark}; }}
-    .dc-pill.off {{ background: {muted}; color: {bg_dark}; }}
+    popover.dc-popover label,
+    popover.dc-popover .dc-hint,
+    popover.dc-popover .dc-label {{ color: {fg_bright}; opacity: 1; }}
+    popover.dc-popover button.dc-chip {{
+        background: {sel}; color: {fg_bright};
+        border-color: alpha({accent}, 0.65); opacity: 1;
+    }}
+    popover.dc-popover button.dc-chip:hover {{
+        background: {accent}; color: {bg_dark};
+    }}
 
     .dc-warn {{ color: {red}; font-size: {small - 1.5:.1f}pt; }}
 
@@ -184,9 +203,8 @@ def css(t: Theme) -> str:
     .dc-clickable:hover {{ color: {accent}; }}
 
     /* Capture: countdown numeral, REC badge, and the shutter flash. */
-    /* The capture button earns its size: it is the one that acts. */
     button.dc-cap {{
-        font-size: {small + 4.0:.1f}pt;
+        font-size: {small + 2.0:.1f}pt;
         padding: 0px 10px;
         min-height: 26px;
         border-radius: 6px;
@@ -196,7 +214,15 @@ def css(t: Theme) -> str:
     }}
     button.dc-cap:hover {{ color: {red}; border-color: alpha({red}, 0.6); }}
 
-    switch {{ min-height: 20px; min-width: 40px; }}
+    switch {{
+        min-height: 22px; min-width: 40px; padding: 0;
+        border-radius: 999px;
+    }}
+    switch slider {{
+        background: {fg_bright}; border: 0; border-radius: 999px;
+        min-height: 18px; min-width: 18px; margin: 2px; padding: 0;
+        box-shadow: none;
+    }}
     switch:checked {{ background: {green}; }}
 
     .dc-count {{
@@ -218,13 +244,13 @@ def css(t: Theme) -> str:
         margin-top: 4px; margin-bottom: 10px;
     }}
 
-    .dc-mic {{
-        border-radius: 5px; padding: 1px 7px; font-weight: 700;
+    .dc-status {{
+        border-radius: 6px; padding: 0 7px; font-weight: 700;
         font-size: {small - 2.0:.1f}pt;
-        border: 1px solid {muted};
+        border: 1px solid {muted}; min-height: 20px;
     }}
-    .dc-mic.live {{ color: {green}; border-color: {green}; }}
-    .dc-mic.dead {{ color: {muted}; opacity: 0.7; }}
+    .dc-status.live {{ color: {green}; border-color: {green}; }}
+    .dc-status.dead {{ color: {muted}; opacity: 0.7; }}
 
     /* Value boxes: a quiet box says "type here" without shouting. */
     entry.dc-entry {{
@@ -241,8 +267,8 @@ def css(t: Theme) -> str:
         border-color: {accent};
     }}
 
-    /* Compact sliders: no drawn value, the number lives in its own label. */
-    scale {{ min-height: 16px; padding: 0; margin: 0; }}
+    /* Compact sliders: no drawn value, the number lives in its own entry. */
+    scale {{ min-height: 22px; padding: 0; margin: 0; }}
     scale trough {{
         background: {bg_light}; border-radius: 999px;
         min-height: 3px; margin: 0;
@@ -254,4 +280,20 @@ def css(t: Theme) -> str:
     }}
     scale:disabled slider {{ background: {muted}; }}
     scale:disabled highlight {{ background: {muted}; }}
+
+    /* One vertical rhythm throughout the panel.  Styles still communicate
+       hierarchy, but button, dropdown, entry, and switch boxes align. */
+    .dc-control-row {{ min-height: 24px; }}
+    .dc-root button,
+    .dc-root menubutton > button,
+    .dc-root dropdown > button,
+    .dc-root entry.dc-entry {{
+        min-height: 22px; padding-top: 0; padding-bottom: 0;
+    }}
+    .dc-root switch {{ min-height: 22px; }}
+    .dc-root button.dc-clear {{
+        min-width: 22px; padding-left: 0; padding-right: 0;
+    }}
+    .dc-root button.dc-clear:disabled {{ opacity: 0.35; }}
+    entry.dc-value-entry {{ min-width: 54px; }}
     """
