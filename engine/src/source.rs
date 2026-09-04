@@ -142,12 +142,16 @@ impl FrameSource for StdinSource {
     }
 }
 
-/// While nobody is streaming from a node, one frame per second keeps its ring
-/// current. A capture client that connects is handed the most recently queued
-/// frame before anything new arrives, so without this the first frame a viewer
-/// saw was whatever the engine started on - typically the camera's black
-/// warm-up frame - rather than the room as it is now.
-const IDLE_REFRESH: Duration = Duration::from_secs(1);
+/// While nobody is streaming from a node, a keep-warm frame every 100 ms
+/// keeps its ring current. A capture client that connects is handed the most
+/// recently queued frame, timestamp and all, before anything new arrives:
+/// without this the first frame a viewer saw was whatever the engine started
+/// on - typically the camera's black warm-up frame. The interval bounds how
+/// old that first frame can be. Measured at one second, ffmpeg bridged the
+/// timestamp gap with thirty duplicate frames and a recording opened on a
+/// one-second freeze; at 100 ms neither is visible, for a third of the copy
+/// work of a live viewer.
+const IDLE_REFRESH: Duration = Duration::from_millis(100);
 const OUTPUT_BUFFERS: u32 = 2;
 
 pub struct V4l2Sink {
@@ -220,8 +224,8 @@ impl V4l2Sink {
     ///
     /// The first frame always is: STREAMON on the producer is what makes an
     /// exclusive-caps v4l2loopback node visible to camera pickers. After
-    /// that, frames flow while a capture client is streaming, plus one
-    /// keep-warm frame per second while nobody is.
+    /// that, frames flow while a capture client is streaming, plus a
+    /// keep-warm frame every 100 ms while nobody is.
     pub fn wants_frame(&mut self) -> bool {
         self.refresh_viewer();
         should_publish(
@@ -376,7 +380,7 @@ impl Drop for V4l2Sink {
 }
 
 /// The publishing policy, kept free of device state so it can be tested:
-/// prime once, then follow the viewer, with a slow heartbeat while idle.
+/// prime once, then follow the viewer, with a keep-warm cadence while idle.
 fn should_publish(
     primed: bool,
     usage_events: bool,
@@ -537,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_node_gets_one_keep_warm_frame_per_second() {
+    fn idle_node_gets_a_keep_warm_frame_every_hundred_ms() {
         assert!(!should_publish(true, true, false, Some(Duration::from_millis(33))));
         assert!(!should_publish(true, true, false, Some(IDLE_REFRESH - Duration::from_millis(1))));
         assert!(should_publish(true, true, false, Some(IDLE_REFRESH)));

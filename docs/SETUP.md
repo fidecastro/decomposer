@@ -28,9 +28,9 @@ decomposer publishes the processed frame to two devices:
 
 Both outputs subscribe to v4l2loopback's client-usage event. After one priming
 frame makes a device discoverable, decomposer converts and writes frames only
-while an application is actually streaming from that device, plus one
-keep-warm frame per second so that the first frame a newly connected viewer
-receives is recent. While a SEND flip is on and something is watching the
+while an application is actually streaming from that device, plus a
+keep-warm frame every 100 ms so that the first frame a newly connected viewer
+receives (and its timestamp) is recent. While a SEND flip is on and something is watching the
 Normal camera, the engine renders that frame a second time without the flip,
 so overlays and replacement backgrounds stay in place on both feeds.
 
