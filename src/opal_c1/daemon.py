@@ -43,6 +43,7 @@ from opal_c1.core.model import Mode
 from opal_c1.modes import current_mode, wait_until_capturable
 from opal_c1.modes import camera_video_node  # engine input node discovery
 from opal_c1.ports import FrameSource
+from opal_c1.v4l2 import output_ready
 
 # The eight Core Image effects Composer exposed, then its five own looks.
 # Order is deliberate: it is the order they appear in the panel.
@@ -464,8 +465,11 @@ class Daemon:
         return model.EngineConfig(
             input="-" if from_stdin else (camera_video_node() or "/dev/video0"),
             output=st.output,
+            # Handed over only when the node answers as a video output: a
+            # missing node, or a real camera that landed on /dev/video11,
+            # leaves the engine publishing SEND alone rather than failing.
             normal_output=(
-                st.normal_output if Path(st.normal_output).exists() else None
+                st.normal_output if output_ready(st.normal_output) else None
             ),
             width=st.width,
             height=st.height,
@@ -1767,6 +1771,13 @@ class Daemon:
         s["mode_actual"] = snapshot.get("mode_actual")
         engine = self._engine
         s["engine_alive"] = engine is not None and engine.alive()
+        # The normal node is optional: this says whether the running engine
+        # was given one, so nobody reports a feed that is not there.
+        s["normal_active"] = bool(
+            s["engine_alive"]
+            and engine.config is not None
+            and engine.config.normal_output
+        )
         with self.lock:
             s["looks"] = list(self._looks_cache)
         s["restarts"] = self.restarts

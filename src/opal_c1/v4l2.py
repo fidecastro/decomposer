@@ -229,6 +229,30 @@ def exclusive_caps_ready(dev_path: str) -> bool:
         os.close(fd)
 
 
+def output_ready(dev_path: str) -> bool:
+    """True if the node exists and answers as a video OUTPUT device.
+
+    That is what a v4l2loopback node looks like before a producer attaches
+    (with exclusive_caps) or at any time (without). A real camera that has
+    ended up at the same path advertises capture only, and must not be
+    handed frames as if it were ours.
+    """
+    try:
+        fd = os.open(dev_path, os.O_RDWR | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        buf = bytearray(struct.calcsize(_QUERYCAP_FMT))
+        fcntl.ioctl(fd, VIDIOC_QUERYCAP, buf, True)
+        values = struct.unpack(_QUERYCAP_FMT, bytes(buf))
+        caps = values[5] or values[4]
+        return bool(caps & V4L2_CAP_VIDEO_OUTPUT)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
 def capture_ready(dev_path: str = "/dev/video0") -> bool:
     """True if the node exists *and* answers as a capture device.
 

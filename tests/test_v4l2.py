@@ -32,3 +32,39 @@ def test_exclusive_caps_checks_the_device_not_module_parameters(
 
     monkeypatch.setattr(v4l2.fcntl, "ioctl", fake_ioctl)
     assert v4l2.exclusive_caps_ready("/dev/video11") is expected
+
+
+@pytest.mark.parametrize(
+    ("directions", "expected"),
+    [
+        (v4l2.V4L2_CAP_VIDEO_OUTPUT, True),
+        (v4l2.V4L2_CAP_VIDEO_CAPTURE | v4l2.V4L2_CAP_VIDEO_OUTPUT, True),
+        (v4l2.V4L2_CAP_VIDEO_CAPTURE, False),
+    ],
+)
+def test_output_ready_accepts_only_nodes_that_take_frames(
+    monkeypatch, directions, expected
+):
+    # A real webcam that ends up at /dev/video11 advertises capture only and
+    # must not be handed frames as if it were the loopback node.
+    monkeypatch.setattr(v4l2.os, "open", lambda *_args: 7)
+    monkeypatch.setattr(v4l2.os, "close", lambda _fd: None)
+
+    def fake_ioctl(_fd, request, buf, mutate):
+        assert request == v4l2.VIDIOC_QUERYCAP
+        buf[:] = struct.pack(
+            v4l2._QUERYCAP_FMT,
+            b"v4l2 loopback", b"decomposer", b"platform", 1,
+            0x80000000, directions, 0, 0, 0,
+        )
+
+    monkeypatch.setattr(v4l2.fcntl, "ioctl", fake_ioctl)
+    assert v4l2.output_ready("/dev/video11") is expected
+
+
+def test_output_ready_is_false_for_a_missing_node(monkeypatch):
+    def missing(*_args):
+        raise FileNotFoundError("/dev/video11")
+
+    monkeypatch.setattr(v4l2.os, "open", missing)
+    assert v4l2.output_ready("/dev/video11") is False

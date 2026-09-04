@@ -34,6 +34,10 @@ receives is recent. While a SEND flip is on and something is watching the
 Normal camera, the engine renders that frame a second time without the flip,
 so overlays and replacement backgrounds stay in place on both feeds.
 
+The Normal camera is optional. When `/dev/video11` is missing, busy, or not a
+loopback output, the daemon publishes the SEND camera alone and `decomposer
+status` says so.
+
 The module options pin both node numbers, name the devices, and set
 `exclusive_caps=1` so camera clients negotiate them correctly.
 
@@ -42,6 +46,20 @@ sudo install -m 0644 packaging/v4l2loopback.conf /etc/modprobe.d/
 sudo install -m 0644 packaging/v4l2loopback-load.conf /etc/modules-load.d/
 sudo modprobe v4l2loopback
 ```
+
+### Upgrading
+
+The original modprobe file created `/dev/video10` only. To add the Normal
+camera to an existing install, reinstall the file and reload the module while
+no application holds either camera:
+
+```
+sudo install -m 0644 packaging/v4l2loopback.conf /etc/modprobe.d/
+sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback
+```
+
+Until then everything keeps working on `/dev/video10`; `decomposer doctor`
+lists the second node as absent rather than as a fault.
 
 ## udev rules
 

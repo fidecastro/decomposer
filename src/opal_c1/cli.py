@@ -613,7 +613,13 @@ def _print_status(st: dict) -> None:
         f"  send      {st.get('output')}  "
         f"{st.get('width')}x{st.get('height')}  follows SEND flips"
     )
-    print(f"  normal    {st.get('normal_output')}  flips excluded")
+    if st.get("normal_active"):
+        print(f"  normal    {st.get('normal_output')}  flips excluded")
+    elif st.get("engine_alive"):
+        print(
+            f"  normal    off  ({st.get('normal_output')} is not a loopback "
+            "output; optional, see docs/SETUP.md \u00a7 Upgrading)"
+        )
     print(f"  engine    {'running' if st.get('engine_alive') else 'STOPPED'}")
     if st.get("frames"):
         print(f"  frames    {st['frames']}")
@@ -843,6 +849,11 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
             if hint:
                 print(f"      \u21b3 {hint}")
 
+    def optional(label, detail, hint):
+        # Absent but not broken: said plainly, counted as nothing.
+        print(f"  \u00b7 {label}  {detail}")
+        print(f"      \u21b3 {hint}")
+
     engine = find_engine()
     check(engine is not None, "engine binary", engine or "",
           "cargo build --release in engine/, or install the package")
@@ -864,14 +875,23 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
 
     loop = Path("/dev/video10")
     check(loop.exists(), "SEND v4l2loopback node", str(loop),
-          "see docs/SETUP.md \u00a7 The virtual camera")
-    normal_loop = Path("/dev/video11")
-    check(normal_loop.exists(), "normal v4l2loopback node", str(normal_loop),
-          "see docs/SETUP.md \u00a7 The virtual camera")
-    caps_ok = all(exclusive_caps_ready(str(p)) for p in (loop, normal_loop))
-    check(caps_ok, "exclusive_caps",
+          "see docs/SETUP.md \u00a7 The virtual cameras")
+    check(loop.exists() and exclusive_caps_ready(str(loop)), "exclusive_caps",
           "", "apps only see the camera when the engine publishes; "
-          "see docs/SETUP.md \u00a7 The virtual camera")
+          "see docs/SETUP.md \u00a7 The virtual cameras")
+    # The second node is a convenience the daemon does without: an install
+    # from before it existed is complete, not broken.
+    normal_loop = Path("/dev/video11")
+    if normal_loop.exists():
+        check(exclusive_caps_ready(str(normal_loop)),
+              "normal v4l2loopback node", str(normal_loop),
+              "the node exists but is not in exclusive_caps mode; "
+              "see docs/SETUP.md \u00a7 The virtual cameras")
+    else:
+        optional("normal v4l2loopback node", "absent, publishing SEND only",
+                 "optional: for an unflipped second camera, reinstall "
+                 "packaging/v4l2loopback.conf and reload the module; "
+                 "see docs/SETUP.md \u00a7 Upgrading")
 
     rules = Path("/etc/udev/rules.d/60-opal-c1.rules")
     check(rules.is_file(), "udev rules", str(rules),

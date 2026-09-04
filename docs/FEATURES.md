@@ -32,8 +32,9 @@ the same size in both modes, and dims everything while the feed is down.
   ride along at odd frame rates.
 - Publishes clean I420 to two reader-driven virtual cameras: `/dev/video10`
   follows SEND flips, while `/dev/video11` always removes them for excluded
-  apps such as Meet. Chrome, OBS, Zoom, Discord and friends consume either,
-  and idle outputs stop copying frames.
+  apps such as Meet. Chrome, OBS, Zoom, Discord and friends consume either;
+  an output nobody is watching gets one keep-warm frame a second instead of
+  thirty, and the second camera is optional.
 
 ## Color
 
