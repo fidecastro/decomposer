@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "decomposer"
-version = "0.1.0"
+version = "1.1.0"
 description = "Composer-inspired looks for the Opal C1 on Linux (and later Windows)"
 readme = "README.md"
 requires-python = ">=3.9"

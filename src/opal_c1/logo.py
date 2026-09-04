@@ -182,7 +182,7 @@ def qml_manifest(module_id: str = "decomposer.overlay") -> str:
             "schemaVersion": 1,
             "id": module_id,
             "name": "decomposer",
-            "version": "1.0.0",
+            "version": "1.1.0",
             "author": "Felipe Infante de Castro",
             "description": (
                 "Linux software for the Opal C1 webcam: GPU looks, "
