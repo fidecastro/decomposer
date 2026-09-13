@@ -12,6 +12,11 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 VERSION = 1
+MAX_NAME_CHARS = 80
+_BIDI_CONTROLS = frozenset(chr(c) for c in (
+    0x061C, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
+    0x2066, 0x2067, 0x2068, 0x2069,
+))
 
 
 def validate_name(name: str) -> str:
@@ -21,16 +26,38 @@ def validate_name(name: str) -> str:
     ".hidden") would otherwise be a way to write wherever the daemon can
     reach.
     """
-    clean = (name or "").strip()
+    if not isinstance(name, str):
+        raise ValueError(f"invalid preset name {name!r}")
+    clean = name.strip()
     if (
         not clean
         or clean.startswith(".")
         or "/" in clean
         or "\\" in clean
         or clean in (".", "..")
+        or len(clean) > MAX_NAME_CHARS
+        or any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch in _BIDI_CONTROLS
+               for ch in clean)
     ):
         raise ValueError(f"invalid preset name {name!r}")
     return clean
+
+
+def decode_last_used(raw) -> dict[str, str]:
+    """Return valid mode-to-name selections from the small state document."""
+    if not isinstance(raw, dict) or raw.get("version") != VERSION:
+        return {}
+    values = raw.get("last_by_mode")
+    if not isinstance(values, dict):
+        return {}
+    out = {}
+    for mode in ("call", "studio"):
+        try:
+            if mode in values:
+                out[mode] = validate_name(values[mode])
+        except (TypeError, ValueError):
+            pass
+    return out
 
 
 def _clamp(value, lo, hi, cast=float):

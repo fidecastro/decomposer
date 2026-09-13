@@ -51,7 +51,7 @@ git clone https://github.com/fidecastro/decomposer
 cd decomposer && cargo build --release --manifest-path engine/Cargo.toml
 python -m venv .venv && .venv/bin/pip install -e .
 .venv/bin/decomposer doctor        # tells you exactly what is missing
-.venv/bin/decomposer daemon        # the camera comes alive on /dev/video10
+.venv/bin/decomposer daemon        # SEND /dev/video10 + Normal /dev/video11
 ```
 
 `doctor` walks the whole stack and points at what is missing. Every

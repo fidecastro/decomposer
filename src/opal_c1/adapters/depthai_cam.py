@@ -14,6 +14,11 @@ from opal_c1.core.model import Mode
 from opal_c1.device import OpalDevice
 
 
+def _wants_auto(value) -> bool:
+    """-1 (any negative) asks the camera to drive the control itself."""
+    return value is not None and int(value) < 0
+
+
 class XLinkBackend:
     mode = Mode.STUDIO
 
@@ -108,13 +113,20 @@ class XLinkBackend:
             attempt("wb", dev.set_white_balance, None if v < 0 else v)
             if "wb" in applied:
                 applied["wb"] = v
-        if values.get("exposure") is not None or values.get("iso") is not None:
+        exposure, iso = values.get("exposure"), values.get("iso")
+        if exposure is not None or iso is not None:
             try:
-                dev.set_exposure(values.get("exposure"), values.get("iso"))
-                if values.get("exposure") is not None:
-                    applied["exposure"] = values["exposure"]
-                if values.get("iso") is not None:
-                    applied["iso"] = values["iso"]
+                if _wants_auto(exposure) or _wants_auto(iso):
+                    # Both hand back together; the ISP treats them as a pair.
+                    dev.set_exposure(None, None)
+                    applied["exposure"] = -1
+                    applied["iso"] = -1
+                else:
+                    dev.set_exposure(exposure, iso)
+                    if exposure is not None:
+                        applied["exposure"] = exposure
+                    if iso is not None:
+                        applied["iso"] = iso
             except Exception as e:
                 refused["exposure"] = f"{type(e).__name__}: {e}"
         return applied, refused
