@@ -266,14 +266,10 @@ impl V4l2Sink {
         Ok(())
     }
 
-    /// `wants_frame` and `write` in one step, for the sink whose frame needs
-    /// no extra work to prepare.
-    pub fn write_if_watched(&mut self, frame: &[u8]) -> Result<bool> {
-        if !self.wants_frame() {
-            return Ok(false);
-        }
-        self.write(frame)?;
-        Ok(true)
+    /// Whether a capture client is streaming, as of the last `wants_frame`.
+    /// Without viewer detection this is always true.
+    pub fn viewer_active(&self) -> bool {
+        self.viewer_active
     }
 
     fn buffer_desc(&self, index: usize) -> v4l2_buffer {

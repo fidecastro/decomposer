@@ -22,6 +22,10 @@ mod seg;
 mod source;
 use source::{FrameSource, StdinSource, V4l2Source};
 
+/// With nobody watching, segment one frame in this many: twice a second
+/// at 30 fps.
+const IDLE_SEG_EVERY: u64 = 15;
+
 #[derive(Parser, Debug)]
 #[command(name = "decomposer-engine", about = "Capture -> look -> virtual camera")]
 struct Args {
@@ -528,6 +532,19 @@ fn main() -> Result<()> {
                 }
             }
         }
+        // Who gets this frame is decided before any work is done on it. With
+        // no V4L2 sink (null or stdout), every frame counts. Idle, the
+        // outputs take only their keep-warm frames, so the rest are never
+        // rendered.
+        let send_wanted = sink.as_mut().map_or(true, |s| s.wants_frame());
+        let normal_wanted = normal_sink.as_mut().is_some_and(|s| s.wants_frame());
+        let preview_wanted = preview.as_mut().is_some_and(|p| p.wants_frame());
+        let preview_live = preview.as_mut().is_some_and(|p| p.live());
+        let render = send_wanted || normal_wanted || preview_wanted;
+        let watched = preview_live
+            || sink.as_ref().map_or(true, |s| s.viewer_active())
+            || normal_sink.as_ref().is_some_and(|s| s.viewer_active());
+
         if let (Some(c), Some(g)) = (model_chain.as_mut(), engine.as_mut()) {
             let (want_blur, want_bg, strength_updates) = {
                 let mut st = look_state.lock().unwrap();
@@ -540,8 +557,11 @@ fn main() -> Result<()> {
             c.set_mask_wanted(want_blur || want_bg);
             seg_frame += 1;
             // Every other frame is plenty: model outputs change slower than
-            // pixels, and the EMA smooths the seams.
-            if c.active() && seg_frame % 2 == 0 {
+            // pixels, and the EMA smooths the seams. Unwatched, a mask twice
+            // a second keeps the keep-warm frames - the first thing a new
+            // viewer sees - blurred for a fraction of the cost.
+            let seg_every = if watched { 2 } else { IDLE_SEG_EVERY };
+            if c.active() && seg_frame % seg_every == 0 {
                 c.submit(frame, w, h);
             }
             // An external producer (the mask socket - a user process, or the
@@ -568,9 +588,15 @@ fn main() -> Result<()> {
                 layer_live = false;
             }
         }
-        // Decided before the GPU runs: the unmirrored pass for the normal
-        // feed is only worth doing when that feed will actually be written.
-        let normal_wanted = normal_sink.as_mut().is_some_and(|s| s.wants_frame());
+        if !render {
+            n += 1;
+            if args.frames != 0 && n >= args.frames {
+                break;
+            }
+            continue;
+        }
+        // The unmirrored pass for the normal feed is only worth doing when
+        // that feed will actually be written.
         let (out, normal_out): (&[u8], Option<&[u8]>) = match engine.as_mut() {
             Some(g) => {
                 g.process(frame)?;
@@ -584,14 +610,17 @@ fn main() -> Result<()> {
             }
             None => (frame, None),
         };
-        if let Some(sink) = sink.as_mut() {
-            sink.write_if_watched(out)?;
+        if let (Some(sink), true) = (sink.as_mut(), send_wanted) {
+            sink.write(out)?;
         }
         if let (Some(sink), true) = (normal_sink.as_mut(), normal_wanted) {
             // Without a SEND flip the two feeds are the same frame.
             sink.write(normal_out.unwrap_or(out))?;
         }
-        if let Some(p) = preview.as_mut() {
+        // A live panel gets every Nth frame. Anything else connected - a
+        // panel still proving itself, the daemon's stall watchdog - gets
+        // whatever was rendered anyway.
+        if let (Some(p), true) = (preview.as_mut(), preview_wanted || !preview_live) {
             p.publish(out, out_w, out_h);
         }
         if let Some(w) = stdout_sink.as_mut() {

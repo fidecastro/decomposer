@@ -12,12 +12,28 @@
 use anyhow::Result;
 use std::io::Write;
 use std::os::unix::net::UnixListener;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub const PREVIEW_W: u32 = 480;
 
-type Clients = Arc<Mutex<Vec<SyncSender<Arc<Vec<u8>>>>>>;
+/// A client must drain this many frames a second to count as a panel someone
+/// is looking at. The daemon's stall watchdog reads this socket too, one frame
+/// every half second; it must not keep the whole pipeline awake.
+const LIVE_FPS: f64 = 4.0;
+const LIVE_WINDOW: Duration = Duration::from_secs(1);
+
+struct Client {
+    tx: SyncSender<Arc<Vec<u8>>>,
+    /// Frames the writer thread has finished sending.
+    delivered: Arc<AtomicU64>,
+    /// `delivered` at the start of the current rate window.
+    seen: u64,
+}
+
+type Clients = Arc<Mutex<Vec<Client>>>;
 
 pub struct Preview {
     clients: Clients,
@@ -29,6 +45,8 @@ pub struct Preview {
     /// 4:3 frame into a fixed 16:9 preview is a distortion, not a preview.
     pw: u32,
     ph: u32,
+    window_start: Instant,
+    live: bool,
 }
 
 impl Preview {
@@ -55,12 +73,18 @@ impl Preview {
                 if stream.write_all(&header).is_err() {
                     continue;
                 }
-                accept_clients.lock().unwrap().push(tx);
+                let delivered = Arc::new(AtomicU64::new(0));
+                accept_clients.lock().unwrap().push(Client {
+                    tx,
+                    delivered: delivered.clone(),
+                    seen: 0,
+                });
                 std::thread::spawn(move || {
                     for frame in rx {
                         if stream.write_all(&frame).is_err() {
                             return; // panel closed
                         }
+                        delivered.fetch_add(1, Ordering::Relaxed);
                     }
                 });
             }
@@ -73,6 +97,8 @@ impl Preview {
             scratch: vec![0u8; (pw * ph * 3) as usize],
             pw,
             ph,
+            window_start: Instant::now(),
+            live: false,
         })
     }
 
@@ -80,10 +106,36 @@ impl Preview {
         self.clients.lock().map(|c| !c.is_empty()).unwrap_or(false)
     }
 
-    /// Downscale one NV12 frame and hand it to every connected panel.
-    pub fn publish(&mut self, nv12: &[u8], width: u32, height: u32) {
+    /// Whether some client drains frames as fast as an open panel does.
+    /// Measured over one-second windows, so a panel that just connected is
+    /// live once it has kept up with the keep-warm frames for a second.
+    pub fn live(&mut self) -> bool {
+        let elapsed = self.window_start.elapsed();
+        if elapsed >= LIVE_WINDOW {
+            let mut live = false;
+            if let Ok(mut clients) = self.clients.lock() {
+                for c in clients.iter_mut() {
+                    let delivered = c.delivered.load(Ordering::Relaxed);
+                    live |= (delivered - c.seen) as f64 / elapsed.as_secs_f64() >= LIVE_FPS;
+                    c.seen = delivered;
+                }
+            }
+            self.live = live;
+            self.window_start = Instant::now();
+        }
+        self.live
+    }
+
+    /// Advance the frame counter: true when a live panel should get this
+    /// frame (every Nth).
+    pub fn wants_frame(&mut self) -> bool {
         self.counter += 1;
-        if self.counter % self.every != 0 || !self.has_clients() {
+        self.live() && self.counter % self.every == 0
+    }
+
+    /// Downscale one NV12 frame and hand it to every connected client.
+    pub fn publish(&mut self, nv12: &[u8], width: u32, height: u32) {
+        if !self.has_clients() {
             return;
         }
         downscale_nv12_to_rgb(nv12, width, height, self.pw, self.ph, &mut self.scratch);
@@ -93,7 +145,7 @@ impl Preview {
             Ok(c) => c,
             Err(_) => return,
         };
-        clients.retain(|tx| match tx.try_send(frame.clone()) {
+        clients.retain(|c| match c.tx.try_send(frame.clone()) {
             Ok(()) => true,
             // Full means the panel is behind: skip this frame, keep the client.
             Err(TrySendError::Full(_)) => true,
