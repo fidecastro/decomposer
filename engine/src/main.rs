@@ -9,6 +9,7 @@
 //!     because in that mode the camera has no V4L2 node at all)
 
 use anyhow::{Context, Result};
+use std::time::{Duration, Instant};
 use clap::Parser;
 
 mod config;
@@ -25,6 +26,17 @@ use source::{FrameSource, StdinSource, V4l2Source};
 /// With nobody watching, segment one frame in this many: twice a second
 /// at 30 fps.
 const IDLE_SEG_EVERY: u64 = 15;
+
+/// Unwatched for this long, the camera stops streaming and its light goes
+/// off. Long enough that an app probing the device does not flap it.
+const PAUSE_AFTER: Duration = Duration::from_secs(5);
+/// While paused, the outputs and the preview get the held frame this often:
+/// the keep-warm interval, and fast enough for a panel to show it is live.
+const PAUSED_TICK: Duration = Duration::from_millis(100);
+/// Streaming again, the Opal hands over about half a second of stale frames,
+/// ~270 ms of black and an exposure overshoot before it settles, around
+/// 900 ms in. Viewers keep the held frame until then.
+const RESUME_SETTLE: Duration = Duration::from_millis(1200);
 
 #[derive(Parser, Debug)]
 #[command(name = "decomposer-engine", about = "Capture -> look -> virtual camera")]
@@ -369,8 +381,36 @@ fn main() -> Result<()> {
     let mut seg_frame = 0u64;
     let mut layer_live = false;
 
+    // Camera rest: unwatched for PAUSE_AFTER, the last rendered frames are
+    // held and the source stops until someone watches again.
+    let mut can_pause = true;
+    let mut paused = false;
+    let mut idle_since: Option<Instant> = None;
+    let mut settle_until: Option<Instant> = None;
+    let mut held_out: Vec<u8> = Vec::new();
+    let mut held_normal: Option<Vec<u8>> = None;
+
     let mut n: u64 = 0;
     loop {
+        if paused {
+            let send_wanted = sink.as_mut().map_or(true, |s| s.wants_frame());
+            let normal_wanted = normal_sink.as_mut().is_some_and(|s| s.wants_frame());
+            let watched = preview.as_mut().is_some_and(|p| p.live())
+                || sink.as_ref().map_or(true, |s| s.viewer_active())
+                || normal_sink.as_ref().is_some_and(|s| s.viewer_active());
+            if !watched {
+                publish_held(
+                    &mut sink, &mut normal_sink, &mut preview,
+                    (send_wanted, normal_wanted, true),
+                    &held_out, held_normal.as_deref(), (out_w, out_h),
+                )?;
+                std::thread::sleep(PAUSED_TICK);
+                continue;
+            }
+            paused = false;
+            settle_until = Some(Instant::now() + RESUME_SETTLE);
+            eprintln!("camera resumed");
+        }
         let frame = match source.next_frame()? {
             Some(f) => f,
             None => break,
@@ -545,6 +585,22 @@ fn main() -> Result<()> {
             || sink.as_ref().map_or(true, |s| s.viewer_active())
             || normal_sink.as_ref().is_some_and(|s| s.viewer_active());
 
+        let now = Instant::now();
+        let settling = settle_until.is_some_and(|t| now < t);
+        if !settling {
+            settle_until = None;
+        }
+        if watched || settling {
+            idle_since = None;
+        } else if idle_since.is_none() {
+            idle_since = Some(now);
+        }
+        // The frame the camera pauses on is rendered in full, normal pass
+        // included, so the held frames are fresh for both outputs.
+        let pausing = can_pause && idle_since.is_some_and(|t| now - t >= PAUSE_AFTER);
+        let render = render || pausing;
+        let normal_wanted = normal_wanted || (pausing && normal_sink.is_some());
+
         if let (Some(c), Some(g)) = (model_chain.as_mut(), engine.as_mut()) {
             let (want_blur, want_bg, strength_updates) = {
                 let mut st = look_state.lock().unwrap();
@@ -561,7 +617,7 @@ fn main() -> Result<()> {
             // a second keeps the keep-warm frames - the first thing a new
             // viewer sees - blurred for a fraction of the cost.
             let seg_every = if watched { 2 } else { IDLE_SEG_EVERY };
-            if c.active() && seg_frame % seg_every == 0 {
+            if c.active() && !settling && seg_frame % seg_every == 0 {
                 c.submit(frame, w, h);
             }
             // An external producer (the mask socket - a user process, or the
@@ -587,6 +643,15 @@ fn main() -> Result<()> {
                 g.set_layer(&[], 0, 0);
                 layer_live = false;
             }
+        }
+        if settling {
+            publish_held(
+                &mut sink, &mut normal_sink, &mut preview,
+                (send_wanted, normal_wanted, preview_wanted || !preview_live),
+                &held_out, held_normal.as_deref(), (out_w, out_h),
+            )?;
+            n += 1;
+            continue;
         }
         if !render {
             n += 1;
@@ -627,6 +692,17 @@ fn main() -> Result<()> {
             use std::io::Write;
             w.write_all(out)?;
         }
+        if pausing {
+            held_out.clear();
+            held_out.extend_from_slice(out);
+            held_normal = normal_out.map(|b| b.to_vec());
+            if source.pause()? {
+                paused = true;
+                eprintln!("camera paused: nobody watching");
+            } else {
+                can_pause = false;
+            }
+        }
         n += 1;
         if args.frames != 0 && n >= args.frames {
             break;
@@ -634,5 +710,28 @@ fn main() -> Result<()> {
     }
     let secs = start.elapsed().as_secs_f64();
     eprintln!("{n} frames in {secs:.1}s ({:.1} fps)", n as f64 / secs);
+    Ok(())
+}
+
+/// Feed the held frames to whichever outputs want one: while the camera is
+/// paused, and while it settles after resuming.
+fn publish_held(
+    sink: &mut Option<source::V4l2Sink>,
+    normal_sink: &mut Option<source::V4l2Sink>,
+    preview: &mut Option<preview::Preview>,
+    (send, normal, to_preview): (bool, bool, bool),
+    held_out: &[u8],
+    held_normal: Option<&[u8]>,
+    (out_w, out_h): (u32, u32),
+) -> Result<()> {
+    if let (Some(s), true) = (sink.as_mut(), send) {
+        s.write(held_out)?;
+    }
+    if let (Some(s), true) = (normal_sink.as_mut(), normal) {
+        s.write(held_normal.unwrap_or(held_out))?;
+    }
+    if let (Some(p), true) = (preview.as_mut(), to_preview) {
+        p.publish(held_out, out_w, out_h);
+    }
     Ok(())
 }

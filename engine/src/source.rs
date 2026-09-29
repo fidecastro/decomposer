@@ -51,6 +51,11 @@ pub trait FrameSource {
     fn dimensions(&self) -> (u32, u32);
     /// Next NV12 frame, or None when the source is exhausted.
     fn next_frame(&mut self) -> Result<Option<&[u8]>>;
+    /// Stop the device streaming until the next `next_frame`. False when
+    /// there is no device to stop: stdin keeps flowing whatever we do.
+    fn pause(&mut self) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 pub struct V4l2Source {
@@ -96,6 +101,13 @@ impl FrameSource for V4l2Source {
         let (buf, meta) = CaptureStream::next(&mut self.stream)?;
         let used = meta.bytesused as usize;
         Ok(Some(&buf[..used.min(buf.len())]))
+    }
+
+    // STREAMOFF turns the camera's light off and returns every buffer; the
+    // next `next_frame` requeues them and streams on again.
+    fn pause(&mut self) -> Result<bool> {
+        v4l::io::traits::Stream::stop(&mut self.stream).context("stop capture stream")?;
+        Ok(true)
     }
 }
 
