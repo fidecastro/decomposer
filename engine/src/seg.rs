@@ -19,6 +19,9 @@ use std::sync::{Arc, Mutex};
 /// 0.45 kills single-frame flicker without visible lag at 30 fps.
 const EMA_ALPHA: f32 = 0.45;
 
+/// Intra-op threads per model session.
+const MODEL_THREADS: usize = 2;
+
 pub struct Mask {
     pub data: Vec<u8>,
     pub width: u32,
@@ -41,6 +44,17 @@ pub fn build_session(model_path: &str, device: &str) -> Result<ort::session::Ses
         "cpu" => builder,
         other => bail!("unknown model device {other:?} (cpu or cuda)"),
     };
+    // The bundled mask model is a few milliseconds of work per frame.
+    // ONNX Runtime's default pool - a thread per core, spinning between
+    // runs - burned more CPU waiting for that work than doing it. Two
+    // threads that sleep between runs keep up with 30 fps and took the
+    // engine from 28% to 15% of a core (46 threads to 16).
+    builder = builder
+        .with_intra_threads(MODEL_THREADS)
+        .and_then(|b| b.with_inter_threads(1))
+        .and_then(|b| b.with_intra_op_spinning(false))
+        .and_then(|b| b.with_inter_op_spinning(false))
+        .map_err(|e| anyhow::anyhow!("configuring model threads: {e}"))?;
     builder
         .commit_from_file(model_path)
         .with_context(|| format!("loading model {model_path}"))
