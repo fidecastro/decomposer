@@ -18,6 +18,7 @@ mod gpu;
 mod lut;
 mod overlay;
 mod preview;
+mod rest;
 mod chain;
 mod seg;
 mod source;
@@ -27,16 +28,9 @@ use source::{FrameSource, StdinSource, V4l2Source};
 /// at 30 fps.
 const IDLE_SEG_EVERY: u64 = 15;
 
-/// Unwatched for this long, the camera stops streaming and its light goes
-/// off. Long enough that an app probing the device does not flap it.
-const PAUSE_AFTER: Duration = Duration::from_secs(5);
 /// While paused, the outputs and the preview get the held frame this often:
 /// the keep-warm interval, and fast enough for a panel to show it is live.
 const PAUSED_TICK: Duration = Duration::from_millis(100);
-/// Streaming again, the Opal hands over about half a second of stale frames,
-/// ~270 ms of black and an exposure overshoot before it settles, around
-/// 900 ms in. Viewers keep the held frame until then.
-const RESUME_SETTLE: Duration = Duration::from_millis(1200);
 
 #[derive(Parser, Debug)]
 #[command(name = "decomposer-engine", about = "Capture -> look -> virtual camera")]
@@ -381,12 +375,10 @@ fn main() -> Result<()> {
     let mut seg_frame = 0u64;
     let mut layer_live = false;
 
-    // Camera rest: unwatched for PAUSE_AFTER, the last rendered frames are
-    // held and the source stops until someone watches again.
-    let mut can_pause = true;
+    // Camera rest: unwatched for a while, the last rendered frames are held
+    // and the source stops until someone watches again.
+    let mut rest = rest::Rest::new();
     let mut paused = false;
-    let mut idle_since: Option<Instant> = None;
-    let mut settle_until: Option<Instant> = None;
     let mut held_out: Vec<u8> = Vec::new();
     let mut held_normal: Option<Vec<u8>> = None;
 
@@ -408,7 +400,7 @@ fn main() -> Result<()> {
                 continue;
             }
             paused = false;
-            settle_until = Some(Instant::now() + RESUME_SETTLE);
+            rest.resumed(Instant::now());
             eprintln!("camera resumed");
         }
         let frame = match source.next_frame()? {
@@ -585,19 +577,11 @@ fn main() -> Result<()> {
             || sink.as_ref().map_or(true, |s| s.viewer_active())
             || normal_sink.as_ref().is_some_and(|s| s.viewer_active());
 
-        let now = Instant::now();
-        let settling = settle_until.is_some_and(|t| now < t);
-        if !settling {
-            settle_until = None;
-        }
-        if watched || settling {
-            idle_since = None;
-        } else if idle_since.is_none() {
-            idle_since = Some(now);
-        }
+        let step = rest.step(watched, Instant::now());
+        let settling = step == rest::Step::Settle;
         // The frame the camera pauses on is rendered in full, normal pass
         // included, so the held frames are fresh for both outputs.
-        let pausing = can_pause && idle_since.is_some_and(|t| now - t >= PAUSE_AFTER);
+        let pausing = step == rest::Step::Pause;
         let render = render || pausing;
         let normal_wanted = normal_wanted || (pausing && normal_sink.is_some());
 
@@ -700,7 +684,7 @@ fn main() -> Result<()> {
                 paused = true;
                 eprintln!("camera paused: nobody watching");
             } else {
-                can_pause = false;
+                rest.cannot_pause();
             }
         }
         n += 1;

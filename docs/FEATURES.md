@@ -35,6 +35,11 @@ the same size in both modes, and dims everything while the feed is down.
   apps such as Meet. Chrome, OBS, Zoom, Discord and friends consume either;
   an output nobody is watching gets ten keep-warm frames a second instead of
   thirty, and the second camera is optional.
+- **The camera rests when nobody is watching.** Five seconds after the last
+  viewer or panel leaves, Call mode stops streaming, the light goes off, and
+  both cameras keep serving the last frame. The next viewer gets that frame
+  at once and live video about 1.4 s later, once the sensor has woken. While
+  it rests the engine idles at about 1% of a core.
 
 ## Color
 

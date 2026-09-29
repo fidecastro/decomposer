@@ -116,7 +116,7 @@ impl Preview {
             if let Ok(mut clients) = self.clients.lock() {
                 for c in clients.iter_mut() {
                     let delivered = c.delivered.load(Ordering::Relaxed);
-                    live |= (delivered - c.seen) as f64 / elapsed.as_secs_f64() >= LIVE_FPS;
+                    live |= drains_live(delivered - c.seen, elapsed);
                     c.seen = delivered;
                 }
             }
@@ -154,6 +154,12 @@ impl Preview {
     }
 }
 
+/// Whether a client that finished `delivered` frames over `elapsed` reads
+/// like an open panel rather than the watchdog's occasional sample.
+fn drains_live(delivered: u64, elapsed: Duration) -> bool {
+    !elapsed.is_zero() && delivered as f64 / elapsed.as_secs_f64() >= LIVE_FPS
+}
+
 /// Nearest-neighbour NV12 to RGB24. The output is a few hundred pixels wide, so
 /// sampling beats filtering for both cost and clarity.
 fn downscale_nv12_to_rgb(nv12: &[u8], sw: u32, sh: u32, pw: u32, ph: u32, out: &mut [u8]) {
@@ -180,5 +186,35 @@ fn downscale_nv12_to_rgb(nv12: &[u8], sw: u32, sh: u32, pw: u32, ph: u32, out: &
             out[o + 1] = (y - 0.344136 * u - 0.714136 * v).clamp(0.0, 255.0) as u8;
             out[o + 2] = (y + 1.772 * u).clamp(0.0, 255.0) as u8;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drains_live;
+    use std::time::Duration;
+
+    #[test]
+    fn the_stall_watchdog_is_not_a_panel() {
+        // One frame every half second.
+        assert!(!drains_live(2, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_panel_reading_every_frame_is_live() {
+        // Keep-warm frames while the camera rests, and full rate after.
+        assert!(drains_live(10, Duration::from_secs(1)));
+        assert!(drains_live(15, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn the_rate_is_per_second_of_window() {
+        assert!(drains_live(4, Duration::from_secs(1)));
+        assert!(!drains_live(8, Duration::from_millis(2500)));
+    }
+
+    #[test]
+    fn an_empty_window_is_not_live() {
+        assert!(!drains_live(5, Duration::ZERO));
     }
 }
