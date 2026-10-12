@@ -19,10 +19,14 @@ use std::time::{Duration, Instant};
 
 pub const PREVIEW_W: u32 = 480;
 
-/// A client must drain this many frames a second to count as a panel someone
-/// is looking at. The daemon's stall watchdog reads this socket too, one frame
-/// every half second; it must not keep the whole pipeline awake.
-const LIVE_FPS: f64 = 4.0;
+/// A client must take this share of the frames offered to it to count as a
+/// panel someone is looking at. A panel reads everything it is sent, at
+/// whatever rate that is: 30 / --preview-every, or the 10 a second of a
+/// resting camera. The daemon's stall watchdog reads this socket too, one
+/// frame every half second whatever it is offered; it must not keep the
+/// whole pipeline awake. A fixed rate cannot tell the two apart once the
+/// panel's own rate drops near the watchdog's, and the share can.
+const LIVE_SHARE: f64 = 0.75;
 const LIVE_WINDOW: Duration = Duration::from_secs(1);
 
 struct Client {
@@ -31,6 +35,8 @@ struct Client {
     delivered: Arc<AtomicU64>,
     /// `delivered` at the start of the current rate window.
     seen: u64,
+    /// Frames handed to this client this window, taken or skipped.
+    offered: u64,
 }
 
 type Clients = Arc<Mutex<Vec<Client>>>;
@@ -78,6 +84,7 @@ impl Preview {
                     tx,
                     delivered: delivered.clone(),
                     seen: 0,
+                    offered: 0,
                 });
                 std::thread::spawn(move || {
                     for frame in rx {
@@ -106,7 +113,7 @@ impl Preview {
         self.clients.lock().map(|c| !c.is_empty()).unwrap_or(false)
     }
 
-    /// Whether some client drains frames as fast as an open panel does.
+    /// Whether some client drains frames the way an open panel does.
     /// Measured over one-second windows, so a panel that just connected is
     /// live once it has kept up with the keep-warm frames for a second.
     pub fn live(&mut self) -> bool {
@@ -116,8 +123,9 @@ impl Preview {
             if let Ok(mut clients) = self.clients.lock() {
                 for c in clients.iter_mut() {
                     let delivered = c.delivered.load(Ordering::Relaxed);
-                    live |= drains_live(delivered - c.seen, elapsed);
+                    live |= drains_live(delivered - c.seen, c.offered);
                     c.seen = delivered;
+                    c.offered = 0;
                 }
             }
             self.live = live;
@@ -145,19 +153,22 @@ impl Preview {
             Ok(c) => c,
             Err(_) => return,
         };
-        clients.retain(|c| match c.tx.try_send(frame.clone()) {
-            Ok(()) => true,
-            // Full means the panel is behind: skip this frame, keep the client.
-            Err(TrySendError::Full(_)) => true,
-            Err(TrySendError::Disconnected(_)) => false,
+        clients.retain_mut(|c| {
+            c.offered += 1;
+            match c.tx.try_send(frame.clone()) {
+                Ok(()) => true,
+                // Full means the panel is behind: skip this frame, keep the client.
+                Err(TrySendError::Full(_)) => true,
+                Err(TrySendError::Disconnected(_)) => false,
+            }
         });
     }
 }
 
-/// Whether a client that finished `delivered` frames over `elapsed` reads
+/// Whether a client that finished `delivered` of the `offered` frames reads
 /// like an open panel rather than the watchdog's occasional sample.
-fn drains_live(delivered: u64, elapsed: Duration) -> bool {
-    !elapsed.is_zero() && delivered as f64 / elapsed.as_secs_f64() >= LIVE_FPS
+fn drains_live(delivered: u64, offered: u64) -> bool {
+    offered > 0 && delivered as f64 >= offered as f64 * LIVE_SHARE
 }
 
 /// Nearest-neighbour NV12 to RGB24. The output is a few hundred pixels wide, so
@@ -192,29 +203,36 @@ fn downscale_nv12_to_rgb(nv12: &[u8], sw: u32, sh: u32, pw: u32, ph: u32, out: &
 #[cfg(test)]
 mod tests {
     use super::drains_live;
-    use std::time::Duration;
 
     #[test]
     fn the_stall_watchdog_is_not_a_panel() {
-        // One frame every half second.
-        assert!(!drains_live(2, Duration::from_secs(1)));
+        // Two frames a second, of the keep-warm ten or a full-rate thirty.
+        assert!(!drains_live(2, 10));
+        assert!(!drains_live(2, 30));
     }
 
     #[test]
     fn a_panel_reading_every_frame_is_live() {
         // Keep-warm frames while the camera rests, and full rate after.
-        assert!(drains_live(10, Duration::from_secs(1)));
-        assert!(drains_live(15, Duration::from_secs(1)));
+        assert!(drains_live(10, 10));
+        assert!(drains_live(15, 15));
     }
 
     #[test]
-    fn the_rate_is_per_second_of_window() {
-        assert!(drains_live(4, Duration::from_secs(1)));
-        assert!(!drains_live(8, Duration::from_millis(2500)));
+    fn a_slow_preview_is_still_live() {
+        // --preview-every 8 at 30 fps, and a 5 fps capture mode.
+        assert!(drains_live(4, 4));
+        assert!(drains_live(5, 5));
     }
 
     #[test]
-    fn an_empty_window_is_not_live() {
-        assert!(!drains_live(5, Duration::ZERO));
+    fn a_panel_may_skip_a_frame() {
+        assert!(drains_live(9, 10));
+        assert!(!drains_live(7, 10));
+    }
+
+    #[test]
+    fn nothing_offered_is_not_live() {
+        assert!(!drains_live(0, 0));
     }
 }
