@@ -30,7 +30,10 @@ Both outputs subscribe to v4l2loopback's client-usage event. After one priming
 frame makes a device discoverable, decomposer converts and writes frames only
 while an application is actually streaming from that device, plus a
 keep-warm frame every 100 ms so that the first frame a newly connected viewer
-receives (and its timestamp) is recent. While a SEND flip is on and something is watching the
+receives (and its timestamp) is recent. With nothing streaming from either
+output and the panel closed for five seconds, Call mode stops the camera
+altogether and both outputs keep publishing the last frame; the camera starts
+again the moment a viewer does. While a SEND flip is on and something is watching the
 Normal camera, the engine renders that frame a second time without the flip,
 so overlays and replacement backgrounds stay in place on both feeds.
 

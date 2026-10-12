@@ -51,6 +51,11 @@ pub trait FrameSource {
     fn dimensions(&self) -> (u32, u32);
     /// Next NV12 frame, or None when the source is exhausted.
     fn next_frame(&mut self) -> Result<Option<&[u8]>>;
+    /// Stop the device streaming until the next `next_frame`. False when
+    /// there is no device to stop: stdin keeps flowing whatever we do.
+    fn pause(&mut self) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 pub struct V4l2Source {
@@ -96,6 +101,13 @@ impl FrameSource for V4l2Source {
         let (buf, meta) = CaptureStream::next(&mut self.stream)?;
         let used = meta.bytesused as usize;
         Ok(Some(&buf[..used.min(buf.len())]))
+    }
+
+    // STREAMOFF turns the camera's light off and returns every buffer; the
+    // next `next_frame` requeues them and streams on again.
+    fn pause(&mut self) -> Result<bool> {
+        v4l::io::traits::Stream::stop(&mut self.stream).context("stop capture stream")?;
+        Ok(true)
     }
 }
 
@@ -266,14 +278,10 @@ impl V4l2Sink {
         Ok(())
     }
 
-    /// `wants_frame` and `write` in one step, for the sink whose frame needs
-    /// no extra work to prepare.
-    pub fn write_if_watched(&mut self, frame: &[u8]) -> Result<bool> {
-        if !self.wants_frame() {
-            return Ok(false);
-        }
-        self.write(frame)?;
-        Ok(true)
+    /// Whether a capture client is streaming, as of the last `wants_frame`.
+    /// Without viewer detection this is always true.
+    pub fn viewer_active(&self) -> bool {
+        self.viewer_active
     }
 
     fn buffer_desc(&self, index: usize) -> v4l2_buffer {
