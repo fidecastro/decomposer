@@ -78,6 +78,8 @@ struct Runner {
     input: Arc<Mutex<Option<Vec<u8>>>>,
     /// Latest EMA-smoothed output: mask plane or RGB image at in_w x in_h.
     output: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Set to start the EMA over from the next output.
+    forget: Arc<AtomicBool>,
     cv: Arc<Condvar>,
 }
 
@@ -177,6 +179,16 @@ impl Chain {
         self.runners
             .iter()
             .any(|r| r.kind == Kind::Filter && self.runner_active(r))
+    }
+
+    /// Drop the smoothing history, so the next output stands on its own.
+    /// After the camera rests, the history is of a scene that may have
+    /// moved on: blending it in would mask where the person used to be.
+    pub fn forget_history(&mut self) {
+        for r in &self.runners {
+            r.forget.store(true, Ordering::Relaxed);
+            r.output.lock().unwrap().take();
+        }
     }
 
     /// Render thread: feed every active runner its own downscale.
@@ -311,13 +323,15 @@ fn start_runner(spec: &Spec) -> Result<Runner> {
     let strength = Arc::new(AtomicU32::new(spec.strength.to_bits()));
     let input: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
     let output: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let forget = Arc::new(AtomicBool::new(false));
     let cv = Arc::new(Condvar::new());
 
     let t_in = input.clone();
     let t_out = output.clone();
+    let t_forget = forget.clone();
     let t_cv = cv.clone();
     std::thread::spawn(move || {
-        run_model(session, in_w, in_h, nchw, kind, t_in, t_out, t_cv);
+        run_model(session, in_w, in_h, nchw, kind, t_in, t_out, t_forget, t_cv);
     });
 
     Ok(Runner {
@@ -328,6 +342,7 @@ fn start_runner(spec: &Spec) -> Result<Runner> {
         strength,
         input,
         output,
+        forget,
         cv,
     })
 }
@@ -355,6 +370,7 @@ fn run_model(
     kind: Kind,
     input: Arc<Mutex<Option<Vec<u8>>>>,
     output: Arc<Mutex<Option<Vec<u8>>>>,
+    forget: Arc<AtomicBool>,
     cv: Arc<Condvar>,
 ) {
     let px = (in_w * in_h) as usize;
@@ -438,6 +454,9 @@ fn run_model(
         } else {
             data[..needed].iter().map(|&v| to_u8(v)).collect()
         };
+        if forget.swap(false, Ordering::Relaxed) {
+            ema.clear();
+        }
         let smoothed = crate::seg::smooth(&mut ema, &fresh);
         *output.lock().unwrap() = Some(smoothed);
     }
