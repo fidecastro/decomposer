@@ -13,6 +13,11 @@ pub const PAUSE_AFTER: Duration = Duration::from_secs(5);
 /// 900 ms in. Viewers keep the held frame until then.
 pub const RESUME_SETTLE: Duration = Duration::from_millis(1200);
 
+/// From this far into the settle, the frames are good enough to segment.
+/// Masking the last stretch means live video starts with a mask of where
+/// the person is now, not where they were when the camera paused.
+pub const PRIME_AFTER: Duration = Duration::from_millis(900);
+
 /// What the render loop does with the frame in hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -20,6 +25,9 @@ pub enum Step {
     Run,
     /// The camera is still waking: viewers keep the held frame.
     Settle,
+    /// Nearly settled: viewers still keep the held frame, but this one is
+    /// segmented.
+    Prime,
     /// Render it in full, hold it, and stop the camera.
     Pause,
 }
@@ -27,7 +35,7 @@ pub enum Step {
 pub struct Rest {
     can_pause: bool,
     idle_since: Option<Instant>,
-    settle_until: Option<Instant>,
+    resumed_at: Option<Instant>,
 }
 
 impl Rest {
@@ -35,7 +43,7 @@ impl Rest {
         Self {
             can_pause: true,
             idle_since: None,
-            settle_until: None,
+            resumed_at: None,
         }
     }
 
@@ -43,9 +51,9 @@ impl Rest {
     /// from the first unwatched frame after the camera has settled, so a
     /// viewer who leaves during the settle still gets the full grace.
     pub fn step(&mut self, watched: bool, now: Instant) -> Step {
-        let settling = self.settle_until.is_some_and(|t| now < t);
+        let settling = self.settling(now);
         if !settling {
-            self.settle_until = None;
+            self.resumed_at = None;
         }
         if watched || settling {
             self.idle_since = None;
@@ -53,7 +61,11 @@ impl Rest {
             self.idle_since = Some(now);
         }
         if settling {
-            Step::Settle
+            if self.resumed_at.is_some_and(|t| now - t >= PRIME_AFTER) {
+                Step::Prime
+            } else {
+                Step::Settle
+            }
         } else if self.can_pause && self.idle_since.is_some_and(|t| now - t >= PAUSE_AFTER) {
             Step::Pause
         } else {
@@ -63,7 +75,19 @@ impl Rest {
 
     /// The camera started streaming again at `now`.
     pub fn resumed(&mut self, now: Instant) {
-        self.settle_until = Some(now + RESUME_SETTLE);
+        self.resumed_at = Some(now);
+    }
+
+    /// Whether the camera restarted less than the settle time before `now`.
+    pub fn settling(&self, now: Instant) -> bool {
+        self.resumed_at.is_some_and(|t| now - t < RESUME_SETTLE)
+    }
+
+    /// Stopping the camera failed at `now`. It is still streaming, so the
+    /// loop carries on, and asks again after another full grace period:
+    /// a USB hiccup should not keep the camera on for good.
+    pub fn pause_failed(&mut self, now: Instant) {
+        self.idle_since = Some(now);
     }
 
     /// The source has no device to stop: never ask again.
@@ -74,7 +98,7 @@ impl Rest {
 
 #[cfg(test)]
 mod tests {
-    use super::{Rest, Step, PAUSE_AFTER, RESUME_SETTLE};
+    use super::{Rest, Step, PAUSE_AFTER, PRIME_AFTER, RESUME_SETTLE};
     use std::time::{Duration, Instant};
 
     fn ms(n: u64) -> Duration {
@@ -113,8 +137,31 @@ mod tests {
         let (mut rest, t0) = (Rest::new(), Instant::now());
         rest.resumed(t0);
         assert_eq!(rest.step(true, t0 + ms(300)), Step::Settle);
-        assert_eq!(rest.step(true, t0 + RESUME_SETTLE - ms(1)), Step::Settle);
+        assert_eq!(rest.step(true, t0 + PRIME_AFTER - ms(1)), Step::Settle);
+        assert_eq!(rest.step(true, t0 + PRIME_AFTER), Step::Prime);
+        assert_eq!(rest.step(true, t0 + RESUME_SETTLE - ms(1)), Step::Prime);
         assert_eq!(rest.step(true, t0 + RESUME_SETTLE), Step::Run);
+    }
+
+    #[test]
+    fn settling_is_known_without_a_frame() {
+        let (mut rest, t0) = (Rest::new(), Instant::now());
+        assert!(!rest.settling(t0));
+        rest.resumed(t0);
+        assert!(rest.settling(t0 + ms(500)));
+        assert!(!rest.settling(t0 + RESUME_SETTLE));
+    }
+
+    #[test]
+    fn a_failed_pause_waits_another_grace() {
+        let (mut rest, t0) = (Rest::new(), Instant::now());
+        rest.step(false, t0);
+        let failed = t0 + PAUSE_AFTER;
+        assert_eq!(rest.step(false, failed), Step::Pause);
+        rest.pause_failed(failed);
+        assert_eq!(rest.step(false, failed + ms(1)), Step::Run);
+        assert_eq!(rest.step(false, failed + PAUSE_AFTER - ms(1)), Step::Run);
+        assert_eq!(rest.step(false, failed + PAUSE_AFTER), Step::Pause);
     }
 
     #[test]

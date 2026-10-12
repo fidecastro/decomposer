@@ -47,10 +47,25 @@ pub fn nv12_len(width: u32, height: u32) -> usize {
     (width as usize * height as usize * 3) / 2
 }
 
+/// How long a capture read waits before handing control back to the render
+/// loop, which can then feed viewers the held frame while a camera that was
+/// paused takes its time to start again.
+const CAPTURE_WAIT: Duration = Duration::from_millis(100);
+
+/// What a read from a source produced.
+pub enum Next<'a> {
+    Frame(&'a [u8]),
+    /// Nothing arrived within the wait; ask again.
+    Late,
+    /// The source is exhausted.
+    End,
+}
+
 pub trait FrameSource {
     fn dimensions(&self) -> (u32, u32);
-    /// Next NV12 frame, or None when the source is exhausted.
-    fn next_frame(&mut self) -> Result<Option<&[u8]>>;
+    /// Next NV12 frame, `Late` when none arrived in time, `End` when the
+    /// source is exhausted.
+    fn next_frame(&mut self) -> Result<Next<'_>>;
     /// Stop the device streaming until the next `next_frame`. False when
     /// there is no device to stop: stdin keeps flowing whatever we do.
     fn pause(&mut self) -> Result<bool> {
@@ -62,6 +77,9 @@ pub struct V4l2Source {
     stream: MmapStream<'static>,
     width: u32,
     height: u32,
+    /// The last read timed out with every buffer queued, so the next one
+    /// must dequeue before it queues anything.
+    late: bool,
 }
 
 impl V4l2Source {
@@ -86,9 +104,10 @@ impl V4l2Source {
             );
         }
 
-        let stream = MmapStream::with_buffers(dev, Type::VideoCapture, 4)
+        let mut stream = MmapStream::with_buffers(dev, Type::VideoCapture, 4)
             .context("start capture stream")?;
-        Ok(Self { stream, width: fmt.width, height: fmt.height })
+        stream.set_timeout(CAPTURE_WAIT);
+        Ok(Self { stream, width: fmt.width, height: fmt.height, late: false })
     }
 }
 
@@ -97,16 +116,39 @@ impl FrameSource for V4l2Source {
         (self.width, self.height)
     }
 
-    fn next_frame(&mut self) -> Result<Option<&[u8]>> {
-        let (buf, meta) = CaptureStream::next(&mut self.stream)?;
-        let used = meta.bytesused as usize;
-        Ok(Some(&buf[..used.min(buf.len())]))
+    fn next_frame(&mut self) -> Result<Next<'_>> {
+        // `next` requeues the buffer it handed out last, then waits. After a
+        // timeout that buffer is already back with the driver and a second
+        // QBUF fails, so dequeue one first: `next` then requeues that one.
+        // The frame it held is dropped, which costs nothing while the camera
+        // is still waking.
+        if self.late {
+            match CaptureStream::dequeue(&mut self.stream) {
+                Ok(_) => self.late = false,
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => return Ok(Next::Late),
+                Err(e) => return Err(e).context("dequeue capture buffer"),
+            }
+        }
+        match CaptureStream::next(&mut self.stream) {
+            Ok((buf, meta)) => {
+                let used = meta.bytesused as usize;
+                Ok(Next::Frame(&buf[..used.min(buf.len())]))
+            }
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                self.late = true;
+                Ok(Next::Late)
+            }
+            Err(e) => Err(e).context("read capture frame"),
+        }
     }
 
     // STREAMOFF turns the camera's light off and returns every buffer; the
     // next `next_frame` requeues them and streams on again.
     fn pause(&mut self) -> Result<bool> {
         v4l::io::traits::Stream::stop(&mut self.stream).context("stop capture stream")?;
+        // STREAMOFF took every buffer back, including one a timed-out read
+        // was waiting on; the next read starts clean.
+        self.late = false;
         Ok(true)
     }
 }
@@ -139,15 +181,15 @@ impl FrameSource for StdinSource {
         (self.width, self.height)
     }
 
-    fn next_frame(&mut self) -> Result<Option<&[u8]>> {
+    fn next_frame(&mut self) -> Result<Next<'_>> {
         if self.eof {
-            return Ok(None);
+            return Ok(Next::End);
         }
         match self.stdin.read_exact(&mut self.buf) {
-            Ok(()) => Ok(Some(&self.buf)),
+            Ok(()) => Ok(Next::Frame(&self.buf)),
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 self.eof = true;
-                Ok(None)
+                Ok(Next::End)
             }
             Err(e) => Err(e).context("reading NV12 from stdin"),
         }

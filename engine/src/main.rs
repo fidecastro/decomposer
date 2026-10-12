@@ -22,7 +22,7 @@ mod rest;
 mod chain;
 mod seg;
 mod source;
-use source::{FrameSource, StdinSource, V4l2Source};
+use source::{FrameSource, Next, StdinSource, V4l2Source};
 
 /// With nobody watching, segment one frame in this many: twice a second
 /// at 30 fps.
@@ -401,11 +401,32 @@ fn main() -> Result<()> {
             }
             paused = false;
             rest.resumed(Instant::now());
+            if let Some(c) = model_chain.as_mut() {
+                c.forget_history();
+            }
             eprintln!("camera resumed");
         }
         let frame = match source.next_frame()? {
-            Some(f) => f,
-            None => break,
+            Next::Frame(f) => f,
+            Next::End => break,
+            // A camera slow to start again: viewers keep the held frame for
+            // the settle time. Past that nothing is published, so the
+            // daemon's stall watchdog sees a camera that never came back.
+            Next::Late => {
+                if rest.settling(Instant::now()) {
+                    let send_wanted = sink.as_mut().map_or(true, |s| s.wants_frame());
+                    let normal_wanted =
+                        normal_sink.as_mut().is_some_and(|s| s.wants_frame());
+                    let preview_wanted = preview.as_mut().is_some_and(|p| p.wants_frame());
+                    let preview_live = preview.as_mut().is_some_and(|p| p.live());
+                    publish_held(
+                        &mut sink, &mut normal_sink, &mut preview,
+                        (send_wanted, normal_wanted, preview_wanted || !preview_live),
+                        &held_out, held_normal.as_deref(), (out_w, out_h),
+                    )?;
+                }
+                continue;
+            }
         };
         if n == 0 {
             start = std::time::Instant::now();
@@ -578,7 +599,10 @@ fn main() -> Result<()> {
             || normal_sink.as_ref().is_some_and(|s| s.viewer_active());
 
         let step = rest.step(watched, Instant::now());
-        let settling = step == rest::Step::Settle;
+        // Settling, viewers keep the held frame. Priming, they still do, but
+        // the frame is segmented so the mask is current when video starts.
+        let priming = step == rest::Step::Prime;
+        let settling = step == rest::Step::Settle || priming;
         // The frame the camera pauses on is rendered in full, normal pass
         // included, so the held frames are fresh for both outputs.
         let pausing = step == rest::Step::Pause;
@@ -601,7 +625,8 @@ fn main() -> Result<()> {
             // a second keeps the keep-warm frames - the first thing a new
             // viewer sees - blurred for a fraction of the cost.
             let seg_every = if watched { 2 } else { IDLE_SEG_EVERY };
-            if c.active() && !settling && seg_frame % seg_every == 0 {
+            let camera_ready = !settling || priming;
+            if c.active() && camera_ready && seg_frame % seg_every == 0 {
                 c.submit(frame, w, h);
             }
             // An external producer (the mask socket - a user process, or the
@@ -680,11 +705,18 @@ fn main() -> Result<()> {
             held_out.clear();
             held_out.extend_from_slice(out);
             held_normal = normal_out.map(|b| b.to_vec());
-            if source.pause()? {
-                paused = true;
-                eprintln!("camera paused: nobody watching");
-            } else {
-                rest.cannot_pause();
+            // A failed STREAMOFF leaves the camera streaming, which is how
+            // it was before resting existed: carry on and try again later.
+            match source.pause() {
+                Ok(true) => {
+                    paused = true;
+                    eprintln!("camera paused: nobody watching");
+                }
+                Ok(false) => rest.cannot_pause(),
+                Err(e) => {
+                    eprintln!("camera pause failed, staying on: {e:#}");
+                    rest.pause_failed(Instant::now());
+                }
             }
         }
         n += 1;
