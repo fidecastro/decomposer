@@ -141,6 +141,11 @@ or classic broadcast bars — right-click to choose. A MIC chip tells
 the audio truth from ALSA, not from assumptions; a CAM chip shows whether
 the camera controls beside it are live. Every action that
 would reboot the camera's firmware asks first, with a real Cancel.
+A click anywhere outside the panel closes it, on the bar entry included, the
+way a menu does; Escape and the bar entry still work too. The click that
+closes it is not passed on to what was under it. To keep the panel open while
+you work elsewhere, set `"close_on_outside_click": false` in
+`~/.config/decomposer/panel.json`.
 Drag the dotted grip beside the title to place the panel anywhere on the current
 display—for example directly below a monitor-mounted camera. Its position is
 remembered; double-click the grip to return to the top-right default.
