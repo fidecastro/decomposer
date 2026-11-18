@@ -154,6 +154,11 @@ class HybridController:
             "--fw", str(self.config.firmware),
             "--tuning", str(self.config.tuning),
             "--mic-nodes",
+            # decomposer owns the camera and has just stopped any controller
+            # of its own, so a camera still running the RAM firmware has no
+            # host: its controller died while nothing was streaming, and the
+            # firmware carries on without one. The service resets it.
+            "--reclaim",
             "--socket", str(self.config.socket),
         ]
         self._proc = self._spawn(argv, stdin=subprocess.DEVNULL)
@@ -183,6 +188,20 @@ class HybridController:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
+
+    def reset_camera(self) -> bool:
+        """Send the camera back to its bootloader, from where it returns to
+        its stored firmware. For a camera left running the RAM firmware by a
+        controller that died: it does not go back by itself."""
+        try:
+            done = subprocess.run(
+                [self.config.binary, "reset"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return done.returncode == 0
 
     # -- commands --------------------------------------------------------
 

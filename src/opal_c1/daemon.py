@@ -311,6 +311,9 @@ class Daemon:
         # core.model.hybrid_plan.
         self._hybrid_strikes = 0
         self._hybrid_struck = None
+        # When the controller's session ended by itself (monotonic times).
+        self._hybrid_losses: list = []
+        self._hybrid_lost_since = None
         self._sticky: dict = {}
         # Segmentation choices are engine-startup facts, not live state.
         self.seg_model = seg_model
@@ -704,6 +707,8 @@ class Daemon:
             self._hybrid_stop()
             return None
         plan = model.hybrid_plan(self._hybrid_strikes)
+        if model.hybrid_losses_exceeded(self._hybrid_losses, time.monotonic()):
+            plan = "flash"
         if plan == "flash":
             self._hybrid_stop()
             print("hybrid keeps failing; using the camera's own firmware")
@@ -716,14 +721,16 @@ class Daemon:
             return None
         if plan == "reuse" and self._hybrid is not None and self._hybrid.ready():
             return self._hybrid
-        self._hybrid_stop()
+        # No waiting for the stored firmware here: the new controller waits
+        # for it itself, and reclaims a camera its predecessor left behind.
+        self._hybrid_stop(wait=False)
         controller = HybridController(config)
         try:
             controller.start()
         except (RuntimeError, OSError) as e:
             print(f"hybrid unavailable, using the camera's own firmware: {e}")
             controller.stop()
-            self._await_flash_firmware()
+            self._await_flash_firmware(reset=controller.reset_camera)
             with self.lock:
                 self.state.notice = (
                     "manual focus is unavailable: opal-controller could not "
@@ -733,23 +740,38 @@ class Daemon:
         self._hybrid = controller
         return controller
 
-    def _hybrid_stop(self) -> None:
+    def _hybrid_stop(self, wait: bool = True) -> None:
         """Release the camera from the controller and wait for it to settle
         back on its flash firmware, which is where every other entry starts."""
         controller, self._hybrid = self._hybrid, None
         if controller is None:
             return
         controller.stop()
-        self._await_flash_firmware()
+        if wait:
+            self._await_flash_firmware(reset=controller.reset_camera)
 
     @staticmethod
-    def _await_flash_firmware(timeout: float = 45.0) -> None:
+    def _await_flash_firmware(timeout: float = 45.0, reset=None) -> None:
+        """Wait for the camera to be back on its stored firmware.
+
+        A controller that ended cleanly leaves the camera rebooting towards
+        it. One that died while nothing was streaming leaves the firmware
+        running in RAM with no host, where it stays; `reset` is called once
+        if the camera is still there after a few seconds.
+        """
         from opal_c1.modes import on_flash_firmware
 
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        started = time.monotonic()
+        while time.monotonic() - started < timeout:
             if on_flash_firmware():
                 return
+            if (
+                reset is not None
+                and time.monotonic() - started >= 6.0
+                and current_mode() is Mode.CALL
+            ):
+                reset()
+                reset = None
             time.sleep(0.3)
 
     def enter_parked(self) -> None:
@@ -1873,7 +1895,11 @@ class Daemon:
                     # is not a death and must not feed the policy counters.
                     continue
                 engine = self._engine
-                if engine is not None and engine.alive():
+                hybrid_lost = (
+                    engine is not None and engine.alive()
+                    and self._hybrid is not None and not self._hybrid.alive()
+                )
+                if engine is not None and engine.alive() and not hybrid_lost:
                     policy.note_alive()
                     if self._hybrid_struck == "never started":
                         self._hybrid_struck = None
@@ -1886,6 +1912,16 @@ class Daemon:
                     if self.state.notice and self.state.frames > 0:
                         self.state.notice = None
                     continue
+                if hybrid_lost:
+                    mode = Mode(self.state.mode)
+            if hybrid_lost:
+                # The controller's session ended while the engine sat idle:
+                # the camera is back on its stored firmware under a new video
+                # node, and the engine would only find out when a call asks
+                # for frames. Re-enter now, while nobody is waiting.
+                self._recover_lost_hybrid(mode)
+                continue
+            with self.lock:
                 # Covers both an engine that died and one that never started
                 # (a mode switch that failed mid-camera-reboot).
                 reason = (
@@ -1994,6 +2030,28 @@ class Daemon:
                 self.state.error = None
                 self.state.last_event = f"engine restarted after: {reason}"
             print(f"engine restarted (total restarts: {self.restarts})")
+
+    def _recover_lost_hybrid(self, mode: Mode) -> None:
+        now = time.monotonic()
+        if self._hybrid_lost_since is None:
+            self._hybrid_lost_since = now
+            print("opal-controller's session ended by itself; restoring Call mode")
+        if not self._camera_settled():
+            return  # mid-reboot, or unplugged; the next pass tries again
+        # A camera that is back within the time a reboot takes crashed out of
+        # the session. One that was away longer was unplugged, which is no
+        # fault of the session.
+        if time.monotonic() - self._hybrid_lost_since <= model.HYBRID_REBOOT_SECONDS:
+            self._hybrid_losses.append(now)
+        self._hybrid_lost_since = None
+        try:
+            self.request_transition(mode, enforce_guard=False)
+        except Exception as e:
+            print(f"could not restore Call mode: {e}")
+            return
+        with self.lock:
+            self.restarts += 1
+            self.state.last_event = "restored after opal-controller's session ended"
 
     def _camera_settled(self, dwell: float = 3.0) -> bool:
         """True if the camera is on the bus and has stayed put.

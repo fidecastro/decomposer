@@ -112,6 +112,22 @@ CALL_SENSOR_SIZE = (3840, 2160)
 HYBRID_HEALTHY_SECONDS = 30.0
 
 
+# A controller session that ends by itself is restarted at once, so that it
+# is not discovered at the start of a call. This many endings inside the
+# window mean the session cannot be kept, and Call mode stops asking for it.
+HYBRID_LOSS_WINDOW_SECONDS = 3600.0
+HYBRID_LOSS_LIMIT = 3
+# A camera that crashed out of a session is back on its stored firmware
+# within about 20 s; one that takes longer than this was unplugged.
+HYBRID_REBOOT_SECONDS = 45.0
+
+
+def hybrid_losses_exceeded(loss_times, now: float) -> bool:
+    """True when the controller's session has ended by itself too often."""
+    recent = [t for t in loss_times if now - t <= HYBRID_LOSS_WINDOW_SECONDS]
+    return len(recent) >= HYBRID_LOSS_LIMIT
+
+
 def hybrid_plan(strikes: int) -> str:
     """What Call mode should run on after `strikes` feeds in a row died
     young under opal-controller.
