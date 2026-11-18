@@ -126,14 +126,16 @@ returns it to the stored firmware.
 What stays Studio-only: frame rates above 30, the 4:3 12 MP mode and the
 on-camera person mask.
 
-It is opt-in, because of one limit. Under the controller the camera's
-video stream does not reliably start again once it has been stopped: every
-restart one second after a stop failed, and about one in fifteen after
-longer pauses, where the stored firmware survived 42 of 42. So in this mode
-decomposer never pauses the camera. **It stays on, light included, for as
-long as Call mode runs.** Streaming continuously it ran for an hour without
-a fault. If you want the camera to switch off when no application is
-using it, stay on the default.
+It is opt-in, because of one limit. In this mode decomposer does not pause
+the camera. **It stays on, light included, for as long as Call mode runs.**
+Kept on, it ran three one-hour soaks and a real call without a fault. The
+controller itself now stops and restarts the stream as reliably as the
+stored firmware (0 of 300 restarts failed), but pausing through decomposer
+still cost the session twice in 60 pauses, and a call must not begin with a
+40-second wait. If you want the camera to switch off when no application is
+using it, stay on the default, or set `DECOMPOSER_HYBRID_PAUSE=1` as well to
+try pausing. Use a controller build from 2026-11-18 or later; older ones
+lose the camera far more often.
 
 To turn it on, set `DECOMPOSER_HYBRID=1` for the daemon (for the user
 service: `Environment=DECOMPOSER_HYBRID=1` under `[Service]`) and have:
