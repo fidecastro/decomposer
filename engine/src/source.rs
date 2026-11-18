@@ -17,6 +17,7 @@ use std::slice;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use v4l::buffer::Type;
+use v4l::control::{Control, Value as ControlValue};
 use v4l::device::Handle;
 use v4l::io::traits::CaptureStream;
 use v4l::memory::Memory;
@@ -237,13 +238,33 @@ impl V4l2Sink {
         // 630-661, the exact mirror positions. Publishing I420 lets every
         // consumer take the frames natively and the flipping code never runs.
         let want = Format::new(width, height, FourCC::new(b"YU12"));
-        let got = Output::set_format(&dev, &want).context("set output format")?;
+        let fits = |f: &Format| f.width == width && f.height == height && &f.fourcc.repr == b"YU12";
+        let mut got = Output::set_format(&dev, &want).context("set output format")?;
+        if !fits(&got) {
+            // keep_format pins the device to its current format (see below),
+            // and a pinned device answers S_FMT with that format, not ours.
+            // Release it and ask again. If a viewer is holding the device the
+            // driver still refuses, and the check below reports it.
+            let _ = set_keep_format(&dev, false);
+            got = Output::set_format(&dev, &want).context("set output format")?;
+        }
         if got.width != width || got.height != height || &got.fourcc.repr != b"YU12" {
             bail!(
                 "{path} rejected {width}x{height} YU12 (got {}x{} {}). \
                  Is v4l2loopback loaded? See docs/SETUP.md",
                 got.width, got.height, got.fourcc
             );
+        }
+
+        // Pin the format. An exclusive-caps loopback reports itself as a
+        // camera only while a producer streams, unless keep_format is set;
+        // PipeWire looks at a device once, when it appears, and never offers
+        // one that was output-only at that moment. packaging/59-decomposer-
+        // loopback.rules sets this at device creation; setting it here too
+        // keeps the device a camera across engine restarts and re-pins it
+        // after a resolution change.
+        if let Err(e) = set_keep_format(&dev, true) {
+            eprintln!("output {path}: could not set keep_format ({e}); the camera may be missing from PipeWire");
         }
 
         let usage_events = subscribe_client_usage(&dev).is_ok();
@@ -495,6 +516,17 @@ fn map_output_buffers(handle: &Handle, count: u32) -> Result<Vec<&'static mut [u
         buffers.push(unsafe { slice::from_raw_parts_mut(ptr as *mut u8, len) });
     }
     Ok(buffers)
+}
+
+/// v4l2loopback's private control: lock the format and keep reporting
+/// CAPTURE when no producer is attached.
+const V4L2_CID_KEEP_FORMAT: u32 = 0x0098_f900;
+
+fn set_keep_format(dev: &Device, on: bool) -> io::Result<()> {
+    dev.set_control(Control {
+        id: V4L2_CID_KEEP_FORMAT,
+        value: ControlValue::Boolean(on),
+    })
 }
 
 fn subscribe_client_usage(dev: &Device) -> io::Result<()> {
