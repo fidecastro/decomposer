@@ -100,6 +100,7 @@ def _install(tmp_path):
     data.mkdir(parents=True)
     (data / "firmware.mvcmd").write_bytes(b"fw")
     (data / "camTuning.bin").write_bytes(b"tuning")
+    (data / "detection.blob").write_bytes(b"nn")
     binary = tmp_path / "opalctl"
     binary.write_text("#!/bin/sh\n")
     return {
@@ -135,9 +136,10 @@ def test_the_engine_is_told_to_keep_a_hybrid_camera_on():
     assert hybrid.needs_restart_from(plain)
 
 
-def test_no_hybrid_without_the_cameras_firmware(tmp_path):
+@pytest.mark.parametrize("missing", ["firmware.mvcmd", "camTuning.bin", "detection.blob"])
+def test_no_hybrid_without_all_of_the_cameras_files(tmp_path, missing):
     env = _install(tmp_path)
-    (tmp_path / "share/opal-controller/firmware.mvcmd").unlink()
+    (tmp_path / "share/opal-controller" / missing).unlink()
     assert hybrid_config(env) is None
 
 
@@ -206,7 +208,7 @@ class FakeService:
 def rig(tmp_path):
     config = HybridConfig(
         binary="/opt/opalctl", firmware=tmp_path / "fw", tuning=tmp_path / "tun",
-        socket=tmp_path / "run/ctl.sock",
+        detection=tmp_path / "nn", socket=tmp_path / "run/ctl.sock",
     )
     made = {}
 
@@ -231,6 +233,7 @@ def test_start_waits_for_ready_and_passes_the_graph_options(rig):
     argv = made["argv"]
     assert argv[:2] == ["/opt/opalctl", "serve"]
     assert "--mic-nodes" in argv and "--socket" in argv and "--reclaim" in argv
+    assert "--detection-blob" in argv
     assert made["service"].seen.count("status") >= 4
 
 
@@ -283,7 +286,7 @@ def test_commands_refusals_and_telemetry(rig):
 
 
 def test_a_silent_controller_is_not_ready(tmp_path):
-    config = HybridConfig("/opt/opalctl", tmp_path / "fw", tmp_path / "tun", tmp_path / "nobody.sock")
+    config = HybridConfig("/opt/opalctl", tmp_path / "fw", tmp_path / "tun", tmp_path / "nn", tmp_path / "nobody.sock")
     controller = HybridController(config)
     assert controller.state() is None
     assert not controller.ready()
