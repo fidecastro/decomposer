@@ -104,6 +104,13 @@ class UvcBackend:
                 control = uvc.query(name)
                 if control is not None and control.value is not None:
                     out[key] = control.value
+            # While the camera drives exposure itself, the exposure and gain
+            # registers keep their last manual values: they are not what the
+            # sensor is using, and reporting them would say "manual".
+            mode = uvc.query("auto_exposure")
+            if mode is not None and mode.value == uvc.AUTO_EXPOSURE_AUTO:
+                out["exposure"] = -1
+                out["iso"] = -1
         except OSError:
             pass
         return out
