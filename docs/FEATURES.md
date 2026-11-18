@@ -16,6 +16,11 @@ explicit instead of hiding it:
   rates** — and no microphone, because that firmware has no audio at
   all. This is a hardware fact, not a setting.
 
+With [opal-controller](https://github.com/fidecastro/opal-controller)
+installed, Call mode gains **manual focus** while keeping the microphone:
+the camera's own firmware is booted into RAM, where it also serves a control
+channel. See docs/SETUP.md.
+
 Switching takes one firmware reboot (~15 s) and always asks first. The
 panel shows only the controls the current mode can actually drive, keeps
 the same size in both modes, and dims everything while the feed is down.

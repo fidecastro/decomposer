@@ -70,9 +70,11 @@ from opal_c1.core.model import (  # noqa: E402
 )
 
 
-def model_controls_for(mode: str) -> frozenset:
+def model_controls_for(mode: str, extra=()) -> frozenset:
+    """Controls the daemon will accept now. `extra` is status's
+    extra_controls: what a hybrid Call session adds (manual focus)."""
     try:
-        return _controls_for(_Mode(mode))
+        return _controls_for(_Mode(mode), frozenset(extra or ()))
     except ValueError:
         return frozenset()
 
@@ -148,7 +150,9 @@ SLIDERS = [
     ("sharpness", "Sharpness", 0, 4, 1, (CALL,)),
     ("exposure", "Exposure", 1000, 33000, 100, (CALL, STUDIO)),
     ("iso", "ISO", 100, 1600, 50, (CALL, STUDIO)),
-    ("focus", "Focus", 0, 255, 1, (STUDIO,)),
+    # In Call mode focus works only while the camera's firmware runs under
+    # opal-controller; on the flash firmware the row shows "-".
+    ("focus", "Focus", 0, 255, 1, (CALL, STUDIO)),
     ("wb", "White bal.", 1000, 12000, 100, (STUDIO,)),
 ]
 
@@ -2602,7 +2606,7 @@ class Panel(Gtk.Box):
                 on_auto = value == -1
                 # A value the current mode cannot report shows "-": drawing
                 # the slider at minimum would claim a setting of zero.
-                known = key in model_controls_for(mode)
+                known = key in model_controls_for(mode, st.get("extra_controls"))
                 for auto in self.auto_buttons.get(key, []):
                     # -1 means the camera is driving it.
                     (auto.add_css_class if on_auto
@@ -2624,7 +2628,11 @@ class Panel(Gtk.Box):
         self.camera_hint.set_text(
             "tap the preview to focus \u00b7 scroll to zoom, drag to pan"
             if studio
-            else "Focus, white balance and effects live in Studio mode"
+            else (
+                "manual focus is on \u00b7 white balance and effects live in Studio mode"
+                if st.get("hybrid")
+                else "Focus, white balance and effects live in Studio mode"
+            )
         )
 
         if time.monotonic() < getattr(self, "_flash_until", 0.0):

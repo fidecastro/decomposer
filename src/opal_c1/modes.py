@@ -36,6 +36,7 @@ from opal_c1.core.model import (  # noqa: F401
     Mode,
     PID_CALL,
     call_settle_remaining,
+    mode_for_identity,
     PID_STUDIO,
     USB_VID,
 )
@@ -98,9 +99,21 @@ def current_mode() -> Optional[Mode]:
         return None
     try:
         pid = (entry / "idProduct").read_text().strip()
+        bcd = (entry / "bcdDevice").read_text().strip()
     except OSError:
         return None
-    return Mode.CALL if pid == PID_CALL else Mode.STUDIO
+    return mode_for_identity(pid, bcd)
+
+
+def on_flash_firmware() -> bool:
+    """True while the camera is on its own stored firmware (not RAM-booted)."""
+    entry = find_camera()
+    if entry is None:
+        return False
+    try:
+        return (entry / "idProduct").read_text().strip() == PID_CALL
+    except OSError:
+        return False
 
 
 def wait_for_mode(mode: Mode, timeout: float = 40.0) -> Optional[float]:

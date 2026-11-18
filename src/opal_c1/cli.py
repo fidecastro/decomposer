@@ -634,6 +634,9 @@ def _print_status(st: dict) -> None:
             print("  mic       live — select 'Opal C1' in your app")
         else:
             print("  mic       none — Studio firmware has no microphone")
+        if st.get("hybrid"):
+            print("  hybrid    on — firmware in RAM under opal-controller; "
+                  "manual focus available")
     if st.get("notice"):
         print(f"  notice    {st['notice']}")
     if st.get("last_event"):
@@ -1584,8 +1587,9 @@ def build_parser() -> argparse.ArgumentParser:
         "set",
         help="Adjust camera controls via the daemon",
         description=(
-            "Routed to whichever path the current mode allows. focus and wb need "
-            "Studio mode; everything else works in either."
+            "Routed to whichever path the current mode allows. wb needs Studio "
+            "mode; focus needs Studio mode, or Call mode under opal-controller; "
+            "everything else works in either."
         ),
     )
     for name, helptext in (

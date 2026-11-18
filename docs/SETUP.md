@@ -103,6 +103,34 @@ decomposer install-service       # writes a user unit, no privileges needed
 systemctl --user enable --now decomposer
 ```
 
+## Manual focus in Call mode (opal-controller)
+
+Call mode normally runs the camera's stored firmware, which offers video and
+the microphone but no manual focus. With
+[opal-controller](https://github.com/fidecastro/opal-controller) installed,
+decomposer instead has it boot the camera's own, unmodified firmware into
+RAM. The camera then presents the same video and microphone, plus a control
+channel: the Focus slider works in Call mode. Nothing is written to the
+camera's flash; unplugging it returns it to the stored firmware.
+
+decomposer uses this automatically when all of these exist:
+
+- `opalctl` on `PATH` or at `~/.local/bin/opalctl` (or `DECOMPOSER_OPALCTL`);
+- `~/.local/share/opal-controller/firmware.mvcmd` and `camTuning.bin`, taken
+  from your own camera (the controller's documentation describes how);
+- optionally `detection.blob`, the camera's detection network.
+
+Set `DECOMPOSER_HYBRID=0` to turn it off. If the controller cannot start,
+decomposer says so in `decomposer status` and runs Call mode on the stored
+firmware as before. `decomposer status` shows `hybrid` when it is in use.
+
+Entering Call mode this way takes about 15 seconds longer the first time:
+the camera reboots into RAM and the firmware is given time to settle before
+anything asks it to stream. An engine restart does not repeat that.
+
+Known limit: autofocus is less steady and slightly softer than on the stored
+firmware (measured on a static scene: sharpness varied 9-10% against 0-1%).
+
 ## USB 2 recovery
 
 If the C1 repeatedly enumerates as `03e7:f63c` and fails to start over
