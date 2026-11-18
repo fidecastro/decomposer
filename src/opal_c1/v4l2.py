@@ -204,6 +204,10 @@ V4L2_CAP_VIDEO_CAPTURE = 0x00000001
 V4L2_CAP_VIDEO_OUTPUT = 0x00000002
 
 
+# The driver name a v4l2loopback node reports in VIDIOC_QUERYCAP.
+LOOPBACK_DRIVER = b"v4l2 loopback"
+
+
 def exclusive_caps_ready(dev_path: str) -> bool:
     """True when a loopback node exposes only its currently usable direction.
 
@@ -230,12 +234,17 @@ def exclusive_caps_ready(dev_path: str) -> bool:
 
 
 def output_ready(dev_path: str) -> bool:
-    """True if the node exists and answers as a video OUTPUT device.
+    """True if the node exists and can be handed frames.
 
-    That is what a v4l2loopback node looks like before a producer attaches
-    (with exclusive_caps) or at any time (without). A real camera that has
-    ended up at the same path advertises capture only, and must not be
-    handed frames as if it were ours.
+    Either it answers as a video OUTPUT device - a v4l2loopback node before a
+    producer attaches (with exclusive_caps) or at any time (without) - or it
+    is a v4l2loopback node presenting as a camera. The second case is a node
+    whose format is pinned (keep_format, which packaging/59-decomposer-
+    loopback.rules and the engine both set so that PipeWire offers it): it
+    advertises capture only even while idle, and is still ours to feed.
+
+    A real camera that has ended up at the same path advertises capture only
+    under another driver, and must not be handed frames.
     """
     try:
         fd = os.open(dev_path, os.O_RDWR | os.O_NONBLOCK)
@@ -246,7 +255,8 @@ def output_ready(dev_path: str) -> bool:
         fcntl.ioctl(fd, VIDIOC_QUERYCAP, buf, True)
         values = struct.unpack(_QUERYCAP_FMT, bytes(buf))
         caps = values[5] or values[4]
-        return bool(caps & V4L2_CAP_VIDEO_OUTPUT)
+        driver = values[0].split(b"\0", 1)[0]
+        return bool(caps & V4L2_CAP_VIDEO_OUTPUT) or driver == LOOPBACK_DRIVER
     except OSError:
         return False
     finally:
