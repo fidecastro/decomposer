@@ -42,6 +42,7 @@ class HybridConfig:
     binary: str
     firmware: Path
     tuning: Path
+    detection: Path
     socket: Path
 
 
@@ -73,11 +74,15 @@ def hybrid_config(env: Mapping[str, str] = os.environ) -> Optional[HybridConfig]
         return None
     data = data_dir(env)
     firmware, tuning = data / "firmware.mvcmd", data / "camTuning.bin"
-    if not (firmware.is_file() and tuning.is_file()):
+    # The camera's detection network is part of the graph it ships with, and
+    # the graph is not stable without it (opal-controller, knowledge base
+    # page 11), so it is required, not optional.
+    detection = data / "detection.blob"
+    if not (firmware.is_file() and tuning.is_file() and detection.is_file()):
         return None
     runtime = env.get("XDG_RUNTIME_DIR") or f"/tmp/decomposer-{os.getuid()}"
     return HybridConfig(
-        binary=binary, firmware=firmware, tuning=tuning,
+        binary=binary, firmware=firmware, tuning=tuning, detection=detection,
         socket=Path(runtime) / "decomposer" / "opal-controller.sock",
     )
 
@@ -159,6 +164,7 @@ class HybridController:
             self.config.binary, "serve",
             "--fw", str(self.config.firmware),
             "--tuning", str(self.config.tuning),
+            "--detection-blob", str(self.config.detection),
             "--mic-nodes",
             # decomposer owns the camera and has just stopped any controller
             # of its own, so a camera still running the RAM firmware has no

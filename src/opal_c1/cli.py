@@ -1005,7 +1005,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     else:
         optional("opal-controller", "not in use",
                  "optional: DECOMPOSER_HYBRID=1, with opalctl on PATH and "
-                 f"firmware.mvcmd and camTuning.bin in {data_dir()}, gives Call "
+                 f"firmware.mvcmd, camTuning.bin and detection.blob in {data_dir()}, gives Call "
                  "mode Studio's controls and keeps the camera on; "
                  "see docs/SETUP.md")
 

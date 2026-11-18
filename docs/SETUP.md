@@ -131,8 +131,9 @@ To turn it on, set `DECOMPOSER_HYBRID=1` for the daemon (for the user
 service: `Environment=DECOMPOSER_HYBRID=1` under `[Service]`) and have:
 
 - `opalctl` on `PATH` or at `~/.local/bin/opalctl` (or `DECOMPOSER_OPALCTL`);
-- `~/.local/share/opal-controller/firmware.mvcmd` and `camTuning.bin`, taken
-  from your own camera (the controller's documentation describes how).
+- `~/.local/share/opal-controller/firmware.mvcmd`, `camTuning.bin` and
+  `detection.blob`, taken from your own camera (the controller's
+  documentation describes how). All three are needed.
 
 Run this way the camera's microphone carries a generic USB name, and
 applications list it as "Myriad VPU [Movidius Neural Compute Stick]". To
