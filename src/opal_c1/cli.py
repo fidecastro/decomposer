@@ -899,7 +899,19 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     check(model is not None, "person-segmentation model", str(model or ""),
           "models/selfie_segmentation.onnx ships with the repo")
 
-    loop = Path("/dev/video10")
+    # The loopback nodes are configuration, not constants: ask the running
+    # daemon which ones it publishes to, and fall back to the defaults.
+    from opal_c1.core.model import BCD_OPAL_FIRMWARE
+    from opal_c1.daemon import Client
+
+    send_node, normal_node = "/dev/video10", "/dev/video11"
+    try:
+        live = Client().request(cmd="status")
+        send_node = live.get("output") or send_node
+        normal_node = live.get("normal_output") or normal_node
+    except (OSError, ValueError):
+        pass
+    loop = Path(send_node)
     check(loop.exists(), "SEND v4l2loopback node", str(loop),
           "see docs/SETUP.md \u00a7 The virtual cameras")
     check(loop.exists() and exclusive_caps_ready(str(loop)), "exclusive_caps",
@@ -907,7 +919,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
           "see docs/SETUP.md \u00a7 The virtual cameras")
     # The second node is a convenience the daemon does without: an install
     # from before it existed is complete, not broken.
-    normal_loop = Path("/dev/video11")
+    normal_loop = Path(normal_node)
     if normal_loop.exists():
         check(exclusive_caps_ready(str(normal_loop)),
               "normal v4l2loopback node", str(normal_loop),
@@ -938,17 +950,34 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
                       "install packaging/59-decomposer-loopback.rules and reload "
                       "the module; see docs/SETUP.md \u00a7 The virtual cameras")
 
-    camera = None
+    camera = bcd = None
     for dev in Path("/sys/bus/usb/devices").glob("*"):
         vid = dev / "idVendor"
         if vid.is_file() and vid.read_text().strip() == "03e7":
             camera = (dev / "idProduct").read_text().strip()
+            with suppress(OSError):
+                bcd = (dev / "bcdDevice").read_text().strip()
             break
     labels = {"f63d": "Call firmware", "f63b": "Studio firmware",
               "f63c": "bootloader (transitional)"}
-    check(camera is not None, "camera on USB",
-          labels.get(camera, camera or ""),
+    label = labels.get(camera, camera or "")
+    if camera == "f63b" and bcd == BCD_OPAL_FIRMWARE:
+        label = "Call firmware in RAM, under opal-controller"
+    check(camera is not None, "camera on USB", label,
           "plug the Opal C1 into a USB 3 port")
+
+    # Optional: Studio's controls in Call mode.
+    from opal_c1.adapters.controller_proc import data_dir, hybrid_config
+    if hybrid_config() is not None:
+        check(True, "opal-controller", "installed; Call mode uses it")
+    elif os.environ.get("DECOMPOSER_HYBRID", "1").strip().lower() in ("0", "no", "off", "false"):
+        optional("opal-controller", "turned off by DECOMPOSER_HYBRID",
+                 "unset it to give Call mode manual focus and white balance")
+    else:
+        optional("opal-controller", "not installed, or its firmware files are missing",
+                 "optional: opalctl on PATH plus firmware.mvcmd and camTuning.bin "
+                 f"in {data_dir()} give Call mode Studio's controls; "
+                 "see docs/SETUP.md")
 
     quirks = Path("/sys/module/usbcore/parameters/quirks")
     quirk_ok = quirks.is_file() and "03e7:f63d" in quirks.read_text()
