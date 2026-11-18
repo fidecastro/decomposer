@@ -2601,6 +2601,11 @@ class Panel(Gtk.Box):
             self.zoom_scale.set_value(float(st.get("zoom", 1.0)))
             self.clahe_scale.set_value(float(st.get("clahe", 0.0)))
             self.blur_scale.set_value(float(st.get("blur", 0.0)))
+            # A slider already at the reported value emits no change, so the
+            # boxes beside these three stayed empty until first touched.
+            self._set_value_text(self.zoom_value, f"{self.zoom_scale.get_value():.1f}")
+            self._set_value_text(self.clahe_value, f"{self.clahe_scale.get_value():.2f}")
+            self._set_value_text(self.blur_value, f"{self.blur_scale.get_value():.2f}")
             self.blur_label.set_text(
                 "Bokeh" if st.get("blur_style") else "Blur"
             )
