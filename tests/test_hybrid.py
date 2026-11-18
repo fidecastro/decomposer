@@ -85,6 +85,14 @@ def test_repeated_young_deaths_escalate_from_reuse_to_fresh_to_flash():
     ]
 
 
+def test_a_session_that_keeps_ending_is_given_up():
+    assert not model.hybrid_losses_exceeded([], now=5000)
+    assert not model.hybrid_losses_exceeded([100, 200], now=300)
+    assert model.hybrid_losses_exceeded([100, 200, 290], now=300)
+    # Old losses are forgotten: one bad hour does not condemn the next day.
+    assert not model.hybrid_losses_exceeded([100, 200, 290], now=100 + 3600 + 150)
+
+
 # -- configuration ----------------------------------------------------------
 
 def _install(tmp_path):
@@ -209,7 +217,7 @@ def test_start_waits_for_ready_and_passes_the_graph_options(rig):
     assert controller.ready()
     argv = made["argv"]
     assert argv[:2] == ["/opt/opalctl", "serve"]
-    assert "--mic-nodes" in argv and "--socket" in argv
+    assert "--mic-nodes" in argv and "--socket" in argv and "--reclaim" in argv
     assert made["service"].seen.count("status") >= 4
 
 
