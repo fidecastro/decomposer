@@ -377,8 +377,14 @@ class Daemon:
         """
         self._mark_missing_models()
         st = self.state
+        input_node = "-" if from_stdin else camera_video_node()
+        if input_node is None:
+            raise RuntimeError(
+                "Opal C1 capture device is unavailable; the camera may be "
+                "disconnected or still booting"
+            )
         return model.EngineConfig(
-            input="-" if from_stdin else (camera_video_node() or "/dev/video0"),
+            input=input_node,
             output=st.output,
             # Handed over only when the node answers as a video output: a
             # missing node, or a real camera that landed on /dev/video11,

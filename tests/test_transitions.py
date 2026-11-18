@@ -65,6 +65,28 @@ def test_attach_never_targets_bootloader():
     assert "transition" in decision.reason
 
 
+def test_explicit_settled_bootloader_recovery_can_attach():
+    decision = choose_device(
+        [("X_LINK_BOOTLOADER", "X_LINK_SUCCESS")], allow_bootloader=True
+    )
+    assert decision.action is AttachAction.ATTACH
+
+
+def test_bootloader_recovery_never_accepts_an_errored_device():
+    decision = choose_device(
+        [("X_LINK_BOOTLOADER", "X_LINK_ERROR")], allow_bootloader=True
+    )
+    assert decision.action is AttachAction.WAIT
+
+
+def test_recovery_still_prefers_a_device_already_running_firmware():
+    decision = choose_device([
+        ("X_LINK_BOOTLOADER", "X_LINK_SUCCESS"),
+        ("X_LINK_FLASH_BOOTED", "X_LINK_SUCCESS"),
+    ], allow_bootloader=True)
+    assert decision.index == 1
+
+
 def test_attach_skips_errored_device():
     # Matches the depthai log line: "skipping ... (status: X_LINK_ERROR)".
     decision = choose_device([("X_LINK_FLASH_BOOTED", "X_LINK_ERROR")])

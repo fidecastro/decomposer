@@ -15,6 +15,7 @@ Only depthai and numpy are needed here — no OpenCV.
 
 from __future__ import annotations
 
+import os
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -81,7 +82,9 @@ class Frame:
         )
 
 
-def find_device(deadline_s: float = 20.0) -> dai.DeviceInfo:
+def find_device(
+    deadline_s: float = 20.0, *, allow_bootloader: bool = False
+) -> dai.DeviceInfo:
     """A device that is actually safe to attach to, or a clear error.
 
     Never `devices[0]`: a switch that lands while the camera is mid-reboot
@@ -89,15 +92,27 @@ def find_device(deadline_s: float = 20.0) -> dai.DeviceInfo:
     "Couldn't read data from stream: `_bootloader` (X_LINK_ERROR)". The pure
     policy in core.transitions decides; this loop just feeds it fresh facts
     until it says attach or the deadline passes.
+
+    Explicit USB 2 recovery may attach to a bootloader after three seconds
+    of stable enumeration, allowing a RAM boot when USB 3 startup fails.
     """
     from opal_c1.core.transitions import AttachAction, choose_device
 
     t0 = time.monotonic()
+    previous = None
+    stable_since = t0
     last_reason = "no DepthAI device on the bus"
     while True:
         devices = dai.Device.getAllAvailableDevices()
+        now = time.monotonic()
+        observed = tuple(
+            (d.getDeviceId(), d.state.name, d.status.name) for d in devices
+        )
+        if observed != previous:
+            previous, stable_since = observed, now
         decision = choose_device(
-            [(d.state.name, d.status.name) for d in devices]
+            [(d.state.name, d.status.name) for d in devices],
+            allow_bootloader=allow_bootloader and now - stable_since >= 3.0,
         )
         if decision.action is AttachAction.ATTACH:
             return devices[decision.index]
@@ -150,8 +165,14 @@ class OpalDevice:
         self.close()
 
     def open(self) -> "OpalDevice":
-        info = find_device()
-        self._device = dai.Device(info)
+        # Some USB 3 host/cable combinations cannot bring the C1 out of its
+        # bootloader. Explicit USB 2 recovery boots only into RAM and leaves
+        # the camera's stored Opal firmware intact.
+        usb2 = os.environ.get("DECOMPOSER_USB_SPEED") == "high"
+        info = find_device(allow_bootloader=usb2)
+        self._device = (
+            dai.Device(info, dai.UsbSpeed.HIGH) if usb2 else dai.Device(info)
+        )
         self._pipeline = dai.Pipeline(self._device)
         cam = self._pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
         # The C1's sensor is mounted upside down. Opal's own firmware corrects

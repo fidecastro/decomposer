@@ -2,8 +2,21 @@
 only while the engine publishes it."""
 
 import opal_c1.daemon as daemon_module
+import pytest
 from opal_c1.core.model import EngineConfig
 from opal_c1.daemon import Daemon
+
+
+def test_missing_opal_never_falls_back_to_an_unrelated_video_device(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(daemon_module, "camera_video_node", lambda: None)
+    daemon = Daemon()
+    with pytest.raises(RuntimeError, match="Opal C1 capture device is unavailable"):
+        daemon._engine_config(False)
+    # Studio receives frames over stdin and needs no V4L2 capture node.
+    assert daemon._engine_config(True).input == "-"
 
 
 def test_normal_output_is_offered_only_when_the_node_takes_frames(
