@@ -30,10 +30,12 @@ from typing import Optional
 # that observes them on the actual bus. Names are re-exported so existing
 # imports keep working.
 from opal_c1.core.model import (  # noqa: F401
+    CALL_STREAM_SETTLE_SECONDS,
     CAPABILITIES,
     Capabilities,
     Mode,
     PID_CALL,
+    call_settle_remaining,
     PID_STUDIO,
     USB_VID,
 )
@@ -111,19 +113,46 @@ def wait_for_mode(mode: Mode, timeout: float = 40.0) -> Optional[float]:
     return None
 
 
-def wait_until_capturable(timeout: float = 40.0) -> Optional[float]:
-    """Call mode only: wait until /dev/video0 can actually capture again.
+def seconds_since_enumeration() -> Optional[float]:
+    """How long the camera has been on the bus in its current personality.
 
-    The node reappears a little after the device re-enumerates, and can be
-    opened before it will stream, so this checks it answers VIDIOC_QUERYCAP as
-    a capture device rather than just testing for the path.
+    Read from the kernel's own counter for the USB device, which restarts at
+    every enumeration. None if the camera is absent or the counter is not
+    readable.
+    """
+    entry = find_camera()
+    if entry is None:
+        return None
+    try:
+        return int((entry / "power/connected_duration").read_text()) / 1000.0
+    except (OSError, ValueError):
+        return None
+
+
+def wait_until_capturable(timeout: float = 40.0) -> Optional[float]:
+    """Call mode only: wait until the camera can be asked to stream.
+
+    Two conditions. The capture node must answer VIDIOC_QUERYCAP as a capture
+    device: it reappears a little after the device re-enumerates, and a bare
+    path test passes too early. And the firmware must have been up for
+    CALL_STREAM_SETTLE_SECONDS: asked to stream sooner, it crashes (see
+    core/model.py). The settle wait is not charged to `timeout`; it is
+    bounded by the settle time itself.
     """
     t0 = time.time()
     while time.time() - t0 < timeout:
         if camera_video_node() is not None:
-            return round(time.time() - t0, 1)
+            break
         time.sleep(0.2)
-    return None
+    else:
+        return None
+    settle_deadline = time.time() + CALL_STREAM_SETTLE_SECONDS + 1.0
+    while time.time() < settle_deadline:
+        remaining = call_settle_remaining(seconds_since_enumeration())
+        if remaining <= 0:
+            break
+        time.sleep(min(remaining, 0.2))
+    return round(time.time() - t0, 1)
 
 
 def describe(mode: Mode) -> str:
