@@ -835,9 +835,22 @@ def _cmd_resolution(args: argparse.Namespace) -> int:
     return 0
 
 
-def _pipewire_camera_paths() -> "set | None":
-    """V4L2 device paths PipeWire offers as camera sources, or None if
-    PipeWire cannot be asked."""
+def pipewire_cameras(objects) -> dict:
+    """From a pw-dump listing: each V4L2 path PipeWire offers as a camera
+    source, and whether PipeWire knows a picture format for it. A source
+    without formats is listed by PipeWire but hidden by browsers."""
+    cameras = {}
+    for obj in objects:
+        info = obj.get("info") or {}
+        props = info.get("props") or {}
+        if props.get("media.class") == "Video/Source" and props.get("api.v4l2.path"):
+            cameras[props["api.v4l2.path"]] = bool((info.get("params") or {}).get("EnumFormat"))
+    return cameras
+
+
+def _pipewire_camera_paths() -> "dict | None":
+    """pipewire_cameras() for the running PipeWire, or None if it cannot
+    be asked."""
     import json
     import shutil as _shutil
     import subprocess
@@ -850,12 +863,7 @@ def _pipewire_camera_paths() -> "set | None":
         objects = json.loads(out)
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
-    paths = set()
-    for obj in objects:
-        props = (obj.get("info") or {}).get("props") or {}
-        if props.get("media.class") == "Video/Source" and props.get("api.v4l2.path"):
-            paths.add(props["api.v4l2.path"])
-    return paths
+    return pipewire_cameras(objects)
 
 
 def _c1_microphone_label() -> str:
@@ -974,6 +982,14 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
                 check(str(node) in sources, "PipeWire offers the camera", str(node),
                       "install packaging/59-decomposer-loopback.rules and reload "
                       "the module; see docs/SETUP.md \u00a7 The virtual cameras")
+                # PipeWire reads a new device's formats the moment it
+                # appears. If that was before the loopback had its format,
+                # the camera is listed with none and browsers leave it out.
+                if str(node) in sources:
+                    check(sources[str(node)], "PipeWire knows the camera's format", str(node),
+                          "PipeWire read the device before it was ready: "
+                          "systemctl --user restart wireplumber, then reload the "
+                          "page in the browser")
 
     camera = bcd = None
     for dev in Path("/sys/bus/usb/devices").glob("*"):

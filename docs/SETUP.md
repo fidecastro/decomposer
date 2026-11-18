@@ -69,7 +69,15 @@ no application holds either camera:
 ```
 sudo install -m 0644 packaging/v4l2loopback.conf /etc/modprobe.d/
 sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback
+systemctl --user restart wireplumber
 ```
+
+The last line matters for browsers. PipeWire reads a camera's formats the
+moment the device appears, and after a reload that can be before the
+loopback has its format: the camera is then listed with no formats and
+Chrome leaves it out of its list. `decomposer doctor` reports this as
+"PipeWire knows the camera's format". After a normal boot the module loads
+before PipeWire starts and the restart is not needed.
 
 Until then everything keeps working on `/dev/video10`; `decomposer doctor`
 lists the second node as absent rather than as a fault.
