@@ -83,3 +83,20 @@ def test_hypr_cursor_reader_rejects_reply_over_limit(tmp_path, monkeypatch):
         assert hypr_cursor_position() is None
     finally:
         thread.join(timeout=1)
+
+
+def test_backdrop_only_for_a_layer_surface_with_the_preference_on():
+    from opal_c1.geometry import backdrop_wanted
+
+    assert backdrop_wanted(True, True, 0)
+    assert not backdrop_wanted(False, True, 0)   # ordinary window
+    assert not backdrop_wanted(True, False, 0)   # preference off
+
+
+def test_backdrop_is_down_while_a_file_chooser_is_open():
+    from opal_c1.geometry import backdrop_wanted
+
+    # The chooser is a normal window below the backdrop: with the backdrop up,
+    # every click meant for the chooser would close the panel instead.
+    assert not backdrop_wanted(True, True, 1)
+    assert not backdrop_wanted(True, True, 2)

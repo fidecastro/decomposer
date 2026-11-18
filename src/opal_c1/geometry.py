@@ -93,3 +93,14 @@ def preview_correction_flips(
 ) -> tuple[bool, bool]:
     """Transform a SEND-oriented engine preview into the requested self-view."""
     return bool(want_mirrored) ^ bool(send_horizontal), bool(send_vertical)
+
+
+def backdrop_wanted(layer_surface: bool, enabled: bool, external_dialogs: int) -> bool:
+    """Whether the click-outside backdrop should be up while the panel shows.
+
+    Only a layer surface can have one (an ordinary window is the compositor's
+    to manage), the preference can turn it off, and it must be down while a
+    file chooser is open: the chooser is a normal window, below the backdrop,
+    and every click meant for it would close the panel instead.
+    """
+    return bool(layer_surface) and bool(enabled) and external_dialogs == 0

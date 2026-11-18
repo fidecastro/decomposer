@@ -57,6 +57,7 @@ from opal_c1 import theme as omtheme  # noqa: E402
 from opal_c1.daemon import Client, runtime_dir  # noqa: E402
 from opal_c1.files import atomic_write_json, read_regular_json  # noqa: E402
 from opal_c1.geometry import (  # noqa: E402
+    backdrop_wanted,
     hypr_cursor_position,
     position_from_cursor,
     preview_correction_flips,
@@ -447,6 +448,7 @@ class Panel(Gtk.Box):
         on_drag_update: Callable[[float, float], None],
         on_drag_end: Callable[[float, float], None],
         on_position_reset: Callable[[], None],
+        on_external_dialog: Callable[[bool], None] = lambda _open: None,
     ):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add_css_class("dc-root")
@@ -456,6 +458,9 @@ class Panel(Gtk.Box):
         self.on_drag_update = on_drag_update
         self.on_drag_end = on_drag_end
         self.on_position_reset = on_position_reset
+        # Told when a file chooser opens and closes: it is a separate window,
+        # and the click-outside backdrop must not sit on top of it.
+        self.on_external_dialog = on_external_dialog
         self.client = Client()
         self.status: dict = {}
         self.busy = False
@@ -1043,9 +1048,11 @@ class Panel(Gtk.Box):
         filters.append(png)
         dialog.set_filters(filters)
         # No transient parent - see _on_overlay_choose.
+        self.on_external_dialog(True)
         dialog.open(None, None, self._on_background_chosen)
 
     def _on_background_chosen(self, dialog, result) -> None:
+        self.on_external_dialog(False)
         try:
             path = dialog.open_finish(result).get_path()
         except Exception:
@@ -1155,9 +1162,11 @@ class Panel(Gtk.Box):
         filters.append(onnx)
         dialog.set_filters(filters)
         # No transient parent - see _on_overlay_choose.
+        self.on_external_dialog(True)
         dialog.open(None, None, self._on_model_chosen)
 
     def _on_model_chosen(self, dialog, result) -> None:
+        self.on_external_dialog(False)
         try:
             path = dialog.open_finish(result).get_path()
         except Exception:
@@ -1430,9 +1439,11 @@ class Panel(Gtk.Box):
         # xdg_toplevel, and asking the compositor to parent a dialog to one is
         # a protocol error: it disconnects the client, which looks exactly like
         # the panel closing itself when the button is pressed.
+        self.on_external_dialog(True)
         dialog.open(None, None, self._on_overlay_chosen)
 
     def _on_overlay_chosen(self, dialog, result) -> None:
+        self.on_external_dialog(False)
         try:
             path = dialog.open_finish(result).get_path()
         except Exception:
@@ -2648,6 +2659,11 @@ class App(Adw.Application):
         self.window: Optional[Gtk.Window] = None
         self.panel: Optional[Panel] = None
         self._layer_surface = False
+        # A click anywhere outside the panel closes it. Set
+        # "close_on_outside_click": false in panel.json to keep it open.
+        self._close_on_outside = _panel_pref("close_on_outside_click", True) is not False
+        self._backdrops: list[Gtk.Window] = []
+        self._external_dialogs = 0
         saved_position = _panel_pref("position", None)
         self._panel_position: Optional[tuple[int, int]] = None
         if isinstance(saved_position, dict):
@@ -2690,6 +2706,17 @@ class App(Adw.Application):
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
+        backdrop_css = Gtk.CssProvider()
+        # Almost, not fully, transparent: a window with nothing to draw is
+        # never given a buffer, and the compositor does not map (or deliver
+        # clicks to) a surface without one. Alpha 1/255 is invisible and is
+        # enough. Measured on Hyprland 0.57 with GTK 4.
+        backdrop_css.load_from_data(b"window.decomposer-backdrop { background: rgba(0, 0, 0, 0.004); }")
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), backdrop_css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+        )
+
         win = Gtk.ApplicationWindow(application=self)
         win.set_title("decomposer")
         win.add_css_class("decomposer")
@@ -2730,6 +2757,7 @@ class App(Adw.Application):
             on_drag_update=self._on_drag_update,
             on_drag_end=self._on_drag_end,
             on_position_reset=self._reset_position,
+            on_external_dialog=self._on_external_dialog,
         )
         win.set_child(self.panel)
         self.window = win
@@ -2757,6 +2785,7 @@ class App(Adw.Application):
     def _show(self) -> None:
         if self.window is None:
             return
+        self._raise_backdrops()
         self.window.present()
         GLib.idle_add(self._clamp_panel_position)
         if self.panel is not None:
@@ -2769,6 +2798,65 @@ class App(Adw.Application):
         if self.panel is not None:
             self.panel.preview.stop()
         self.window.set_visible(False)
+        self._drop_backdrops()
+
+    # -- closing on a click outside --------------------------------------
+    #
+    # A layer surface is never told about clicks that land elsewhere, and
+    # keyboard focus is no proxy for them here: with focus-follows-mouse the
+    # panel loses focus as soon as the pointer rests on another window. So
+    # while the panel is up, an invisible surface covers each output beneath
+    # it and takes the outside click. Same-layer surfaces stack in the order
+    # they are mapped (measured on Hyprland 0.57), so the backdrops must be
+    # mapped before the panel.
+
+    def _raise_backdrops(self) -> None:
+        self._drop_backdrops()
+        if not backdrop_wanted(self._layer_surface, self._close_on_outside, self._external_dialogs):
+            return
+        monitors = Gdk.Display.get_default().get_monitors()
+        for i in range(monitors.get_n_items()):
+            backdrop = Gtk.Window(application=self)
+            backdrop.add_css_class("decomposer-backdrop")
+            backdrop.set_decorated(False)
+            LayerShell.init_for_window(backdrop)
+            LayerShell.set_namespace(backdrop, "decomposer-backdrop")
+            LayerShell.set_layer(backdrop, LayerShell.Layer.TOP)
+            LayerShell.set_monitor(backdrop, monitors.get_item(i))
+            for edge in (
+                LayerShell.Edge.TOP, LayerShell.Edge.BOTTOM,
+                LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT,
+            ):
+                LayerShell.set_anchor(backdrop, edge, True)
+            # -1: ignore other surfaces' reserved space, so the bar is covered
+            # too and a second click on the bar entry closes instead of
+            # re-toggling.
+            LayerShell.set_exclusive_zone(backdrop, -1)
+            LayerShell.set_keyboard_mode(backdrop, LayerShell.KeyboardMode.NONE)
+            click = Gtk.GestureClick()
+            click.set_button(0)  # any button
+            click.connect("pressed", lambda *_: self._hide())
+            backdrop.add_controller(click)
+            backdrop.present()
+            self._backdrops.append(backdrop)
+
+    def _drop_backdrops(self) -> None:
+        for backdrop in self._backdrops:
+            backdrop.destroy()
+        self._backdrops = []
+
+    def _on_external_dialog(self, opened: bool) -> None:
+        self._external_dialogs = max(0, self._external_dialogs + (1 if opened else -1))
+        if self.window is None or not self.window.get_visible():
+            return
+        if opened:
+            self._drop_backdrops()
+        elif self._external_dialogs == 0:
+            self._raise_backdrops()
+            if self._backdrops:
+                # Re-map the panel so it is above the new backdrops again.
+                self.window.set_visible(False)
+                self.window.present()
 
     # -- panel placement ------------------------------------------------
 
