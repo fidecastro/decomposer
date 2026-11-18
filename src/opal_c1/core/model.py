@@ -87,8 +87,59 @@ STUDIO_ONLY_CONTROLS = frozenset({
 })
 # What Call mode gains when Opal's firmware runs from RAM under a host
 # controller ("hybrid"): the firmware then serves a control channel next to
-# its UVC video and microphone. Only focus has been verified on the camera.
-HYBRID_CALL_CONTROLS = frozenset({"focus"})
+# its UVC video and microphone, and every Studio control works over it.
+# Each one was verified on the camera by its effect on the picture.
+HYBRID_CALL_CONTROLS = frozenset(STUDIO_ONLY_CONTROLS)
+
+# The camera's effect and scene programs, "off" first. Shared by both
+# firmware paths; the names are the firmware's own.
+EFFECTS = (
+    "off", "mono", "negative", "solarize", "sepia", "posterize",
+    "whiteboard", "blackboard", "aqua",
+)
+SCENES = (
+    "off", "face_priority", "action", "portrait", "landscape", "night",
+    "night_portrait", "theatre", "beach", "snow", "sunset", "steadyphoto",
+    "fireworks", "sports", "party", "candlelight", "barcode",
+)
+# The 16:9 sensor area every Call-mode frame is scaled from. Regions are
+# given in output-frame coordinates and aimed in these.
+CALL_SENSOR_SIZE = (3840, 2160)
+
+
+# How long a feed must live before a hybrid session counts as healthy, and
+# what to do when feeds keep dying young under the controller.
+HYBRID_HEALTHY_SECONDS = 30.0
+
+
+def hybrid_plan(strikes: int) -> str:
+    """What Call mode should run on after `strikes` feeds in a row died
+    young under opal-controller.
+
+    "reuse": keep the controller's session (an engine restart must not cost
+    the camera a reboot). "fresh": the session itself is suspect, start a
+    new one. "flash": stop trying and use the camera's stored firmware,
+    which gives up the extra controls but is what the camera ships with.
+    """
+    if strikes >= 4:
+        return "flash"
+    if strikes >= 2:
+        return "fresh"
+    return "reuse"
+
+
+def to_sensor_region(region, frame_size, sensor_size=CALL_SENSOR_SIZE) -> tuple:
+    """Scale an (x, y, w, h) region from output-frame to sensor pixels,
+    clamped to the sensor and never empty."""
+    x, y, w, h = (int(v) for v in region)
+    fw, fh = max(1, int(frame_size[0])), max(1, int(frame_size[1]))
+    sw, sh = sensor_size
+    sx, sy = sw / fw, sh / fh
+    X = max(0, min(sw - 1, int(x * sx)))
+    Y = max(0, min(sh - 1, int(y * sy)))
+    W = max(1, min(sw - X, int(w * sx)))
+    H = max(1, min(sh - Y, int(h * sy)))
+    return X, Y, W, H
 
 
 # The LCM48/IMX582's three sensor configurations, read from the device
@@ -217,6 +268,24 @@ def restore_values(touched, sticky: dict, readback: dict) -> tuple:
     return values, unknown
 
 
+def remember_applied(sticky: dict, applied: dict) -> None:
+    """Record what the camera accepted as the user's standing requests.
+
+    Exposure and ISO are one pair to the ISP: automatic covers both, and
+    setting either by hand ends automatic for both. So a manual value for
+    one withdraws a remembered "automatic" for the other; it would otherwise
+    keep reporting auto for a control that is now fixed.
+    """
+    for key, value in applied.items():
+        if key in STICKY_CONTROLS:
+            sticky[key] = value
+    for key, partner in (("exposure", "iso"), ("iso", "exposure")):
+        value = applied.get(key)
+        if isinstance(value, (int, float)) and value >= 0 and partner not in applied:
+            if sticky.get(partner) == -1:
+                del sticky[partner]
+
+
 def sticky_for_mode(sticky: dict, mode: Mode, extra: frozenset = frozenset()) -> dict:
     """The subset of remembered requests that this mode can replay."""
     reachable = controls_for(mode, extra)
@@ -235,7 +304,7 @@ def merge_reported(live: dict, sticky: dict) -> dict:
     remembered request is the only truth available.
     """
     out = dict(live)
-    for key in ("focus", "wb"):
+    for key in ("focus", "wb", "exposure", "iso"):
         if sticky.get(key) == -1:
             out[key] = -1
     for key in ("effect", "scene"):

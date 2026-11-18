@@ -110,7 +110,11 @@ LOOK_BLURB = {
 EFFECTS = ["off", "sepia", "mono", "negative", "posterize",
            "solarize", "aqua", "blackboard", "whiteboard"]
 
-AUTO_CAPABLE = ("focus", "wb")
+AUTO_CAPABLE = ("exposure", "iso", "focus", "wb")
+AUTO_TOOLTIPS = {
+    "exposure": "Hand exposure and ISO back to the camera",
+    "iso": "Hand exposure and ISO back to the camera",
+}
 
 PANEL_CONFIG = (
     Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
@@ -150,10 +154,11 @@ SLIDERS = [
     ("sharpness", "Sharpness", 0, 4, 1, (CALL,)),
     ("exposure", "Exposure", 1000, 33000, 100, (CALL, STUDIO)),
     ("iso", "ISO", 100, 1600, 50, (CALL, STUDIO)),
-    # In Call mode focus works only while the camera's firmware runs under
-    # opal-controller; on the flash firmware the row shows "-".
+    # In Call mode these two (and the effect row) exist only while the
+    # camera's firmware runs under opal-controller; on the flash firmware
+    # their rows are hidden.
     ("focus", "Focus", 0, 255, 1, (CALL, STUDIO)),
-    ("wb", "White bal.", 1000, 12000, 100, (STUDIO,)),
+    ("wb", "White bal.", 1000, 12000, 100, (CALL, STUDIO)),
 ]
 
 
@@ -788,9 +793,11 @@ class Panel(Gtk.Box):
         self.mode_buttons = {}
         blurbs = {
             "call": (
-                "The camera's own firmware: the MICROPHONE IS ON, focus and "
-                "white balance stay automatic, and you get the colour "
-                "controls at a fixed 30 fps. The mode for actual calls."
+                "The camera's own firmware: the MICROPHONE IS ON, with the "
+                "colour controls at a fixed 30 fps. The mode for actual "
+                "calls. With opal-controller installed it also has manual "
+                "focus and white balance, tap-to-focus and effects; without "
+                "it those stay automatic."
             ),
             "studio": (
                 "Stock DepthAI firmware: manual focus and white balance, "
@@ -1552,6 +1559,9 @@ class Panel(Gtk.Box):
         panel never changes size with the mode."""
         self.sliders = {}        # key -> [scale, ...] (shared keys: one per page)
         self.slider_labels = {}
+        self.slider_rows = {}
+        self.effect_drops = []
+        self.effect_rows = []
         self.slider_values = {}
         self.auto_buttons = {}
 
@@ -1601,27 +1611,33 @@ class Panel(Gtk.Box):
                 auto = Gtk.Button(label="auto")
                 auto.add_css_class("dc-tiny")
                 auto.set_valign(Gtk.Align.CENTER)
-                auto.set_tooltip_text(f"Hand {label.lower()} back to the camera")
+                auto.set_tooltip_text(
+                    AUTO_TOOLTIPS.get(key, f"Hand {label.lower()} back to the camera")
+                )
                 auto.connect("clicked", self._on_auto, key)
                 row.append(auto)
                 self.auto_buttons.setdefault(key, []).append(auto)
             self.sliders.setdefault(key, []).append(scale)
             self.slider_values.setdefault(key, []).append(value)
             self.slider_labels.setdefault(key, []).append(row.get_first_child())
+            self.slider_rows.setdefault(key, []).append(row)
             box.append(row)
 
-        if page_mode == STUDIO:
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
-            row.add_css_class("dc-control-row")
-            lbl = Gtk.Label(label="Effect", xalign=0)
-            lbl.add_css_class("dc-label")
-            lbl.set_size_request(64, -1)
-            row.append(lbl)
-            self.effect_drop = Gtk.DropDown.new_from_strings(EFFECTS)
-            self.effect_drop.set_hexpand(True)
-            self.effect_drop.connect("notify::selected", self._on_effect_selected)
-            row.append(self.effect_drop)
-            box.append(row)
+        # One effect row per page: Studio always has it, Call when the
+        # camera runs under opal-controller.
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        row.add_css_class("dc-control-row")
+        lbl = Gtk.Label(label="Effect", xalign=0)
+        lbl.add_css_class("dc-label")
+        lbl.set_size_request(64, -1)
+        row.append(lbl)
+        drop = Gtk.DropDown.new_from_strings(EFFECTS)
+        drop.set_hexpand(True)
+        drop.connect("notify::selected", self._on_effect_selected)
+        row.append(drop)
+        box.append(row)
+        self.effect_drops.append(drop)
+        self.effect_rows.append(row)
         return box
 
     def _footer(self) -> Gtk.Widget:
@@ -2082,8 +2098,13 @@ class Panel(Gtk.Box):
         """Tap to focus: aim autofocus and exposure metering where clicked."""
         if self.busy or not self._ready:
             return
-        if self.status.get("mode") != "studio":
-            self._flash("tap-to-focus needs Studio mode", 4.0)
+        if "af_region" not in model_controls_for(
+            self.status.get("mode") or "", self.status.get("extra_controls")
+        ):
+            self._flash(
+                "tap-to-focus needs Studio mode, or Call mode with opal-controller",
+                4.0,
+            )
             return
         # The preview uses ContentFit.CONTAIN (letterboxed), so undo that
         # mapping - with the stream's actual aspect - before converting to
@@ -2584,8 +2605,11 @@ class Panel(Gtk.Box):
                 "Bokeh" if st.get("blur_style") else "Blur"
             )
             effect = (st.get("controls") or {}).get("effect", "off")
-            if effect in EFFECTS:
-                self.effect_drop.set_selected(EFFECTS.index(effect))
+            reachable = model_controls_for(mode, st.get("extra_controls"))
+            for drop, row in zip(self.effect_drops, self.effect_rows):
+                if effect in EFFECTS and drop.get_selected() != EFFECTS.index(effect):
+                    drop.set_selected(EFFECTS.index(effect))
+                row.set_visible("effect" in reachable)
             self.strength.set_value(float(st.get("strength", 1.0)))
             controls = st.get("controls") or {}
             now = time.monotonic()
@@ -2606,7 +2630,10 @@ class Panel(Gtk.Box):
                 on_auto = value == -1
                 # A value the current mode cannot report shows "-": drawing
                 # the slider at minimum would claim a setting of zero.
-                known = key in model_controls_for(mode, st.get("extra_controls"))
+                known = key in reachable
+                # A row the camera cannot act on now is hidden, not dead.
+                for row in self.slider_rows.get(key, []):
+                    row.set_visible(known)
                 for auto in self.auto_buttons.get(key, []):
                     # -1 means the camera is driving it.
                     (auto.add_css_class if on_auto
@@ -2627,12 +2654,8 @@ class Panel(Gtk.Box):
 
         self.camera_hint.set_text(
             "tap the preview to focus \u00b7 scroll to zoom, drag to pan"
-            if studio
-            else (
-                "manual focus is on \u00b7 white balance and effects live in Studio mode"
-                if st.get("hybrid")
-                else "Focus, white balance and effects live in Studio mode"
-            )
+            if studio or st.get("hybrid")
+            else "Focus, white balance and effects live in Studio mode"
         )
 
         if time.monotonic() < getattr(self, "_flash_until", 0.0):

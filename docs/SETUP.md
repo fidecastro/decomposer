@@ -103,22 +103,26 @@ decomposer install-service       # writes a user unit, no privileges needed
 systemctl --user enable --now decomposer
 ```
 
-## Manual focus in Call mode (opal-controller)
+## Studio's controls in Call mode (opal-controller)
 
 Call mode normally runs the camera's stored firmware, which offers video and
-the microphone but no manual focus. With
+the microphone but keeps focus and white balance automatic. With
 [opal-controller](https://github.com/fidecastro/opal-controller) installed,
 decomposer instead has it boot the camera's own, unmodified firmware into
 RAM. The camera then presents the same video and microphone, plus a control
-channel: the Focus slider works in Call mode. Nothing is written to the
-camera's flash; unplugging it returns it to the stored firmware.
+channel, and Call mode gains everything Studio has: manual focus and white
+balance (each with an auto button), tap-to-focus, exposure metering regions,
+effects and scenes. Nothing is written to the camera's flash; unplugging it
+returns it to the stored firmware.
+
+What stays Studio-only: frame rates above 30, the 4:3 12 MP mode and the
+on-camera person mask.
 
 decomposer uses this automatically when all of these exist:
 
 - `opalctl` on `PATH` or at `~/.local/bin/opalctl` (or `DECOMPOSER_OPALCTL`);
 - `~/.local/share/opal-controller/firmware.mvcmd` and `camTuning.bin`, taken
   from your own camera (the controller's documentation describes how);
-- optionally `detection.blob`, the camera's detection network.
 
 Set `DECOMPOSER_HYBRID=0` to turn it off. If the controller cannot start,
 decomposer says so in `decomposer status` and runs Call mode on the stored
@@ -128,8 +132,10 @@ Entering Call mode this way takes about 15 seconds longer the first time:
 the camera reboots into RAM and the firmware is given time to settle before
 anything asks it to stream. An engine restart does not repeat that.
 
-Known limit: autofocus is less steady and slightly softer than on the stored
-firmware (measured on a static scene: sharpness varied 9-10% against 0-1%).
+Autofocus in this mode is done by opal-controller, not by the firmware: it
+sweeps the lens once, holds the sharpest position and moves again only when
+the scene changes for several seconds. The Focus row's auto button starts a
+new sweep; a tap on the preview focuses on that spot.
 
 ## USB 2 recovery
 

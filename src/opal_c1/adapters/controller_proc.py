@@ -3,7 +3,8 @@
 opal-controller (`opalctl serve`) boots the camera's own, unmodified firmware
 into RAM with a host-defined graph. The camera then shows the same UVC video
 and USB microphone as the shipped product, plus a control channel: manual
-focus in Call mode, which the flash firmware cannot offer.
+focus, white balance, tap-to-focus and effects in Call mode, none of which
+the flash firmware can offer.
 
 This module is the only place that knows the controller exists. It starts
 the process, waits for it to report ready, relays commands over its Unix
@@ -26,7 +27,14 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional, Tuple
 
 from opal_c1.adapters.uvc_cam import UvcBackend
-from opal_c1.core.model import HYBRID_CALL_CONTROLS, Mode
+from opal_c1.core.model import (
+    CALL_SENSOR_SIZE,
+    EFFECTS,
+    HYBRID_CALL_CONTROLS,
+    SCENES,
+    Mode,
+    to_sensor_region,
+)
 
 
 @dataclass(frozen=True)
@@ -34,7 +42,6 @@ class HybridConfig:
     binary: str
     firmware: Path
     tuning: Path
-    detection: Optional[Path]
     socket: Path
 
 
@@ -62,11 +69,9 @@ def hybrid_config(env: Mapping[str, str] = os.environ) -> Optional[HybridConfig]
     firmware, tuning = data / "firmware.mvcmd", data / "camTuning.bin"
     if not (firmware.is_file() and tuning.is_file()):
         return None
-    detection = data / "detection.blob"
     runtime = env.get("XDG_RUNTIME_DIR") or f"/tmp/decomposer-{os.getuid()}"
     return HybridConfig(
         binary=binary, firmware=firmware, tuning=tuning,
-        detection=detection if detection.is_file() else None,
         socket=Path(runtime) / "decomposer" / "opal-controller.sock",
     )
 
@@ -151,8 +156,6 @@ class HybridController:
             "--mic-nodes",
             "--socket", str(self.config.socket),
         ]
-        if self.config.detection is not None:
-            argv += ["--detection-blob", str(self.config.detection)]
         self._proc = self._spawn(argv, stdin=subprocess.DEVNULL)
         deadline = self._clock() + timeout
         while self._clock() < deadline:
@@ -183,7 +186,9 @@ class HybridController:
 
     # -- commands --------------------------------------------------------
 
-    def _command(self, line: str) -> None:
+    def command(self, line: str) -> None:
+        """Send one control line. ValueError if the controller refuses it,
+        OSError if it does not answer."""
         try:
             reply = self.request(line)
         except OSError as e:
@@ -191,35 +196,118 @@ class HybridController:
         if not reply.startswith("ok"):
             raise ValueError(reply.removeprefix("error ").strip() or "refused")
 
-    def set_focus(self, lens_position: int) -> None:
-        self._command(f"focus {int(lens_position)}")
-
-    def set_autofocus(self) -> None:
-        self._command("autofocus")
+    def telemetry(self) -> dict:
+        """What the camera last reported about itself: lens position,
+        exposure time and ISO, read from its frames. Empty if unknown."""
+        try:
+            reply = self.request("status")
+        except OSError:
+            return {}
+        out = {}
+        for word in reply.split()[2:]:
+            key, _, value = word.partition("=")
+            try:
+                out[key] = int(value)
+            except ValueError:
+                pass
+        return out
 
 
 class HybridBackend(UvcBackend):
-    """Call mode through the controller: UVC controls plus manual focus."""
+    """Call mode through the controller.
+
+    The UVC controls of plain Call mode, plus everything Studio offers over
+    the firmware's control channel: focus, white balance, effects, scenes
+    and the focus and exposure regions. The controller keeps the standing
+    settings and re-sends them whenever the video stream restarts, because
+    the firmware ignores controls while the sensor is idle.
+    """
 
     mode = Mode.CALL
     extra_controls = HYBRID_CALL_CONTROLS
 
-    def __init__(self, controller: HybridController, **kw) -> None:
+    def __init__(
+        self,
+        controller: HybridController,
+        frame_size: Callable[[], Tuple[int, int]] = lambda: (1920, 1080),
+        **kw,
+    ) -> None:
         super().__init__(**kw)
         self._controller = controller
+        self._frame_size = frame_size
+        # The firmware cannot be asked what focus and white balance are set
+        # to; a fresh session starts with both automatic.
+        self._requested = {"focus": -1, "wb": -1}
+        # True after a tap aimed focus and metering at one spot.
+        self._aimed = False
+
+    def _line(self, key: str, value) -> str:
+        if key in ("focus", "wb"):
+            v = int(value)
+            return f"{key} auto" if v < 0 else f"{key} {v}"
+        if key in ("effect", "scene"):
+            name = str(value).strip().lower()
+            known = EFFECTS if key == "effect" else SCENES
+            if name not in known:
+                raise ValueError(f"unknown {key} {value!r}. Known: {', '.join(known)}")
+            return f"{key} {name}"
+        if key in ("af_region", "ae_region"):
+            x, y, w, h = to_sensor_region(value, self._frame_size())
+            return f"{key[:2]}-region {x} {y} {w} {h}"
+        raise ValueError(f"unknown control {key!r}")
 
     def apply_controls(self, values: Mapping[str, object]) -> Tuple[dict, dict]:
         applied, refused = super().apply_controls(values)
-        focus = values.get("focus")
-        if focus is not None:
+        for key in ("focus", "wb", "effect", "scene", "ae_region", "af_region"):
+            value = values.get(key)
+            if value is None:
+                continue
             try:
-                v = int(focus)
-                if v < 0:
-                    self._controller.set_autofocus()
-                    applied["focus"] = -1
-                else:
-                    self._controller.set_focus(v)
-                    applied["focus"] = v
+                self._controller.command(self._line(key, value))
             except (ValueError, TypeError, OSError) as e:
-                refused["focus"] = str(e)
+                refused[key] = str(e)
+                continue
+            if key in ("focus", "wb"):
+                value = -1 if int(value) < 0 else int(value)
+                self._requested[key] = value
+                if key == "focus" and value < 0 and self._aimed:
+                    # "Auto" undoes a tap: the controller has gone back to
+                    # focusing on the centre, so meter the whole frame too.
+                    self._aimed = False
+                    try:
+                        w, h = CALL_SENSOR_SIZE
+                        self._controller.command(f"ae-region 0 0 {w} {h}")
+                    except (ValueError, OSError):
+                        pass
+            elif key in ("effect", "scene"):
+                value = str(value).strip().lower()
+            else:
+                value = [int(v) for v in value]
+                self._aimed = True
+                if key == "af_region":
+                    # Aiming autofocus takes the lens back from manual.
+                    self._requested["focus"] = -1
+            applied[key] = value
         return applied, refused
+
+    def replay_controls(self, values: Mapping[str, object]) -> Tuple[dict, dict]:
+        """Re-apply remembered requests after the engine restarted.
+
+        Unlike a firmware reboot, an engine restart leaves the controller's
+        session - and the settings it holds - in place. Automatic focus and
+        white balance are where it already is, and asking for automatic
+        focus again would start a visible lens sweep for nothing.
+        """
+        needed = {
+            key: value for key, value in values.items()
+            if not (key in ("focus", "wb") and int(value) < 0)
+        }
+        skipped = {key: -1 for key in values if key not in needed}
+        applied, refused = self.apply_controls(needed) if needed else ({}, {})
+        applied.update(skipped)
+        return applied, refused
+
+    def read_controls(self) -> dict:
+        out = super().read_controls()
+        out.update(self._requested)
+        return out

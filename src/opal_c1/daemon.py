@@ -307,6 +307,10 @@ class Daemon:
         # The opal-controller session behind Call mode, when hybrid is in
         # use. Outlives engine restarts; released on leaving Call mode.
         self._hybrid = None
+        # Feeds in a row that died young under the controller; see
+        # core.model.hybrid_plan.
+        self._hybrid_strikes = 0
+        self._hybrid_struck = None
         self._sticky: dict = {}
         # Segmentation choices are engine-startup facts, not live state.
         self.seg_model = seg_model
@@ -638,7 +642,10 @@ class Daemon:
         if not replay:
             return
         try:
-            applied, refused = backend.apply_controls(replay)
+            # A backend whose session outlives the engine knows what does
+            # not need re-sending.
+            apply = getattr(backend, "replay_controls", backend.apply_controls)
+            applied, refused = apply(replay)
             with self.lock:
                 self.state.controls.update(applied)
             if refused:
@@ -665,7 +672,13 @@ class Daemon:
             wait_until_capturable(timeout=45)
         else:
             wait_until_capturable(timeout=10)
-        backend = HybridBackend(controller) if controller is not None else UvcBackend()
+        if controller is not None:
+            backend = HybridBackend(
+                controller,
+                frame_size=lambda: (self.state.width, self.state.height),
+            )
+        else:
+            backend = UvcBackend()
         backend.attach()
         self._backend = backend
         self._engine_up(from_stdin=False)
@@ -690,7 +703,18 @@ class Daemon:
         if config is None:
             self._hybrid_stop()
             return None
-        if self._hybrid is not None and self._hybrid.ready():
+        plan = model.hybrid_plan(self._hybrid_strikes)
+        if plan == "flash":
+            self._hybrid_stop()
+            print("hybrid keeps failing; using the camera's own firmware")
+            with self.lock:
+                self.state.notice = (
+                    "the feed kept dying under opal-controller, so Call mode "
+                    "is on the camera's own firmware: focus and white "
+                    "balance are automatic."
+                )
+            return None
+        if plan == "reuse" and self._hybrid is not None and self._hybrid.ready():
             return self._hybrid
         self._hybrid_stop()
         controller = HybridController(config)
@@ -1129,9 +1153,7 @@ class Daemon:
             # refresh them later, but undo/redo snapshots taken at this IPC
             # boundary must not capture the pre-request readback.
             self._snapshot.setdefault("controls", {}).update(applied)
-            for key, value in applied.items():
-                if key in model.STICKY_CONTROLS:
-                    self._sticky[key] = value
+            model.remember_applied(self._sticky, applied)
         out = self.status()
         out["applied"] = applied
         if refused:
@@ -1853,6 +1875,14 @@ class Daemon:
                 engine = self._engine
                 if engine is not None and engine.alive():
                     policy.note_alive()
+                    if self._hybrid_struck == "never started":
+                        self._hybrid_struck = None
+                    if (
+                        self._hybrid_strikes
+                        and time.time() - engine.started_at
+                        >= model.HYBRID_HEALTHY_SECONDS
+                    ):
+                        self._hybrid_strikes = 0
                     if self.state.notice and self.state.frames > 0:
                         self.state.notice = None
                     continue
@@ -1865,9 +1895,22 @@ class Daemon:
                 started = engine.started_at if engine is not None else 0.0
                 uptime = time.time() - started if started else 0.0
 
-            action = policy.on_death(
-                mode, uptime, camera_on_bus=current_mode() is not None
-            )
+            on_bus = current_mode() is not None
+            # An unplugged camera says nothing about the controller; a feed
+            # that dies young with the camera present does.
+            # One strike per feed: this loop comes round several times
+            # for the same dead engine while the camera settles.
+            struck = engine if engine is not None else "never started"
+            if (
+                self._hybrid is not None
+                and on_bus
+                and uptime < model.HYBRID_HEALTHY_SECONDS
+                and struck is not self._hybrid_struck
+            ):
+                self._hybrid_struck = struck
+                self._hybrid_strikes += 1
+
+            action = policy.on_death(mode, uptime, camera_on_bus=on_bus)
 
             if action.kind is health.Kind.HOLD_SICK:
                 with self.lock:
