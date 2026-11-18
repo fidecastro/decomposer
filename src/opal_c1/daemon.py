@@ -402,6 +402,9 @@ class Daemon:
             normal_output=(
                 st.normal_output if output_ready(st.normal_output) else None
             ),
+            # Under opal-controller a stopped stream does not reliably start
+            # again (core.model.HYBRID_CALL_CONTROLS), so it is never stopped.
+            keep_camera_on=self._hybrid is not None,
             width=st.width,
             height=st.height,
             look=st.look,

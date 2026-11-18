@@ -118,11 +118,21 @@ returns it to the stored firmware.
 What stays Studio-only: frame rates above 30, the 4:3 12 MP mode and the
 on-camera person mask.
 
-decomposer uses this automatically when all of these exist:
+It is opt-in, because of one limit. Under the controller the camera's
+video stream does not reliably start again once it has been stopped: every
+restart one second after a stop failed, and about one in fifteen after
+longer pauses, where the stored firmware survived 42 of 42. So in this mode
+decomposer never pauses the camera. **It stays on, light included, for as
+long as Call mode runs.** Streaming continuously it ran for an hour without
+a fault. If you want the camera to switch off when no application is
+using it, stay on the default.
+
+To turn it on, set `DECOMPOSER_HYBRID=1` for the daemon (for the user
+service: `Environment=DECOMPOSER_HYBRID=1` under `[Service]`) and have:
 
 - `opalctl` on `PATH` or at `~/.local/bin/opalctl` (or `DECOMPOSER_OPALCTL`);
 - `~/.local/share/opal-controller/firmware.mvcmd` and `camTuning.bin`, taken
-  from your own camera (the controller's documentation describes how);
+  from your own camera (the controller's documentation describes how).
 
 Run this way the camera's microphone carries a generic USB name, and
 applications list it as "Myriad VPU [Movidius Neural Compute Stick]". To
@@ -134,9 +144,9 @@ install -Dm644 packaging/51-opal-c1-microphone.conf \
 systemctl --user restart wireplumber
 ```
 
-Set `DECOMPOSER_HYBRID=0` to turn it off. If the controller cannot start,
-decomposer says so in `decomposer status` and runs Call mode on the stored
-firmware as before. `decomposer status` shows `hybrid` when it is in use.
+If the controller cannot start, or its session keeps ending, decomposer says
+so in `decomposer status` and runs Call mode on the stored firmware.
+`decomposer status` shows `hybrid` when it is in use.
 
 Entering Call mode this way takes about 15 seconds longer the first time:
 the camera reboots into RAM and the firmware is given time to settle before

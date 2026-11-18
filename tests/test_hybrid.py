@@ -103,6 +103,7 @@ def _install(tmp_path):
     binary = tmp_path / "opalctl"
     binary.write_text("#!/bin/sh\n")
     return {
+        "DECOMPOSER_HYBRID": "1",
         "XDG_DATA_HOME": str(tmp_path / "share"),
         "XDG_RUNTIME_DIR": str(tmp_path / "run"),
         "DECOMPOSER_OPALCTL": str(binary),
@@ -110,16 +111,28 @@ def _install(tmp_path):
     }
 
 
-def test_hybrid_is_the_default_when_everything_is_installed(tmp_path):
+def test_hybrid_is_used_when_asked_for_and_installed(tmp_path):
     cfg = hybrid_config(_install(tmp_path))
     assert cfg is not None
     assert cfg.socket == tmp_path / "run/decomposer/opal-controller.sock"
 
 
-def test_hybrid_can_be_turned_off(tmp_path):
+def test_hybrid_is_opt_in(tmp_path):
+    # Installed is not enough: a hybrid session keeps the camera on, and
+    # that is the user's choice to make.
     env = _install(tmp_path)
+    del env["DECOMPOSER_HYBRID"]
+    assert hybrid_config(env) is None
     env["DECOMPOSER_HYBRID"] = "0"
     assert hybrid_config(env) is None
+
+
+def test_the_engine_is_told_to_keep_a_hybrid_camera_on():
+    plain = model.EngineConfig(input="/dev/video0")
+    hybrid = model.EngineConfig(input="/dev/video0", keep_camera_on=True)
+    assert "--keep-camera-on" not in model.engine_cli_args(plain)
+    assert "--keep-camera-on" in model.engine_cli_args(hybrid)
+    assert hybrid.needs_restart_from(plain)
 
 
 def test_no_hybrid_without_the_cameras_firmware(tmp_path):

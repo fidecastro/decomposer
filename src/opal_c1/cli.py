@@ -636,7 +636,8 @@ def _print_status(st: dict) -> None:
             print("  mic       none — Studio firmware has no microphone")
         if st.get("hybrid"):
             print("  hybrid    on — firmware in RAM under opal-controller; "
-                  "focus, white balance, regions and effects available")
+                  "focus, white balance, regions and effects available; "
+                  "the camera stays on")
     if st.get("notice"):
         print(f"  notice    {st['notice']}")
     if st.get("last_event"):
@@ -1001,13 +1002,11 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
             optional("microphone name", f"applications list it as '{label}'",
                      "install packaging/51-opal-c1-microphone.conf; "
                      "see docs/SETUP.md")
-    elif os.environ.get("DECOMPOSER_HYBRID", "1").strip().lower() in ("0", "no", "off", "false"):
-        optional("opal-controller", "turned off by DECOMPOSER_HYBRID",
-                 "unset it to give Call mode manual focus and white balance")
     else:
-        optional("opal-controller", "not installed, or its firmware files are missing",
-                 "optional: opalctl on PATH plus firmware.mvcmd and camTuning.bin "
-                 f"in {data_dir()} give Call mode Studio's controls; "
+        optional("opal-controller", "not in use",
+                 "optional: DECOMPOSER_HYBRID=1, with opalctl on PATH and "
+                 f"firmware.mvcmd and camTuning.bin in {data_dir()}, gives Call "
+                 "mode Studio's controls and keeps the camera on; "
                  "see docs/SETUP.md")
 
     quirks = Path("/sys/module/usbcore/parameters/quirks")

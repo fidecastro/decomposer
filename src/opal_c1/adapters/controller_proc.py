@@ -53,11 +53,17 @@ def data_dir(env: Mapping[str, str] = os.environ) -> Path:
 def hybrid_config(env: Mapping[str, str] = os.environ) -> Optional[HybridConfig]:
     """What is needed to run Call mode through the controller, or None.
 
-    Hybrid is the default whenever the controller and the camera's firmware
-    files are installed; DECOMPOSER_HYBRID=0 turns it off. The firmware image
-    and tuning blob come from the user's own camera and are never shipped.
+    Opt-in: DECOMPOSER_HYBRID=1, with the controller and the camera's
+    firmware files installed. It is not the default because a hybrid session
+    does not survive its video stream being stopped and started (measured:
+    every restart one second after a stop failed, about one in fifteen after
+    longer pauses, against none of 42 on the stored firmware). decomposer
+    therefore keeps the camera streaming for as long as hybrid Call mode
+    runs, light included, which is a choice for the user to make. The
+    firmware image and tuning blob come from the user's own camera and are
+    never shipped.
     """
-    if env.get("DECOMPOSER_HYBRID", "1").strip().lower() in ("0", "no", "off", "false"):
+    if env.get("DECOMPOSER_HYBRID", "0").strip().lower() not in ("1", "yes", "on", "true"):
         return None
     binary = env.get("DECOMPOSER_OPALCTL") or shutil.which("opalctl")
     if not binary:
