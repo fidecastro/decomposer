@@ -44,6 +44,15 @@ Everything is listed in **[docs/FEATURES.md](docs/FEATURES.md)** — the
 two capture modes, the looks, background blur and bokeh, your own ONNX
 models over the feed, and the rest.
 
+### Optional: opal-controller
+
+Call mode keeps the microphone but leaves focus and white balance to the
+camera. With [opal-controller](https://github.com/fidecastro/opal-controller)
+installed, decomposer runs Call mode through it and the Call page gains
+Studio's controls: manual focus and white balance, tap-to-focus, effects.
+It also focuses the lens itself and then holds it still. decomposer works
+without it; see [docs/SETUP.md](docs/SETUP.md).
+
 ## Get it running
 
 ```
