@@ -9,7 +9,7 @@ pkgdesc="Linux software for the Opal C1 webcam: GPU looks, background blur, virt
 arch=(x86_64)
 url="https://github.com/fidecastro/decomposer"
 license=(MIT)
-depends=(gtk4 libadwaita gtk4-layer-shell python-gobject python v4l2loopback-dkms)
+depends=(gtk4 libadwaita gtk4-layer-shell python-gobject python v4l2loopback-dkms v4l-utils)
 optdepends=(
   'libpulse: default-mic warning in the panel'
   'pipewire: audio stack the mic integrates with'
@@ -41,6 +41,8 @@ package() {
   install -m644 luts/*.cube "$pkgdir/usr/share/decomposer/luts/"
   install -Dm644 packaging/60-opal-c1.rules \
     "$pkgdir/usr/lib/udev/rules.d/60-opal-c1.rules"
+  install -Dm644 packaging/59-decomposer-loopback.rules \
+    "$pkgdir/usr/lib/udev/rules.d/59-decomposer-loopback.rules"
   install -Dm644 packaging/v4l2loopback.conf \
     "$pkgdir/usr/lib/modprobe.d/decomposer.conf"
   install -Dm644 packaging/v4l2loopback-load.conf \

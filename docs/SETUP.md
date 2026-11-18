@@ -44,9 +44,19 @@ status` says so.
 The module options pin both node numbers, name the devices, and set
 `exclusive_caps=1` so camera clients negotiate them correctly.
 
+The udev rule makes both devices report as cameras from the moment they are
+created, by setting v4l2loopback's `keep_format` control. Without it they
+report as output-only until decomposer publishes its first frame. PipeWire
+inspects a device once, when it appears, so it would never offer them, and
+applications that take their cameras from PipeWire (Chrome and Zoom's web
+client on Omarchy) would not list them. `decomposer doctor` checks that
+PipeWire offers both. The rule needs `v4l2-ctl` (package `v4l-utils`).
+
 ```
 sudo install -m 0644 packaging/v4l2loopback.conf /etc/modprobe.d/
 sudo install -m 0644 packaging/v4l2loopback-load.conf /etc/modules-load.d/
+sudo install -m 0644 packaging/59-decomposer-loopback.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
 sudo modprobe v4l2loopback
 ```
 

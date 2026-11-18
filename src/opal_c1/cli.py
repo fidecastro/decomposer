@@ -831,6 +831,29 @@ def _cmd_resolution(args: argparse.Namespace) -> int:
     return 0
 
 
+def _pipewire_camera_paths() -> "set | None":
+    """V4L2 device paths PipeWire offers as camera sources, or None if
+    PipeWire cannot be asked."""
+    import json
+    import shutil as _shutil
+    import subprocess
+
+    if not _shutil.which("pw-dump"):
+        return None
+    try:
+        out = subprocess.run(["pw-dump"], capture_output=True, text=True,
+                             timeout=5, check=True).stdout
+        objects = json.loads(out)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    paths = set()
+    for obj in objects:
+        props = (obj.get("info") or {}).get("props") or {}
+        if props.get("media.class") == "Video/Source" and props.get("api.v4l2.path"):
+            paths.add(props["api.v4l2.path"])
+    return paths
+
+
 def _cmd_doctor(_args: argparse.Namespace) -> int:
     """Check every piece of the stack and say which one is missing."""
     import ctypes.util
@@ -896,6 +919,21 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     rules = Path("/etc/udev/rules.d/60-opal-c1.rules")
     check(rules.is_file(), "udev rules", str(rules),
           "see docs/SETUP.md \u00a7 udev rules")
+
+    # Browsers take their cameras from PipeWire where it is enabled, and
+    # PipeWire only offers a loopback it saw as a camera when the device
+    # appeared. A device missing here is invisible to those applications
+    # however healthy it looks to V4L2.
+    sources = _pipewire_camera_paths()
+    if sources is None:
+        optional("PipeWire cameras", "PipeWire not running or pw-dump missing",
+                 "nothing to check: applications open the V4L2 devices directly")
+    else:
+        for node in (loop, normal_loop):
+            if node.exists():
+                check(str(node) in sources, "PipeWire offers the camera", str(node),
+                      "install packaging/59-decomposer-loopback.rules and reload "
+                      "the module; see docs/SETUP.md \u00a7 The virtual cameras")
 
     camera = None
     for dev in Path("/sys/bus/usb/devices").glob("*"):

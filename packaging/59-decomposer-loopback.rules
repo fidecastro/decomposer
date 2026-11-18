@@ -1,0 +1,31 @@
+# decomposer's virtual cameras: make them cameras from the moment they exist.
+#
+# With exclusive_caps=1 a v4l2loopback device reports OUTPUT until a producer
+# is streaming, and CAPTURE only after. PipeWire inspects a V4L2 device once,
+# when udev announces it, and creates a camera source only if the device can
+# capture at that moment. The module loads at boot, long before decomposer
+# publishes a frame, so PipeWire records two output-only devices and never
+# looks again: Chrome, Zoom's web client and every other application that
+# takes its cameras from PipeWire never see them.
+#
+# v4l2loopback's keep_format control makes a device report CAPTURE whether or
+# not a producer is attached. This rule sets a format and that control as each
+# device appears. The format and the control must be set in one v4l2-ctl call:
+# without keep_format the driver forgets the format when the setter closes.
+# The engine re-pins its real format when it attaches.
+#
+# THE FILENAME NUMBER MATTERS, and so does PROGRAM (not RUN). PROGRAM executes
+# while the rules are processed, which is before 60-persistent-v4l.rules runs
+# v4l_id (so udev also records the device as a capture device) and before the
+# event reaches listeners such as PipeWire.
+#
+# Devices are matched by name, not number, so a changed video_nr still works.
+#
+# Install:
+#   sudo install -m 0644 packaging/59-decomposer-loopback.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback
+# (stop decomposer and close every application using either camera first)
+
+ACTION=="add", SUBSYSTEM=="video4linux", ATTR{name}=="decomposer*", \
+  PROGRAM="/usr/bin/v4l2-ctl -d $devnode --set-fmt-video-out=width=1920,height=1080,pixelformat=YU12 -c keep_format=1"
