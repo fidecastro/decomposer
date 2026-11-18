@@ -56,7 +56,10 @@ class UvcBackend:
 
     def _controls(self) -> UvcControls:
         # Resolved per use: the node number changes across re-enumerations.
-        return UvcControls(self._resolve() or "/dev/video0")
+        node = self._resolve()
+        if node is None:
+            raise FileNotFoundError("Opal C1 capture device is unavailable")
+        return UvcControls(node)
 
     def apply_controls(
         self, values: Mapping[str, object]

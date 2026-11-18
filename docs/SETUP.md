@@ -93,6 +93,22 @@ decomposer install-service       # writes a user unit, no privileges needed
 systemctl --user enable --now decomposer
 ```
 
+## USB 2 recovery
+
+If the C1 repeatedly enumerates as `03e7:f63c` and fails to start over
+USB 3, an explicit USB 2 Studio connection may work:
+
+```
+DECOMPOSER_USB_SPEED=high decomposer daemon --mode studio --width 1280 --height 720 --fps 15
+```
+
+This waits for three seconds of stable bootloader enumeration, then boots
+DepthAI into RAM without changing the stored Opal firmware. The lower
+resolution and frame rate fit USB 2 bandwidth. Studio mode has no camera
+microphone. For a user service, add `Environment=DECOMPOSER_USB_SPEED=high`
+under `[Service]` and use the same mode, dimensions, and frame rate in
+`ExecStart`. Preserve any custom virtual-camera output paths.
+
 ## Arch packaging
 
 `packaging/PKGBUILD` is a starting point for an AUR package that

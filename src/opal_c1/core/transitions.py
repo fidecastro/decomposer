@@ -95,11 +95,19 @@ _ATTACHABLE = {
 _TRANSIENT = {"X_LINK_BOOTLOADER", "X_LINK_BOOTED"}
 
 
-def choose_device(devices: Sequence[Tuple[str, str]]) -> AttachDecision:
+def choose_device(
+    devices: Sequence[Tuple[str, str]], *, allow_bootloader: bool = False
+) -> AttachDecision:
     """Pick a device to attach to from (state_name, status_name) pairs."""
     for i, (state, status) in enumerate(devices):
         if status == "X_LINK_SUCCESS" and state in _ATTACHABLE:
             return AttachDecision(AttachAction.ATTACH, index=i)
+    # Explicit recovery may boot a settled bootloader into RAM. The sysfs
+    # adapter must observe stability first; normal transitions keep waiting.
+    if allow_bootloader:
+        for i, (state, status) in enumerate(devices):
+            if status == "X_LINK_SUCCESS" and state == "X_LINK_BOOTLOADER":
+                return AttachDecision(AttachAction.ATTACH, index=i)
     for state, status in devices:
         if state in _TRANSIENT:
             return AttachDecision(

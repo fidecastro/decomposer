@@ -1,6 +1,7 @@
 """The two camera backends' handling of -1: hand the control back."""
 
 from opal_c1.adapters import depthai_cam, uvc_cam
+import pytest
 
 
 class _FakeUvc:
@@ -33,6 +34,17 @@ def _uvc(monkeypatch):
     _FakeUvc.calls = []
     monkeypatch.setattr(uvc_cam, "UvcControls", _FakeUvc)
     return uvc_cam.UvcBackend(node_resolver=lambda: "/dev/video0")
+
+
+def test_missing_opal_never_reads_or_adjusts_an_unrelated_video_device(monkeypatch):
+    def unexpected_open(_node):
+        raise AssertionError("must not open an unrelated device")
+
+    monkeypatch.setattr(uvc_cam, "UvcControls", unexpected_open)
+    backend = uvc_cam.UvcBackend(node_resolver=lambda: None)
+    assert backend.read_controls() == {}
+    with pytest.raises(FileNotFoundError, match="Opal C1"):
+        backend.apply_controls({"brightness": 120})
 
 
 def test_uvc_negative_exposure_returns_the_pair_to_auto(monkeypatch):
