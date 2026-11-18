@@ -304,6 +304,9 @@ class Daemon:
         # firmware reboots - which it does on every mode switch and every
         # Studio engine restart, silently resetting to defaults otherwise.
         self._backend = None
+        # The opal-controller session behind Call mode, when hybrid is in
+        # use. Outlives engine restarts; released on leaving Call mode.
+        self._hybrid = None
         self._sticky: dict = {}
         # Segmentation choices are engine-startup facts, not live state.
         self.seg_model = seg_model
@@ -629,7 +632,9 @@ class Daemon:
         the old values. Failures are noted, not fatal: a fresh session with
         defaults beats no session because one replayed value was refused.
         """
-        replay = model.sticky_for_mode(self._sticky, backend.mode)
+        replay = model.sticky_for_mode(
+            self._sticky, backend.mode, getattr(backend, "extra_controls", frozenset())
+        )
         if not replay:
             return
         try:
@@ -645,6 +650,7 @@ class Daemon:
         """Only the transition worker calls this. The state lock is taken for
         mutations only — a mode entry spends seconds in hardware waits, and
         holding the lock across them froze every status() call meanwhile."""
+        from opal_c1.adapters.controller_proc import HybridBackend
         from opal_c1.adapters.uvc_cam import UvcBackend
 
         self._teardown()
@@ -653,12 +659,13 @@ class Daemon:
                 self.state.active_preset = None
             self.state.mode = Mode.CALL.value
             self.state.error = None
+        controller = self._hybrid_enter()
         # Leaving Studio mode reboots the camera; /dev/video0 takes ~14s.
         if current_mode() is not Mode.CALL:
             wait_until_capturable(timeout=45)
         else:
             wait_until_capturable(timeout=10)
-        backend = UvcBackend()
+        backend = HybridBackend(controller) if controller is not None else UvcBackend()
         backend.attach()
         self._backend = backend
         self._engine_up(from_stdin=False)
@@ -666,6 +673,60 @@ class Daemon:
             self.state.running = True
             self.state.frames = 0
         self._replay_sticky(backend)
+
+    # -- hybrid: Call mode through opal-controller ------------------------
+
+    def _hybrid_enter(self):
+        """A ready controller for Call mode, or None to use the flash firmware.
+
+        A controller that is already holding a healthy session is kept: an
+        engine restart must not cost the camera a firmware reboot. Any
+        failure falls back to the camera's own firmware, which always works
+        for video and microphone, and says so in status.
+        """
+        from opal_c1.adapters.controller_proc import HybridController, hybrid_config
+
+        config = hybrid_config()
+        if config is None:
+            self._hybrid_stop()
+            return None
+        if self._hybrid is not None and self._hybrid.ready():
+            return self._hybrid
+        self._hybrid_stop()
+        controller = HybridController(config)
+        try:
+            controller.start()
+        except (RuntimeError, OSError) as e:
+            print(f"hybrid unavailable, using the camera's own firmware: {e}")
+            controller.stop()
+            self._await_flash_firmware()
+            with self.lock:
+                self.state.notice = (
+                    "manual focus is unavailable: opal-controller could not "
+                    f"start ({e}). Running on the camera's own firmware."
+                )
+            return None
+        self._hybrid = controller
+        return controller
+
+    def _hybrid_stop(self) -> None:
+        """Release the camera from the controller and wait for it to settle
+        back on its flash firmware, which is where every other entry starts."""
+        controller, self._hybrid = self._hybrid, None
+        if controller is None:
+            return
+        controller.stop()
+        self._await_flash_firmware()
+
+    @staticmethod
+    def _await_flash_firmware(timeout: float = 45.0) -> None:
+        from opal_c1.modes import on_flash_firmware
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if on_flash_firmware():
+                return
+            time.sleep(0.3)
 
     def enter_parked(self) -> None:
         """Feed off, honestly: hold the camera in its Studio personality.
@@ -678,6 +739,7 @@ class Daemon:
         from opal_c1.adapters.depthai_cam import XLinkBackend
 
         self._teardown()
+        self._hybrid_stop()
         with self.lock:
             self.state.running = False
             self.state.error = None
@@ -697,6 +759,7 @@ class Daemon:
         from opal_c1.adapters.depthai_cam import XLinkBackend
 
         self._teardown()
+        self._hybrid_stop()
         with self.lock:
             if self.state.mode != Mode.STUDIO.value:
                 self.state.active_preset = None
@@ -1045,7 +1108,9 @@ class Daemon:
         applied, refused = {}, {}
         allowed = {}
         for key, value in requested.items():
-            why = model.refusal_reason(mode, key)
+            why = model.refusal_reason(
+                mode, key, getattr(backend, "extra_controls", frozenset())
+            )
             if why:
                 refused[key] = why
             else:
@@ -1260,7 +1325,9 @@ class Daemon:
         for key in unknown:
             refused[key] = "no earlier value is known"
         for key in list(values):
-            why = model.refusal_reason(Mode(current_mode), key)
+            why = model.refusal_reason(
+                Mode(current_mode), key, getattr(backend, "extra_controls", frozenset())
+            )
             if why:
                 refused[key] = why
                 del values[key]
@@ -1688,6 +1755,12 @@ class Daemon:
             snapshot = dict(self._snapshot)
         s["controls"] = snapshot.get("controls", {})
         s["mode_actual"] = snapshot.get("mode_actual")
+        # Hybrid: Call mode with the camera's firmware in RAM under
+        # opal-controller. extra_controls is what that adds to the mode.
+        backend = self._backend
+        extra = sorted(getattr(backend, "extra_controls", frozenset()))
+        s["hybrid"] = bool(extra)
+        s["extra_controls"] = extra
         engine = self._engine
         s["engine_alive"] = engine is not None and engine.alive()
         # The normal node is optional: this says whether the running engine
@@ -2139,6 +2212,7 @@ class Daemon:
         finally:
             print("\nshutting down")
             self._teardown()
+            self._hybrid_stop()
             server.close()
             with suppress(OSError):
                 path.unlink()

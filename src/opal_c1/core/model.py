@@ -18,6 +18,10 @@ USB_VID = "03e7"
 PID_CALL = "f63d"
 PID_STUDIO = "f63b"
 PID_BOOTLOADER = "f63c"
+# Opal's own firmware reports version 4.10 in bcdDevice, on flash (f63d) and
+# equally when it has been booted into RAM by a host, where it enumerates
+# under the generic f63b. Stock DepthAI firmware under f63b reports 1.00.
+BCD_OPAL_FIRMWARE = "0410"
 
 # Opal's firmware must not be asked to stream too soon after it enumerates.
 # Measured on fw 4.10 (2026-11-18): with the video stream opened 3 s or 5 s
@@ -81,6 +85,10 @@ SHARED_CONTROLS = frozenset({"exposure", "iso"})
 STUDIO_ONLY_CONTROLS = frozenset({
     "focus", "wb", "af_region", "ae_region", "effect", "scene",
 })
+# What Call mode gains when Opal's firmware runs from RAM under a host
+# controller ("hybrid"): the firmware then serves a control channel next to
+# its UVC video and microphone. Only focus has been verified on the camera.
+HYBRID_CALL_CONTROLS = frozenset({"focus"})
 
 
 # The LCM48/IMX582's three sensor configurations, read from the device
@@ -144,10 +152,26 @@ def clamp_fps(mode: Mode, width: int, height: int, fps: float) -> float:
     return max(lo, min(hi, float(fps)))
 
 
-def controls_for(mode: Mode) -> frozenset:
+def controls_for(mode: Mode, extra: frozenset = frozenset()) -> frozenset:
+    """Controls reachable in `mode`. `extra` is what the attached backend
+    adds beyond the mode's own set (a hybrid Call backend adds focus)."""
     if mode is Mode.CALL:
-        return CALL_ONLY_CONTROLS | SHARED_CONTROLS
+        return CALL_ONLY_CONTROLS | SHARED_CONTROLS | (extra & HYBRID_CALL_CONTROLS)
     return STUDIO_ONLY_CONTROLS | SHARED_CONTROLS
+
+
+def mode_for_identity(product_id: str, bcd_device: str) -> Optional[Mode]:
+    """Which mode a camera with this USB identity is in.
+
+    The product id alone no longer decides: f63b is stock DepthAI firmware
+    (Studio) unless it reports Opal's firmware version, in which case it is
+    Opal's firmware booted into RAM and behaves as Call mode does.
+    """
+    if product_id == PID_CALL:
+        return Mode.CALL
+    if product_id == PID_STUDIO:
+        return Mode.CALL if bcd_device == BCD_OPAL_FIRMWARE else Mode.STUDIO
+    return None
 
 
 # Controls whose requested values should be replayed after the firmware
@@ -193,9 +217,9 @@ def restore_values(touched, sticky: dict, readback: dict) -> tuple:
     return values, unknown
 
 
-def sticky_for_mode(sticky: dict, mode: Mode) -> dict:
+def sticky_for_mode(sticky: dict, mode: Mode, extra: frozenset = frozenset()) -> dict:
     """The subset of remembered requests that this mode can replay."""
-    reachable = controls_for(mode)
+    reachable = controls_for(mode, extra)
     return {
         key: value
         for key, value in sticky.items()
@@ -220,10 +244,16 @@ def merge_reported(live: dict, sticky: dict) -> dict:
     return out
 
 
-def refusal_reason(mode: Mode, control: str) -> Optional[str]:
+def refusal_reason(mode: Mode, control: str, extra: frozenset = frozenset()) -> Optional[str]:
     """Why `control` cannot be applied in `mode`, or None if it can."""
-    if control in controls_for(mode):
+    if control in controls_for(mode, extra):
         return None
+    if mode is Mode.CALL and control in HYBRID_CALL_CONTROLS:
+        return (
+            f"{control} needs Studio mode, or Call mode with the camera's "
+            "firmware running under opal-controller; it is on its flash "
+            "firmware now"
+        )
     if control in STUDIO_ONLY_CONTROLS:
         return (
             f"{control} needs Studio mode; it is an XLink control the "
