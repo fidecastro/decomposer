@@ -35,18 +35,20 @@ def test_exclusive_caps_checks_the_device_not_module_parameters(
 
 
 @pytest.mark.parametrize(
-    ("directions", "expected"),
+    ("driver", "directions", "expected"),
     [
-        (v4l2.V4L2_CAP_VIDEO_OUTPUT, True),
-        (v4l2.V4L2_CAP_VIDEO_CAPTURE | v4l2.V4L2_CAP_VIDEO_OUTPUT, True),
-        (v4l2.V4L2_CAP_VIDEO_CAPTURE, False),
+        (b"v4l2 loopback", v4l2.V4L2_CAP_VIDEO_OUTPUT, True),
+        (b"v4l2 loopback", v4l2.V4L2_CAP_VIDEO_CAPTURE | v4l2.V4L2_CAP_VIDEO_OUTPUT, True),
+        # A loopback whose format is pinned (keep_format) presents as a
+        # camera even while idle. It is still the loopback, and still ours.
+        (b"v4l2 loopback", v4l2.V4L2_CAP_VIDEO_CAPTURE, True),
+        # A real webcam that ended up at the same path is not.
+        (b"uvcvideo", v4l2.V4L2_CAP_VIDEO_CAPTURE, False),
     ],
 )
 def test_output_ready_accepts_only_nodes_that_take_frames(
-    monkeypatch, directions, expected
+    monkeypatch, driver, directions, expected
 ):
-    # A real webcam that ends up at /dev/video11 advertises capture only and
-    # must not be handed frames as if it were the loopback node.
     monkeypatch.setattr(v4l2.os, "open", lambda *_args: 7)
     monkeypatch.setattr(v4l2.os, "close", lambda _fd: None)
 
@@ -54,7 +56,7 @@ def test_output_ready_accepts_only_nodes_that_take_frames(
         assert request == v4l2.VIDIOC_QUERYCAP
         buf[:] = struct.pack(
             v4l2._QUERYCAP_FMT,
-            b"v4l2 loopback", b"decomposer", b"platform", 1,
+            driver, b"decomposer", b"platform", 1,
             0x80000000, directions, 0, 0, 0,
         )
 

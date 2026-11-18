@@ -142,10 +142,12 @@ Entering Call mode this way takes about 15 seconds longer the first time:
 the camera reboots into RAM and the firmware is given time to settle before
 anything asks it to stream. An engine restart does not repeat that.
 
-Autofocus in this mode is done by opal-controller, not by the firmware: it
-sweeps the lens once, holds the sharpest position and moves again only when
-the scene changes for several seconds. The Focus row's auto button starts a
-new sweep; a tap on the preview focuses on that spot.
+Autofocus in this mode is done by opal-controller, not by the firmware. It
+sweeps the lens once (about three seconds, when the camera first streams),
+holds the sharpest position, and every 15 seconds tries one lens step either
+side, too small to see, following it only if the picture gets clearly
+sharper. The Focus row's auto button starts a new sweep; a tap on the
+preview focuses on that spot, and auto undoes the tap.
 
 ## USB 2 recovery
 
