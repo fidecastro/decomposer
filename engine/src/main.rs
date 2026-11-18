@@ -49,6 +49,13 @@ struct Args {
     #[arg(long)]
     normal_output: Option<String>,
 
+    /// Never stop the camera while nobody is watching. For a camera whose
+    /// stream does not reliably start again once stopped (the Opal C1 run
+    /// under opal-controller): it stays on, light included, for as long as
+    /// the engine runs.
+    #[arg(long)]
+    keep_camera_on: bool,
+
     #[arg(long, default_value_t = 1920)]
     width: u32,
 
@@ -378,6 +385,10 @@ fn main() -> Result<()> {
     // Camera rest: unwatched for a while, the last rendered frames are held
     // and the source stops until someone watches again.
     let mut rest = rest::Rest::new();
+    if args.keep_camera_on {
+        rest.cannot_pause();
+        eprintln!("camera kept on: it will not be paused while unwatched");
+    }
     let mut paused = false;
     let mut held_out: Vec<u8> = Vec::new();
     let mut held_normal: Option<Vec<u8>> = None;

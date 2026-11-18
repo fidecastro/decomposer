@@ -48,10 +48,11 @@ models over the feed, and the rest.
 
 Call mode keeps the microphone but leaves focus and white balance to the
 camera. With [opal-controller](https://github.com/fidecastro/opal-controller)
-installed, decomposer runs Call mode through it and the Call page gains
-Studio's controls: manual focus and white balance, tap-to-focus, effects.
-It also focuses the lens itself and then holds it still. decomposer works
-without it; see [docs/SETUP.md](docs/SETUP.md).
+installed and switched on, decomposer runs Call mode through it and the Call
+page gains Studio's controls: manual focus and white balance, tap-to-focus,
+effects. It also focuses the lens itself and then holds it still. The price
+is that the camera stays on while Call mode runs. It is off by default and
+decomposer works without it; see [docs/SETUP.md](docs/SETUP.md).
 
 ## Get it running
 

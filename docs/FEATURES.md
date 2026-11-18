@@ -17,10 +17,11 @@ explicit instead of hiding it:
   all. This is a hardware fact, not a setting.
 
 With [opal-controller](https://github.com/fidecastro/opal-controller)
-installed, Call mode gains **Studio's controls** while keeping the
+installed and `DECOMPOSER_HYBRID=1` set, Call mode gains **Studio's controls** while keeping the
 microphone: manual focus and white balance, tap-to-focus, effects and
 scenes. The camera's own firmware is booted into RAM, where it also serves a
-control channel. See docs/SETUP.md.
+control channel. The camera then stays on while Call mode runs; see
+docs/SETUP.md for why.
 
 Switching takes one firmware reboot (~15 s) and always asks first. The
 panel shows only the controls the current mode can actually drive, keeps
