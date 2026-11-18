@@ -631,7 +631,7 @@ def _print_status(st: dict) -> None:
     if mode_name in ("call", "studio"):
         from opal_c1.core.model import CAPABILITIES, Mode
         if CAPABILITIES[Mode(mode_name)].microphone:
-            print("  mic       live — select 'Opal C1' in your app")
+            print(f"  mic       live — select '{_c1_microphone_label()}' in your app")
         else:
             print("  mic       none — Studio firmware has no microphone")
         if st.get("hybrid"):
@@ -857,6 +857,30 @@ def _pipewire_camera_paths() -> "set | None":
     return paths
 
 
+def _c1_microphone_label() -> str:
+    """What applications call the camera's microphone right now.
+
+    Asked of PipeWire rather than assumed: run from RAM the camera's audio
+    device carries a generic name unless packaging/51-opal-c1-microphone.conf
+    is installed.
+    """
+    import json as _json
+    import subprocess as _subprocess
+
+    try:
+        listing = _subprocess.run(
+            ["pactl", "-f", "json", "list", "sources"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+        for source in _json.loads(listing or "[]"):
+            name = source.get("name", "")
+            if "Opal_C1" in name and not name.endswith(".monitor"):
+                return source.get("description") or "Opal C1"
+    except (OSError, ValueError, _subprocess.SubprocessError):
+        pass
+    return "Opal C1"
+
+
 def _cmd_doctor(_args: argparse.Namespace) -> int:
     """Check every piece of the stack and say which one is missing."""
     import ctypes.util
@@ -970,6 +994,13 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     from opal_c1.adapters.controller_proc import data_dir, hybrid_config
     if hybrid_config() is not None:
         check(True, "opal-controller", "installed; Call mode uses it")
+        label = _c1_microphone_label()
+        if "Opal" in label:
+            check(True, "microphone name", label)
+        else:
+            optional("microphone name", f"applications list it as '{label}'",
+                     "install packaging/51-opal-c1-microphone.conf; "
+                     "see docs/SETUP.md")
     elif os.environ.get("DECOMPOSER_HYBRID", "1").strip().lower() in ("0", "no", "off", "false"):
         optional("opal-controller", "turned off by DECOMPOSER_HYBRID",
                  "unset it to give Call mode manual focus and white balance")
