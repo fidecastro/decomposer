@@ -19,6 +19,27 @@ PID_CALL = "f63d"
 PID_STUDIO = "f63b"
 PID_BOOTLOADER = "f63c"
 
+# Opal's firmware must not be asked to stream too soon after it enumerates.
+# Measured on fw 4.10 (2026-11-18): with the video stream opened 3 s or 5 s
+# after the device appeared, the firmware dropped off the bus one to two
+# seconds into streaming and rebooted, 6 times out of 6; opened at 6, 7, 10
+# and 15 s it streamed, 10 times out of 10. A supervisor that reopens the
+# camera the moment it reappears therefore kills it again, every time: the
+# "dies young" crash loop. Eight seconds leaves margin over the measured
+# threshold.
+CALL_STREAM_SETTLE_SECONDS = 8.0
+
+
+def call_settle_remaining(seconds_since_enumeration: Optional[float]) -> float:
+    """How much longer to wait before opening the Call-mode video stream.
+
+    `None` means the bus could not say how long the camera has been there;
+    the full settle time is then the only safe answer.
+    """
+    if seconds_since_enumeration is None:
+        return CALL_STREAM_SETTLE_SECONDS
+    return max(0.0, CALL_STREAM_SETTLE_SECONDS - seconds_since_enumeration)
+
 
 class Mode(Enum):
     CALL = "call"

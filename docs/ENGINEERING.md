@@ -42,6 +42,17 @@ the crash loop's own re-enumerations for a human replugging the cable
 (that mistake briefly defeated the sick-hold; the fix is pinned by
 test).
 
+**One cause, later measured (2026-11-18):** the toss is not entirely
+random. Opal's firmware crashes when asked to stream too soon after it
+enumerates: opened 3 s or 5 s after the device appeared it dropped off the
+bus within two seconds, six times out of six; opened from 6 s on it streamed,
+ten out of ten. The supervisor used to re-enter Call mode after three seconds
+of bus presence, inside that window, so each recovery attempt could kill the
+camera it was recovering. `wait_until_capturable` now also waits until the
+device has been enumerated for `CALL_STREAM_SETTLE_SECONDS` (8 s), read from
+the kernel's `power/connected_duration`. Whether this also explains the
+11-second deaths is not established.
+
 ## 3. Why did every mode switch cost two firmware reboots?
 
 A three-part race found by counting enumerations in the kernel log: the
