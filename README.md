@@ -27,12 +27,16 @@ command line for everything, so nothing depends on the panel being open.
 
 ## How it was made
 
-No firmware hacking. No reverse engineering of Opal's app. Two AI agents,
-Fable and Grok, sat with the camera and asked its endpoints questions
-until the answers made sense: what the USB descriptors admit to, what the
-hidden XLink server will say, what the sensor claims it can do and what
-it actually delivers. Every feature here is built on a measured answer,
-and the measurements are written down.
+No modified firmware: the camera runs exactly what Opal shipped, and
+nothing is ever written to it. Two AI agents, Fable and Grok, sat with the
+camera and asked its endpoints questions until the answers made sense: what
+the USB descriptors admit to, what the hidden XLink server will say, what
+the sensor claims it can do and what it actually delivers. Every feature
+here is built on a measured answer, and the measurements are written down.
+
+The optional controller goes further, and came from carefully studying the
+firmware and the hardware quirks around it: the pipeline the camera ships
+with, how it boots, what makes it fall off the bus and what brings it back.
 
 The color looks are the real Composer looks. They were extracted by
 photographing test charts through Opal's own app and distilling the
