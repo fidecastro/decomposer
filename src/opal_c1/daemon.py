@@ -402,9 +402,14 @@ class Daemon:
             normal_output=(
                 st.normal_output if output_ready(st.normal_output) else None
             ),
-            # Under opal-controller a stopped stream does not reliably start
-            # again (core.model.HYBRID_CALL_CONTROLS), so it is never stopped.
-            keep_camera_on=self._hybrid is not None,
+            # Under opal-controller the camera is kept on. Pausing it works
+            # most of the time, but through decomposer 2 of 60 pauses cost
+            # the session (2026-11-18), and a call must not start with a
+            # 40 s wait. DECOMPOSER_HYBRID_PAUSE=1 allows pausing, to try it.
+            keep_camera_on=(
+                self._hybrid is not None
+                and os.environ.get("DECOMPOSER_HYBRID_PAUSE", "") not in ("1", "yes", "on", "true")
+            ),
             width=st.width,
             height=st.height,
             look=st.look,
@@ -727,19 +732,26 @@ class Daemon:
         # No waiting for the stored firmware here: the new controller waits
         # for it itself, and reclaims a camera its predecessor left behind.
         self._hybrid_stop(wait=False)
-        controller = HybridController(config)
-        try:
-            controller.start()
-        except (RuntimeError, OSError) as e:
-            print(f"hybrid unavailable, using the camera's own firmware: {e}")
-            controller.stop()
-            self._await_flash_firmware(reset=controller.reset_camera)
-            with self.lock:
-                self.state.notice = (
-                    "manual focus is unavailable: opal-controller could not "
-                    f"start ({e}). Running on the camera's own firmware."
-                )
-            return None
+        # One failed start is not a verdict: the firmware now and then dies
+        # in its first seconds after a boot and comes up fine the next time.
+        for attempt in (1, 2):
+            controller = HybridController(config)
+            try:
+                controller.start()
+                break
+            except (RuntimeError, OSError) as e:
+                controller.stop()
+                self._await_flash_firmware(reset=controller.reset_camera)
+                if attempt == 1:
+                    print(f"opal-controller did not start ({e}); trying once more")
+                    continue
+                print(f"hybrid unavailable, using the camera's own firmware: {e}")
+                with self.lock:
+                    self.state.notice = (
+                        "manual focus is unavailable: opal-controller could not "
+                        f"start ({e}). Running on the camera's own firmware."
+                    )
+                return None
         self._hybrid = controller
         return controller
 
