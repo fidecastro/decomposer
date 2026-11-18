@@ -124,6 +124,16 @@ decomposer uses this automatically when all of these exist:
 - `~/.local/share/opal-controller/firmware.mvcmd` and `camTuning.bin`, taken
   from your own camera (the controller's documentation describes how);
 
+Run this way the camera's microphone carries a generic USB name, and
+applications list it as "Myriad VPU [Movidius Neural Compute Stick]". To
+have it called "Opal C1 Microphone":
+
+```
+install -Dm644 packaging/51-opal-c1-microphone.conf \
+  ~/.config/wireplumber/wireplumber.conf.d/51-opal-c1-microphone.conf
+systemctl --user restart wireplumber
+```
+
 Set `DECOMPOSER_HYBRID=0` to turn it off. If the controller cannot start,
 decomposer says so in `decomposer status` and runs Call mode on the stored
 firmware as before. `decomposer status` shows `hybrid` when it is in use.

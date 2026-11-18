@@ -49,6 +49,8 @@ package() {
     "$pkgdir/usr/lib/modules-load.d/decomposer.conf"
   install -Dm644 packaging/decomposer-usb.conf \
     "$pkgdir/usr/lib/tmpfiles.d/decomposer-usb.conf"
+  install -Dm644 packaging/51-opal-c1-microphone.conf \
+    "$pkgdir/usr/share/wireplumber/wireplumber.conf.d/51-opal-c1-microphone.conf"
   install -Dm644 packaging/decomposer.desktop \
     "$pkgdir/usr/share/applications/decomposer.desktop"
 }
