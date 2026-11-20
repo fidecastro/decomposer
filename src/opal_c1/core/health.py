@@ -63,10 +63,17 @@ SICK_MESSAGE = (
     "streams in this state (decomposer switch studio). Holding retries for "
     "2 minutes."
 )
+# A camera that only ever shows its bootloader, then vanishes, has no working
+# USB 3 link: the bootloader speaks USB 2, the firmware needs USB 3 and does
+# not fall back. One orientation of the USB-C plug can lose USB 3 alone, so
+# flipping the plug is the first thing to try (seen 2026-11-20 with the
+# camera's own cable: hours of looping, cured by turning the plug over).
 VANISHED_MESSAGE = (
-    "the camera keeps dropping off the USB bus. This is the C1's firmware, "
-    "not decomposer: unplug it for ~30s and plug it back into a direct USB 3 "
-    "port. Retrying slowly."
+    "the camera keeps dropping off the USB bus. Most often its USB 3 link is "
+    "not working: unplug the USB-C cable at the camera, turn the plug over "
+    "and plug it back in; then try the laptop end, another USB 3 cable, and "
+    "a direct port. If that does not help, leave it unplugged for a minute. "
+    "Retrying slowly."
 )
 
 

@@ -172,8 +172,16 @@ preview focuses on that spot, and auto undoes the tap.
 
 ## USB 2 recovery
 
-If the C1 repeatedly enumerates as `03e7:f63c` and fails to start over
-USB 3, an explicit USB 2 Studio connection may work:
+If the C1 repeatedly enumerates as `03e7:f63c` (its bootloader), vanishes
+and comes back, its USB 3 link is not working. The bootloader speaks USB 2;
+the firmware needs USB 3 and does not fall back, so the camera loops.
+
+**First, turn the USB-C plug over at the camera end** and plug it back in.
+Each orientation uses different wires for USB 3, and one side can fail
+alone: this cured hours of looping with the camera's own cable. Then try
+the laptop end, another cable that carries USB 3 data, and a direct port.
+
+If USB 3 cannot be had, an explicit USB 2 Studio connection may work:
 
 ```
 DECOMPOSER_USB_SPEED=high decomposer daemon --mode studio --width 1280 --height 720 --fps 15

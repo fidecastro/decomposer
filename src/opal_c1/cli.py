@@ -1006,6 +1006,13 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
         label = "Call firmware in RAM, under opal-controller"
     check(camera is not None, "camera on USB", label,
           "plug the Opal C1 into a USB 3 port")
+    if camera == "f63c":
+        # The bootloader is passed through in a second or two on a healthy
+        # link. Seen here, it usually means the camera is looping in it.
+        optional("USB 3 link", "the camera is in its bootloader",
+                 "if it stays there or comes and goes, the USB 3 link is not "
+                 "working: turn the USB-C plug over at the camera, then try "
+                 "another USB 3 cable; see docs/SETUP.md \u00a7 USB 2 recovery")
 
     # Optional: Studio's controls in Call mode.
     from opal_c1.adapters.controller_proc import data_dir, hybrid_config
